@@ -1,0 +1,7 @@
+[package]
+name = "blip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gen-api = { path = "../../crates/gen-api" }

@@ -1,0 +1,13 @@
+[package]
+name = "workspace"
+version = "0.1.0"
+edition = "2021"
+description = "Global workspace mixer: clock, click and generator subprocesses"
+
+[[bin]]
+name = "ws"
+path = "src/main.rs"
+
+[dependencies]
+gen-api = { path = "../crates/gen-api" }
+cpal = "0.15"

@@ -1,0 +1,504 @@
+//! percussion — generative psytrance percussion: off-beat open hat, closed
+//! hats, shaker, clap, ride, panned percs and snare rolls. Stereo.
+//!
+//! Structure follows the shared grid (see gen_api::Position):
+//! - per epoch (16 bars): which layers play and in what style
+//! - per cycle (4 bars): the actual pattern, with a fill at its end
+//! - the last bar of an epoch often carries a snare roll into the next one
+
+use gen_api::{Config, Context, Generator, Info, Rng};
+use std::f64::consts::PI;
+
+const SLOTS: usize = 64; // 16ths in a cycle (4 bars)
+const CYCLES_PER_EPOCH: u64 = 4;
+
+/// Fixed output stage: soft clip, then a -1 dBFS ceiling.
+const DRIVE: f64 = 1.0;
+const CEILING: f64 = 0.891;
+
+/// Closed-hat velocity per 16th within a beat; slot 2 belongs to the open hat.
+const CHAT_STYLES: [(&str, [f64; 4]); 3] = [
+    ("16ths", [0.45, 0.7, 0.0, 0.8]),
+    ("1+3  ", [0.0, 0.65, 0.0, 0.8]),
+    ("last ", [0.0, 0.0, 0.0, 0.8]),
+];
+const CHAT_WEIGHTS: [f64; 3] = [3.0, 2.0, 1.0];
+const SHAKER_VEL: [f64; 4] = [0.5, 0.85, 0.6, 0.95];
+
+// ---------------------------------------------------------------- dsp
+
+/// Zavalishin TPT state-variable filter with fixed coefficients.
+#[derive(Default, Clone, Copy)]
+struct Svf {
+    ic1: f64,
+    ic2: f64,
+    a1: f64,
+    a2: f64,
+    a3: f64,
+    k: f64,
+}
+
+impl Svf {
+    fn new(fc: f64, res: f64, sr: f64) -> Svf {
+        let g = (PI * fc.clamp(20.0, sr * 0.45) / sr).tan();
+        let k = 2.0 - 2.0 * res.clamp(0.0, 0.97);
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        Svf { ic1: 0.0, ic2: 0.0, a1, a2: g * a1, a3: g * g * a1, k }
+    }
+
+    /// Returns (lowpass, bandpass, highpass).
+    fn tick(&mut self, x: f64) -> (f64, f64, f64) {
+        let v3 = x - self.ic2;
+        let v1 = self.a1 * self.ic1 + self.a2 * v3;
+        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
+        self.ic1 = 2.0 * v1 - self.ic1;
+        self.ic2 = 2.0 * v2 - self.ic2;
+        (v2, v1, x - self.k * v1 - v2)
+    }
+}
+
+/// Per-sample multiplier for an exponential decay with time constant `tau`.
+fn decay_coef(tau: f64, sr: f64) -> f64 {
+    (-1.0 / (tau * sr)).exp()
+}
+
+/// Equal-power pan, -1 = left … 1 = right.
+fn pan_gains(pan: f64) -> (f64, f64) {
+    let a = (pan.clamp(-1.0, 1.0) + 1.0) * PI / 4.0;
+    (a.cos(), a.sin())
+}
+
+// ---------------------------------------------------------------- voices
+
+/// Six inharmonic squares (the 808 recipe) plus noise, band-limited.
+const METAL_HZ: [f64; 6] = [205.3, 304.4, 369.6, 522.7, 540.0, 800.0];
+
+#[derive(Clone, Copy)]
+struct MetalSound {
+    pitch: f64, // multiplier on METAL_HZ
+    noise: f64, // 0 = all squares, 1 = all noise
+    bp: f64,
+    hp: f64,
+    decay: f64, // time constant, s
+    gain: f64,
+}
+
+struct Metal {
+    s: MetalSound,
+    phases: [f64; 6],
+    amp: f64,
+    coef: f64,
+    bp: Svf,
+    hp: Svf,
+}
+
+impl Metal {
+    fn new(s: MetalSound, sr: f64) -> Metal {
+        Metal { s, phases: [0.0, 0.13, 0.31, 0.47, 0.62, 0.89], amp: 0.0, coef: 0.0, bp: Svf::new(s.bp, 0.3, sr), hp: Svf::new(s.hp, 0.1, sr) }
+    }
+
+    fn trigger(&mut self, vel: f64, decay_scale: f64, sr: f64) {
+        self.amp = vel;
+        self.coef = decay_coef(self.s.decay * decay_scale, sr);
+    }
+
+    /// Cut a ringing sound short without a click.
+    fn choke(&mut self, sr: f64) {
+        self.coef = self.coef.min(decay_coef(0.006, sr));
+    }
+
+    fn tick(&mut self, sr: f64, noise: &mut Rng) -> f64 {
+        if self.amp < 1e-5 {
+            return 0.0;
+        }
+        let mut sq = 0.0;
+        for (ph, hz) in self.phases.iter_mut().zip(METAL_HZ) {
+            *ph = (*ph + hz * self.s.pitch / sr).fract();
+            sq += if *ph < 0.5 { 1.0 } else { -1.0 };
+        }
+        let x = sq / 6.0 * (1.0 - self.s.noise) + noise.range(-1.0, 1.0) * self.s.noise;
+        let (_, b, _) = self.bp.tick(x);
+        let (_, _, h) = self.hp.tick(b);
+        let y = h * self.amp * self.s.gain;
+        self.amp *= self.coef;
+        y
+    }
+}
+
+/// Bandpassed noise with a soft attack — shaker.
+struct Shaker {
+    t: usize,
+    vel: f64,
+    bp: Svf,
+}
+
+impl Shaker {
+    fn tick(&mut self, sr: f64, noise: &mut Rng) -> f64 {
+        if self.vel == 0.0 {
+            return 0.0;
+        }
+        let t = self.t as f64 / sr;
+        self.t += 1;
+        if t > 0.15 {
+            self.vel = 0.0;
+        }
+        let env = (t / 0.004).min(1.0) * (-t / 0.02).exp();
+        let (_, b, _) = self.bp.tick(noise.range(-1.0, 1.0));
+        b * env * self.vel * 0.9
+    }
+}
+
+/// Three quick noise bursts and a tail — clap.
+struct Clap {
+    t: usize,
+    vel: f64,
+    bp: Svf,
+}
+
+impl Clap {
+    fn tick(&mut self, sr: f64, noise: &mut Rng) -> f64 {
+        if self.vel == 0.0 {
+            return 0.0;
+        }
+        let t = self.t as f64 / sr;
+        self.t += 1;
+        if t > 0.4 {
+            self.vel = 0.0;
+        }
+        let mut env = 0.0;
+        for k in 0..3 {
+            let tk = t - k as f64 * 0.009;
+            if tk >= 0.0 {
+                env += (-tk / 0.003).exp();
+            }
+        }
+        if t >= 0.02 {
+            env += 0.6 * (-(t - 0.02) / 0.07).exp();
+        }
+        let (_, b, _) = self.bp.tick(noise.range(-1.0, 1.0));
+        b * env * self.vel * 1.4
+    }
+}
+
+/// Tone + highpassed noise — snare for rolls and fills.
+struct Snare {
+    t: usize,
+    vel: f64,
+    decay: f64,
+    phase: f64,
+    hp: Svf,
+}
+
+impl Snare {
+    fn tick(&mut self, sr: f64, noise: &mut Rng) -> f64 {
+        if self.vel == 0.0 {
+            return 0.0;
+        }
+        let t = self.t as f64 / sr;
+        self.t += 1;
+        if t > self.decay * 8.0 {
+            self.vel = 0.0;
+        }
+        self.phase += (180.0 + 70.0 * (-t / 0.01).exp()) / sr;
+        let tone = (2.0 * PI * self.phase).sin() * (-t / 0.04).exp() * 0.5;
+        let (_, _, h) = self.hp.tick(noise.range(-1.0, 1.0));
+        let body = h * (-t / self.decay).exp();
+        (tone + body) * self.vel * 0.8
+    }
+}
+
+/// Short pitched blip with a pitch drop — the "psy perc".
+#[derive(Default)]
+struct Perc {
+    t: usize,
+    vel: f64,
+    hz: f64,
+    pan: f64,
+    phase: f64,
+}
+
+impl Perc {
+    fn tick(&mut self, sr: f64) -> f64 {
+        if self.vel == 0.0 {
+            return 0.0;
+        }
+        let t = self.t as f64 / sr;
+        self.t += 1;
+        if t > 0.3 {
+            self.vel = 0.0;
+        }
+        self.phase += self.hz * (1.0 + 1.2 * (-t / 0.004).exp()) / sr;
+        let y = ((2.0 * PI * self.phase).sin() * 2.0).tanh();
+        y * (-t / 0.035).exp() * self.vel * 0.22
+    }
+}
+
+// ---------------------------------------------------------------- composition
+
+#[derive(Clone, Copy, Default)]
+struct Step {
+    ohat: f64,
+    chat: f64,
+    shaker: f64,
+    clap: f64,
+    ride: f64,
+    snare: f64,
+    perc: f64,
+    perc_hz: f64,
+    perc_pan: f64,
+}
+
+struct Epoch {
+    index: u64,
+    chat_style: usize,
+    shaker: bool,
+    clap: bool,
+    ride: bool,
+    perc_density: f64,
+    roll: bool,
+}
+
+struct Cycle {
+    index: u64,
+    steps: [Step; SLOTS],
+}
+
+// ---------------------------------------------------------------- generator
+
+pub struct Percussion {
+    sr: f64,
+    rng: Rng,
+    noise: Rng,
+    epoch: Option<Epoch>,
+    cycle: Option<Cycle>,
+    next_slot: Option<u64>,
+    ohat: Metal,
+    chat: Metal,
+    ride: Metal,
+    shaker: Shaker,
+    clap: Clap,
+    snare: Snare,
+    perc: Perc,
+}
+
+const PAN_OHAT: f64 = -0.1;
+const PAN_CHAT: f64 = 0.3;
+const PAN_SHAKER: f64 = -0.4;
+const PAN_RIDE: f64 = 0.45;
+
+impl Percussion {
+    fn compose_epoch(&mut self, index: u64) -> Epoch {
+        let r = &mut self.rng;
+        let e = Epoch {
+            index,
+            chat_style: r.weighted(&CHAT_WEIGHTS),
+            shaker: r.chance(0.6),
+            clap: r.chance(0.5),
+            ride: r.chance(0.35),
+            perc_density: if r.chance(0.75) { r.range(0.08, 0.3) } else { 0.0 },
+            roll: r.chance(0.65),
+        };
+        let on = |b: bool| if b { "on " } else { "off" };
+        let first_bar = index * CYCLES_PER_EPOCH * 4 + 1;
+        eprintln!(
+            "  bars {:>4}-{:<4} hats {}  shaker {}  clap {}  ride {}  percs {:>2.0}%  roll {}",
+            first_bar,
+            first_bar + 15,
+            CHAT_STYLES[e.chat_style].0,
+            on(e.shaker),
+            on(e.clap),
+            on(e.ride),
+            e.perc_density * 100.0,
+            on(e.roll)
+        );
+        e
+    }
+
+    fn compose_cycle(&mut self, index: u64) -> Cycle {
+        let epoch_index = index / CYCLES_PER_EPOCH;
+        if self.epoch.as_ref().map(|e| e.index) != Some(epoch_index) {
+            self.epoch = Some(self.compose_epoch(epoch_index));
+        }
+        let e = self.epoch.as_ref().unwrap();
+        let r = &mut self.rng;
+        let last_in_epoch = index % CYCLES_PER_EPOCH == CYCLES_PER_EPOCH - 1;
+        let roll = e.roll && last_in_epoch;
+
+        // One bar of percs, repeated, with the last bar varied.
+        let n_pitches = 2 + (r.next_u64() % 2) as usize;
+        let pitches: Vec<f64> = (0..n_pitches).map(|_| 280.0 * 5f64.powf(r.f())).collect();
+        let mut perc_bar = [(0.0, 0.0, 0.0); 16];
+        let mut side = if r.chance(0.5) { 1.0 } else { -1.0 };
+        let mut roll_perc = |r: &mut Rng| {
+            side = -side;
+            (r.range(0.6, 0.9), *r.pick(&pitches), side * r.range(0.4, 0.8))
+        };
+        for (s, p) in perc_bar.iter_mut().enumerate() {
+            if s % 4 != 0 && r.chance(e.perc_density) {
+                *p = roll_perc(r);
+            }
+        }
+
+        let mut steps = [Step::default(); SLOTS];
+        for bar in 0..4 {
+            for beat in 0..4 {
+                for s in 0..4 {
+                    let i = bar * 16 + beat * 4 + s;
+                    let st = &mut steps[i];
+                    let jitter = r.range(0.9, 1.05);
+                    if s == 2 {
+                        st.ohat = r.range(0.85, 1.0);
+                    }
+                    st.chat = CHAT_STYLES[e.chat_style].1[s] * jitter;
+                    if e.shaker {
+                        st.shaker = SHAKER_VEL[s] * r.range(0.85, 1.0);
+                    }
+                    if e.clap && s == 0 && beat % 2 == 1 {
+                        st.clap = 0.85;
+                    }
+                    if e.ride && s == 0 {
+                        st.ride = r.range(0.5, 0.65);
+                    }
+                    let mut p = perc_bar[beat * 4 + s];
+                    if bar == 3 && s % 4 != 0 && r.chance(0.3) {
+                        p = if r.chance(e.perc_density.max(0.1)) { roll_perc(r) } else { (0.0, 0.0, 0.0) };
+                    }
+                    (st.perc, st.perc_hz, st.perc_pan) = p;
+                }
+            }
+        }
+
+        let last_bar = &mut steps[48..64];
+        if roll {
+            // Snare roll into the next epoch: 8ths, then 16ths, rising.
+            for (j, st) in last_bar.iter_mut().enumerate() {
+                if j < 8 && j % 2 == 1 {
+                    continue;
+                }
+                st.snare = 0.25 + 0.75 * (j as f64 / 15.0).powf(1.5);
+                st.clap = 0.0;
+            }
+        } else if r.chance(0.5) {
+            // Small fill on the last beat.
+            if r.chance(0.5) {
+                last_bar[14].snare = 0.5;
+                last_bar[15].snare = 0.7;
+            } else {
+                last_bar[15].ohat = 0.8;
+                last_bar[15].chat = 0.0;
+            }
+        }
+        Cycle { index, steps }
+    }
+
+    fn trigger(&mut self, slot: u64, ctx: &Context) {
+        let index = slot / SLOTS as u64;
+        if self.cycle.as_ref().map(|c| c.index) != Some(index) {
+            self.cycle = Some(self.compose_cycle(index));
+        }
+        let st = self.cycle.as_ref().unwrap().steps[(slot % SLOTS as u64) as usize];
+        let sr = self.sr;
+        let six = 60.0 / ctx.transport.bpm / 4.0;
+
+        if st.ohat > 0.0 {
+            self.ohat.trigger(st.ohat, 1.0, sr);
+        }
+        if st.chat > 0.0 {
+            self.ohat.choke(sr);
+            self.chat.trigger(st.chat, 1.0, sr);
+        }
+        if st.ride > 0.0 {
+            self.ride.trigger(st.ride, 1.0, sr);
+        }
+        if st.shaker > 0.0 {
+            self.shaker.t = 0;
+            self.shaker.vel = st.shaker;
+        }
+        if st.clap > 0.0 {
+            self.clap.t = 0;
+            self.clap.vel = st.clap;
+        }
+        if st.snare > 0.0 {
+            self.snare.t = 0;
+            self.snare.vel = st.snare;
+            self.snare.phase = 0.0;
+            self.snare.decay = (six * 0.5).min(0.08);
+        }
+        if st.perc > 0.0 {
+            self.perc = Perc { vel: st.perc, hz: st.perc_hz, pan: st.perc_pan, ..Perc::default() };
+        }
+    }
+}
+
+impl Generator for Percussion {
+    fn new(config: &Config) -> Self {
+        let sr = config.sample_rate;
+        let mut rng = Rng::new(config.seed ^ 0x9E2C);
+        // Sound design varies a little per seed.
+        let tone = rng.range(0.9, 1.15);
+        Percussion {
+            sr,
+            noise: Rng::new(config.seed ^ 0x401_5E),
+            epoch: None,
+            cycle: None,
+            next_slot: None,
+            ohat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.35, bp: 9000.0, hp: 6500.0, decay: 0.07, gain: 3.2 }, sr),
+            chat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.45, bp: 10000.0, hp: 7500.0, decay: 0.012, gain: 2.6 }, sr),
+            ride: Metal::new(MetalSound { pitch: 1.2 * tone, noise: 0.15, bp: 5500.0, hp: 3500.0, decay: 0.35, gain: 0.7 }, sr),
+            shaker: Shaker { t: 0, vel: 0.0, bp: Svf::new(rng.range(6000.0, 8000.0), 0.35, sr) },
+            clap: Clap { t: 0, vel: 0.0, bp: Svf::new(rng.range(1000.0, 1500.0), 0.4, sr) },
+            snare: Snare { t: 0, vel: 0.0, decay: 0.08, phase: 0.0, hp: Svf::new(1800.0, 0.1, sr) },
+            perc: Perc::default(),
+            rng,
+        }
+    }
+
+    fn info(&self) -> Info {
+        Info {
+            name: "percussion",
+            description: "Psytrance hats, shaker, clap, ride, percs and snare rolls (stereo)",
+            channels: 2,
+        }
+    }
+
+    fn process(&mut self, ctx: &Context, out: &mut [f32]) {
+        const EPS: f64 = 1e-9;
+        let tr = &ctx.transport;
+        let slot_len = ctx.sample_rate * 60.0 / tr.bpm / 4.0; // samples per 16th
+        let start = tr.beat * 4.0; // position in 16ths
+
+        // On the first block or after a seek, resume at the next boundary.
+        let mut next = match self.next_slot {
+            Some(n) if (n as f64) >= start - EPS && (n as f64) <= start + 1.0 + EPS => n,
+            _ => (start - EPS).ceil().max(0.0) as u64,
+        };
+
+        let sr = self.sr;
+        let pans = [pan_gains(PAN_OHAT), pan_gains(PAN_CHAT), pan_gains(PAN_RIDE), pan_gains(PAN_SHAKER)];
+        for (i, frame) in out.chunks_exact_mut(2).enumerate() {
+            if tr.playing {
+                let pos = start + i as f64 / slot_len;
+                while next as f64 <= pos + EPS {
+                    self.trigger(next, ctx);
+                    next += 1;
+                }
+            }
+            let n = &mut self.noise;
+            let mono = [self.ohat.tick(sr, n), self.chat.tick(sr, n), self.ride.tick(sr, n), self.shaker.tick(sr, n)];
+            let center = self.clap.tick(sr, n) + self.snare.tick(sr, n);
+            let (mut l, mut r) = (center * 0.707, center * 0.707);
+            for (x, (gl, gr)) in mono.iter().zip(pans) {
+                l += x * gl;
+                r += x * gr;
+            }
+            let (pl, pr) = pan_gains(self.perc.pan);
+            let p = self.perc.tick(sr);
+            l += p * pl;
+            r += p * pr;
+            frame[0] = ((l * DRIVE).tanh() * CEILING) as f32;
+            frame[1] = ((r * DRIVE).tanh() * CEILING) as f32;
+        }
+        self.next_slot = Some(next);
+    }
+}
+
