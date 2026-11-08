@@ -133,7 +133,8 @@ transport is stopped, nothing is due.
 `crates/dsp` holds the building blocks generators share: `Svf` (TPT
 state-variable filter, LP/BP/HP), `Ladder` (4-pole resonant lowpass with
 saturation in the loop), `OnePole`, band-limited `saw` and `square`
-(PolyBLEP), `decay_coef`, `pan_gains`, `midi_hz`.
+(PolyBLEP), `Reverb` (stereo FDN, for pads and tails), `decay_coef`,
+`pan_gains`, `midi_hz`.
 
 ## Standard CLI
 

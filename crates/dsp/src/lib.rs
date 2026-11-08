@@ -139,6 +139,92 @@ pub fn square(phase: f64, dt: f64) -> f64 {
     naive + poly_blep(phase, dt) - poly_blep((phase + 0.5).fract(), dt)
 }
 
+// ---------------------------------------------------------------- reverb
+
+/// Schroeder allpass: smears transients without colouring the spectrum.
+#[derive(Clone, Debug)]
+struct Allpass {
+    buf: Vec<f64>,
+    i: usize,
+    g: f64,
+}
+
+impl Allpass {
+    fn new(len: usize, g: f64) -> Allpass {
+        Allpass { buf: vec![0.0; len.max(1)], i: 0, g }
+    }
+
+    fn tick(&mut self, x: f64) -> f64 {
+        let d = self.buf[self.i];
+        let v = x + self.g * d;
+        self.buf[self.i] = v;
+        self.i = (self.i + 1) % self.buf.len();
+        d - self.g * v
+    }
+}
+
+const FDN_MS: [f64; 4] = [89.3, 107.9, 127.1, 149.7];
+const DIFFUSE_MS: [f64; 4] = [4.7, 7.3, 11.3, 16.9];
+
+/// Stereo reverb for pads and tails: input diffusion (allpasses) into a
+/// 4-line feedback delay network with a Householder matrix and damping in
+/// the loop. Returns the wet signal only. Buffers are allocated in
+/// [`Reverb::new`]; `tick` doesn't allocate.
+#[derive(Clone, Debug)]
+pub struct Reverb {
+    diffuse: [Vec<Allpass>; 2],
+    lines: Vec<Vec<f64>>,
+    w: usize,
+    gains: [f64; 4],
+    damp: [OnePole; 4],
+}
+
+impl Reverb {
+    pub fn new(sr: f64) -> Reverb {
+        let ms = |m: f64| (m * sr / 1000.0) as usize;
+        // Slightly different diffusers per side decorrelate left and right.
+        let side = |k: f64| DIFFUSE_MS.iter().map(|&m| Allpass::new(ms(m * k), 0.6)).collect();
+        let mut r = Reverb {
+            diffuse: [side(1.0), side(1.13)],
+            lines: FDN_MS.iter().map(|&m| vec![0.0; ms(m)]).collect(),
+            w: 0,
+            gains: [0.0; 4],
+            damp: [OnePole::default(); 4],
+        };
+        r.set(3.0, 6000.0, sr);
+        r
+    }
+
+    /// `t60`: seconds for the tail to fall by 60 dB; `damp_hz`: lowpass in
+    /// the loop, lower is darker.
+    pub fn set(&mut self, t60: f64, damp_hz: f64, sr: f64) {
+        for (k, line) in self.lines.iter().enumerate() {
+            let secs = line.len() as f64 / sr;
+            self.gains[k] = 10f64.powf(-3.0 * secs / t60.max(0.05));
+            let z = self.damp[k].z;
+            self.damp[k] = OnePole::new(damp_hz, sr);
+            self.damp[k].z = z;
+        }
+    }
+
+    pub fn tick(&mut self, l: f64, r: f64) -> (f64, f64) {
+        let l = self.diffuse[0].iter_mut().fold(l, |x, a| a.tick(x));
+        let r = self.diffuse[1].iter_mut().fold(r, |x, a| a.tick(x));
+        let mut o = [0.0; 4];
+        for (k, line) in self.lines.iter().enumerate() {
+            o[k] = self.damp[k].lp(line[self.w % line.len()]);
+        }
+        let s = o.iter().sum::<f64>() * 0.5; // Householder: I - 2/N · 11ᵀ
+        let input = [l, r, l, r];
+        for (k, line) in self.lines.iter_mut().enumerate() {
+            let n = line.len();
+            line[self.w % n] = (o[k] - s) * self.gains[k] + input[k] * 0.5;
+        }
+        self.w = self.w.wrapping_add(1);
+        (o[0] - o[2] * 0.6 + o[3] * 0.3, o[1] - o[3] * 0.6 + o[2] * 0.3)
+    }
+}
+
 // ---------------------------------------------------------------- helpers
 
 /// Per-sample multiplier for an exponential decay with time constant `tau`
@@ -171,6 +257,22 @@ mod tests {
             peak = peak.max(f.tick(x, 800.0, 1.05, 48_000.0).abs());
         }
         assert!(peak.is_finite() && peak < 2.0, "peak {peak}");
+    }
+
+    #[test]
+    fn reverb_tail_decays() {
+        let sr = 48_000.0;
+        let mut rv = Reverb::new(sr);
+        rv.set(1.0, 8000.0, sr);
+        let energy = |rv: &mut Reverb, n: usize, x: f64| {
+            (0..n).map(|i| { let (l, r) = rv.tick(if i == 0 { x } else { 0.0 }, 0.0); l * l + r * r }).sum::<f64>()
+        };
+        let early = energy(&mut rv, 24_000, 1.0);
+        let late = energy(&mut rv, 24_000, 0.0);
+        let later = energy(&mut rv, 96_000, 0.0);
+        assert!(early > 0.0 && early.is_finite());
+        assert!(late < early * 0.1, "early {early} late {late}");
+        assert!(later < late, "late {late} later {later}");
     }
 
     #[test]
