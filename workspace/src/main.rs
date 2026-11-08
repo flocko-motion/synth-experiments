@@ -46,7 +46,12 @@ commands (sent to the running daemon):
   restart NAME               restart it now, e.g. after rebuilding
   gain NAME|master|click DB  set a level, e.g. ws gain bass -3
   mute NAME / unmute NAME
-  params NAME                list a generator's parameters and values
+  effect [--name NAME] [--insert GENERATOR] COMMAND [ARGS..]
+                             add an effect: a send effect (its own bus) or,
+                             with --insert, into a generator's chain
+  send GENERATOR EFFECT AMOUNT   send level 0..1 to a send effect (0 removes)
+  bypass EFFECT on|off       bypass an insert effect
+  params NAME                list a generator's or effect's parameters
   set NAME PARAM VALUE       set one, e.g. ws set acid cutoff 0.5
   bpm N                      change tempo
   key ROOT [SCALE]           change key, e.g. ws key F# phrygian

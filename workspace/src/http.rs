@@ -1,6 +1,7 @@
 //! The HTTP API, as specified in `workspace/openapi.yaml` (served at
 //! `/api/openapi.yaml`). A small HTTP/1.1 server on std, one thread per
-//! connection, `Connection: close` except for the event stream.
+//! connection, `Connection: close` except for the event stream. GETs
+//! outside `/api/` serve the web UI's files ([`crate::ui`]).
 //!
 //! Security: `POST /api/generators` starts programs, so the server binds to
 //! loopback only. It answers only requests whose `Host` is its loopback
@@ -15,7 +16,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -151,7 +152,7 @@ fn write_head(stream: &mut TcpStream, status: u16, content_type: &str, len: Opti
     stream.write_all(h.as_bytes())
 }
 
-fn handle(mut stream: TcpStream, ctl: &Ctl, cwd: &PathBuf, port: u16) -> io::Result<()> {
+fn handle(mut stream: TcpStream, ctl: &Ctl, cwd: &PathBuf, ui: &Path, port: u16) -> io::Result<()> {
     let Some(req) = read_request(&stream)? else { return Ok(()) };
 
     let host_ok = req.headers.get("host").is_some_and(|h| is_local_host(h, Some(port)));
@@ -175,6 +176,11 @@ fn handle(mut stream: TcpStream, ctl: &Ctl, cwd: &PathBuf, port: u16) -> io::Res
     }
     if req.method == "GET" && req.path == "/api/events" {
         return events(stream, ctl, &cors);
+    }
+    if req.method == "GET" && req.path != "/api" && !req.path.starts_with("/api/") {
+        let f = crate::ui::file(ui, &req.path);
+        write_head(&mut stream, f.status, f.content_type, Some(f.body.len()), &cors)?;
+        return stream.write_all(&f.body);
     }
 
     let r = route(&req, ctl, cwd);
@@ -209,11 +215,6 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
         };
     }
     match (m, segs.as_slice()) {
-        ("GET", [""]) => Response {
-            status: 200,
-            content_type: "text/plain; charset=utf-8",
-            body: b"workspace HTTP API; spec at /api/openapi.yaml\n".to_vec(),
-        },
         ("GET", ["api", "openapi.yaml"]) => Response { status: 200, content_type: "application/yaml", body: SPEC.as_bytes().to_vec() },
         ("GET", ["api", "state"]) => reply(200, ctl.state()),
         ("PATCH", ["api", "transport"]) => reply(200, ctl.patch_transport(body!())),
@@ -226,13 +227,23 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Err(e) => Response::error(&e),
         },
         ("PATCH", ["api", "generators", name, "params"]) => reply(200, ctl.set_params(name.to_string(), body!())),
+        ("POST", ["api", "generators", name, "inserts"]) => reply(201, ctl.add_effect(body!(), Some(name.to_string()), cwd)),
+        ("GET", ["api", "effects"]) => reply(200, ctl.effects()),
+        ("POST", ["api", "effects"]) => reply(201, ctl.add_effect(body!(), None, cwd)),
+        ("PATCH", ["api", "effects", name]) => reply(200, ctl.patch_effect(name.to_string(), body!())),
+        ("DELETE", ["api", "effects", name]) => match ctl.remove_effect(name.to_string()) {
+            Ok(()) => Response::empty(204),
+            Err(e) => Response::error(&e),
+        },
+        ("PATCH", ["api", "effects", name, "params"]) => reply(200, ctl.set_effect_params(name.to_string(), body!())),
+        ("POST", ["api", "effects", name, "restart"]) => reply(202, ctl.restart_effect(name.to_string())),
         ("POST", ["api", "generators", name, "restart"]) => reply(202, ctl.restart(name.to_string())),
         ("GET", ["api", "catalog"]) => Response::json(200, &ctl.catalog.list()),
         ("GET", ["api", "log"]) => {
             let after = req.query.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
             Response::json(200, &log_lines(after))
         }
-        (_, ["api", "state" | "transport" | "generators" | "catalog" | "log" | "openapi.yaml", ..]) => {
+        (_, ["api", "state" | "transport" | "generators" | "effects" | "catalog" | "log" | "openapi.yaml", ..]) => {
             Response::json(405, &serde_json::json!({ "error": format!("{m} not allowed on {}", req.path) }))
         }
         _ => Response::json(404, &serde_json::json!({ "error": format!("no such endpoint {}", req.path) })),

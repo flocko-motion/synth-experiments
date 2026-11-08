@@ -48,6 +48,10 @@ curl -s -N $A/api/events                                 # live state + log (SSE
   built generators show up without a restart. `command` takes any
   pipe-protocol program instead. Leave out `name` and one is derived,
   with `-2`, `-3`, … appended if taken.
+- **Web UI**: every other GET is served from `--ui DIR` (default
+  `workspace/ui`, relative to where the daemon starts), read on each
+  request, so new or edited files show up on reload with no rebuild.
+  Requests can't reach files outside that directory, symlinks included.
 - **Live updates**: `/api/events` streams `state` about 20 times a second
   and every log line, generator stderr included.
 - **Access**: loopback only. Requests must carry a loopback `Host`, and

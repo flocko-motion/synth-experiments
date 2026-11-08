@@ -19,6 +19,17 @@ info:
     Prefer it to polling `/api/state`. To animate the position smoothly
     between events, extrapolate from `beat` and `bpm` while `playing`.
 
+    **Effects.** Effects are pipe plugins with audio inputs, used in one of
+    two roles:
+    - **send**: its own bus. Every generator has a send amount (linear 0..1,
+      post-fader) to every send effect, and the effect's `gain_db` is its
+      return level into the mix. Send effects don't feed each other.
+    - **insert**: in one generator's chain, in order, before its fader.
+    Inserts add no latency: each block runs generators, then every chain's
+    first insert in parallel, then the second, and so on, then send
+    effects. An insert that is bypassed, restarting or late passes its input
+    through unchanged. A send effect in that state returns silence.
+
     **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
     that long after the response.
 
@@ -168,7 +179,7 @@ paths:
       - $ref: "#/components/parameters/Name"
     patch:
       operationId: patchGenerator
-      summary: Set a generator's volume or mute it
+      summary: Set a generator's volume, mute or send amounts
       requestBody:
         required: true
         content:
@@ -177,6 +188,7 @@ paths:
             examples:
               volume: { value: { gain_db: -6 } }
               mute: { value: { muted: true } }
+              sends: { value: { sends: { pump: 0.4, echo: 0 } } }
       responses:
         "200":
           description: The generator after the change
@@ -225,6 +237,142 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /api/generators/{name}/inserts:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      operationId: addInsert
+      summary: Add an insert effect to a generator's chain
+      description: |
+        Starts the effect and puts it into the generator's chain at
+        `position` (default: last). Removing the generator removes its
+        inserts. Naming works as for generators: names are shared between
+        generators and effects.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewEffect" }
+            examples:
+              duck: { value: { effect: duck, params: { depth: 0.9 } } }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /api/effects:
+    get:
+      operationId: listEffects
+      summary: All effects, send and insert
+      responses:
+        "200":
+          description: Effects, in the order they were added
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Effect" }
+    post:
+      operationId: addSendEffect
+      summary: Add a send effect (its own bus)
+      description: |
+        Starts the effect as a send effect. Every generator can then send to
+        it with `PATCH /api/generators/{name}` `{"sends": {"<effect>": 0.4}}`;
+        its `gain_db` is the return level.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewEffect" }
+            examples:
+              pump: { value: { effect: duck, name: pump, gain_db: -6 } }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /api/effects/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    patch:
+      operationId: patchEffect
+      summary: Return level, mute, bypass or chain position
+      description: "`gain_db` and `muted` apply to send effects (their return); `bypass` and `position` to inserts."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EffectPatch" }
+      responses:
+        "200":
+          description: The effect after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+    delete:
+      operationId: removeEffect
+      summary: Stop an effect and remove it
+      description: Removes it from its chain, or drops every generator's send to it.
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/effects/{name}/params:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    patch:
+      operationId: setEffectParams
+      summary: Set an effect's parameters
+      description: Same rules as setParams.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              additionalProperties: { type: number }
+      responses:
+        "200":
+          description: The effect after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /api/effects/{name}/restart:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      operationId: restartEffect
+      summary: Restart an effect now
+      responses:
+        "202":
+          description: Restart scheduled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/generators/{name}/restart:
     parameters:
@@ -358,7 +506,7 @@ components:
 
     State:
       type: object
-      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, ahead_ms, underruns, sample_rate, generators]
+      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, ahead_ms, underruns, sample_rate, generators, effects]
       properties:
         playing: { type: boolean }
         position: { $ref: "#/components/schemas/Position" }
@@ -376,6 +524,9 @@ components:
         generators:
           type: array
           items: { $ref: "#/components/schemas/Generator" }
+        effects:
+          type: array
+          items: { $ref: "#/components/schemas/Effect" }
 
     TransportPatch:
       type: object
@@ -403,7 +554,7 @@ components:
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error]
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -418,7 +569,7 @@ components:
           description: 1 (mono) or 2 (stereo); null while not running.
         inputs:
           type: [integer, "null"]
-          description: Input channels; non-zero for effects (fed silence until routing exists). Null while not running.
+          description: Input channels; always 0 for generators (effects are in `effects`). Null while not running.
         params:
           type: array
           items: { $ref: "#/components/schemas/Param" }
@@ -437,6 +588,12 @@ components:
               properties:
                 message: { type: string, examples: ["hung (no output for 1s)", "exited", "garbled output (something printed to stdout?)"] }
                 seconds_ago: { type: number }
+        inserts:
+          type: array
+          items: { $ref: "#/components/schemas/GeneratorName" }
+          description: Insert effects (names in `effects`), in signal order.
+        sends:
+          $ref: "#/components/schemas/Sends"
 
     Param:
       type: object
@@ -485,14 +642,109 @@ components:
       properties:
         gain_db: { $ref: "#/components/schemas/Decibels" }
         muted: { type: boolean }
+        sends:
+          type: object
+          description: Send amounts to set, by send-effect name; 0 or null removes. Others are unchanged.
+          additionalProperties:
+            oneOf:
+              - type: "null"
+              - { type: number, minimum: 0, maximum: 1 }
+
+    Sends:
+      type: object
+      description: Post-fader send amounts (linear 0..1) by send-effect name. Absent means 0.
+      additionalProperties: { type: number, minimum: 0, maximum: 1 }
+
+    Effect:
+      type: object
+      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error]
+      properties:
+        name: { $ref: "#/components/schemas/GeneratorName" }
+        command: { type: array, items: { type: string } }
+        description: { type: string }
+        role:
+          type: string
+          enum: [send, insert]
+        owner:
+          type: [string, "null"]
+          description: Inserts only, the generator whose chain it's in.
+        channels: { type: [integer, "null"] }
+        inputs: { type: [integer, "null"] }
+        params:
+          type: array
+          items: { $ref: "#/components/schemas/Param" }
+        gain_db:
+          $ref: "#/components/schemas/Decibels"
+        muted: { type: boolean }
+        bypass: { type: boolean, description: Inserts only. }
+        state: { $ref: "#/components/schemas/GeneratorState" }
+        late: { type: integer, minimum: 0 }
+        restarts: { type: integer, minimum: 0 }
+        peak: { $ref: "#/components/schemas/Peak" }
+        last_error:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [message, seconds_ago]
+              properties:
+                message: { type: string }
+                seconds_ago: { type: number }
+
+    NewEffect:
+      type: object
+      additionalProperties: false
+      description: Exactly one of `effect` and `command`.
+      properties:
+        name: { $ref: "#/components/schemas/GeneratorName" }
+        effect: { type: string, description: "A `name` from /api/catalog with kind effect." }
+        command: { type: array, minItems: 1, items: { type: string } }
+        seed: { type: integer, minimum: 0 }
+        params:
+          type: object
+          additionalProperties: { type: number }
+          description: Initial parameter values by id.
+        gain_db: { $ref: "#/components/schemas/Decibels" }
+        muted: { type: boolean }
+        position: { type: integer, minimum: 0, description: "Inserts: index in the chain, 0 = first; default last." }
+      oneOf:
+        - required: [effect]
+        - required: [command]
+
+    EffectPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        gain_db: { $ref: "#/components/schemas/Decibels" }
+        muted: { type: boolean }
+        bypass: { type: boolean, description: Inserts only. }
+        position: { type: integer, minimum: 0, description: "Inserts only: move to this index." }
 
     CatalogEntry:
       type: object
-      required: [name, description, channels, path]
+      required: [name, kind, description, channels, inputs, params, path]
       properties:
-        name: { type: string, description: "Pass as `generator` to addGenerator." }
+        name: { type: string, description: "Pass as `generator` to addGenerator, or as `effect` to addSendEffect/addInsert." }
+        kind: { type: string, enum: [generator, effect] }
         description: { type: string }
         channels: { type: integer }
+        inputs: { type: integer, description: Non-zero for effects. }
+        params:
+          type: array
+          description: Parameter descriptions (defaults, no current values).
+          items:
+            type: object
+            required: [id, name, min, max, default, kind, log, unit]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              min: { type: number }
+              max: { type: number }
+              default: { type: number }
+              kind: { type: string, enum: [continuous, integer, toggle, choice] }
+              log: { type: boolean }
+              unit: { type: string }
+              labels: { type: array, items: { type: string } }
         path: { type: string }
 
     LogLine:

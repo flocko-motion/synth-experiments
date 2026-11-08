@@ -20,7 +20,7 @@
 use crate::api::{self, ApiError, Ctl, Job};
 use crate::catalog::Catalog;
 use crate::click::Click;
-use crate::gen::{Slot, Spawned};
+use crate::gen::{adapt_channels, Slot, Spawned};
 use crate::log::wlog;
 use crate::ring::Ring;
 use crate::sys;
@@ -57,6 +57,53 @@ pub struct Opts {
 /// Per-block falloff of the level meters (about -20 dB in 0.4 s).
 const PEAK_FALLOFF: f32 = 0.93;
 
+/// What every stage of a block shares.
+struct Stage {
+    seq: u64,
+    req: Request,
+    channels: usize,
+    deadline: Instant,
+    block_secs: f64,
+}
+
+/// Runs each generator's buffer through its insert chain. Chains advance together: every
+/// chain's first effect renders in parallel, then every second effect, and
+/// so on, so effects add no latency and stay sample-aligned with the grid.
+/// An effect that is bypassed, restarting, late or broken passes its input
+/// through unchanged, so a channel never goes silent because of an effect.
+fn run_chains(fx: &mut [Slot], chains: &[Vec<String>], bufs: &mut [Vec<f32>], st: &Stage) {
+    let depth = chains.iter().map(Vec::len).max().unwrap_or(0);
+    for d in 0..depth {
+        let mut asked = Vec::new();
+        for (c, names) in chains.iter().enumerate() {
+            let Some(name) = names.get(d) else { continue };
+            let Some(fi) = fx.iter().position(|s| &s.name == name) else { continue };
+            fx[fi].peak *= PEAK_FALLOFF;
+            if fx[fi].bypass {
+                continue;
+            }
+            fx[fi].request(st.seq, st.req, &bufs[c], st.channels);
+            asked.push((c, fi));
+        }
+        let short = Instant::now() + Duration::from_secs_f64(st.block_secs / 3.0);
+        for (c, fi) in asked {
+            let slot = &mut fx[fi];
+            let Some(mut chunk) = slot.collect(st.seq, st.deadline, short) else { continue };
+            slot.sanitize(&mut chunk);
+            let Some(och) = slot.channels() else { continue };
+            let out = adapt_channels(&chunk, och, st.channels);
+            slot.peak = out.iter().fold(slot.peak, |p, s| p.max(s.abs()));
+            bufs[c] = out;
+        }
+    }
+}
+
+fn add_scaled(into: &mut [f32], from: &[f32], gain: f32) {
+    for (o, x) in into.iter_mut().zip(from) {
+        *o += x * gain;
+    }
+}
+
 pub struct Mixer {
     pub sample_rate: u32,
     channels: usize,
@@ -81,6 +128,10 @@ pub struct Mixer {
     pub tonality: Tonality,
 
     pub gens: Vec<Slot>,
+    /// Every effect slot. An effect is either an insert in one generator's
+    /// chain (`owner` is set) or a send effect: its own bus, fed by every
+    /// generator's send to it, returned to the mix through its own fader.
+    pub fx: Vec<Slot>,
     /// Background restarts report here.
     spawned_tx: Sender<Spawned>,
     click: Click,
@@ -165,6 +216,7 @@ impl Mixer {
             underruns: self.underruns.load(Ordering::Relaxed),
             sample_rate: self.sample_rate,
             generators: self.gens.iter().map(api::Generator::of).collect(),
+            effects: self.fx.iter().map(api::Effect::of).collect(),
         }
     }
 
@@ -201,8 +253,34 @@ impl Mixer {
             if let Some((why, at)) = &g.last_error {
                 s.push_str(&format!("{:w$}  └ {} ago: {why}\n", "", fmt_ago(at.elapsed())));
             }
+            let routing = self.chain_text(&g.inserts)
+                + &g.sends.iter().map(|(fx, a)| format!("  send {fx} {a:.2}")).collect::<String>();
+            if !routing.is_empty() {
+                s.push_str(&format!("{:w$} {routing}\n", ""));
+            }
+        }
+        for f in self.fx.iter().filter(|f| f.owner.is_none()) {
+            s.push_str(&format!(
+                "send fx {}  return {:+.1} dB  {}{}\n",
+                f.name,
+                f.gain_db,
+                f.state_label(),
+                f.last_error.as_ref().map_or(String::new(), |(why, at)| format!("  (last error {} ago: {why})", fmt_ago(at.elapsed())))
+            ));
         }
         s
+    }
+
+    /// `  -> duck (ok) -> echo (bypass)` for a chain, or empty.
+    fn chain_text(&self, names: &[String]) -> String {
+        names
+            .iter()
+            .map(|n| match self.fx.iter().find(|f| &f.name == n) {
+                Some(f) if f.bypass => format!("  -> {n} (bypass)"),
+                Some(f) => format!("  -> {n} ({})", f.state_label()),
+                None => format!("  -> {n} (missing)"),
+            })
+            .collect()
     }
 
     fn render_block(&mut self) {
@@ -217,46 +295,87 @@ impl Mixer {
         };
         let seq = self.seq;
         for g in &mut self.gens {
-            g.request(seq, req);
+            g.request(seq, req, &[], 0);
         }
 
         // Wait for chunks at most until half of what's buffered would have
-        // played; past that we'd rather drop one generator's block than the
-        // whole output.
+        // played; past that we'd rather drop one process's block than the
+        // whole output. Every stage of the block shares this deadline.
         let buffered = Duration::from_secs_f64(self.ring.len() as f64 / ch as f64 / self.sample_rate as f64);
         let now = Instant::now();
-        let deadline = now + (buffered / 2).max(Duration::from_millis(2));
-        // For generators already behind: a few ms, well under a block's
+        let block_secs = n as f64 / self.sample_rate as f64;
+        let st = Stage { seq, req, channels: ch, deadline: now + (buffered / 2).max(Duration::from_millis(2)), block_secs };
+        // For processes already behind: a few ms, well under a block's
         // duration, so the mixer always outpaces the device.
-        let short_deadline = now + Duration::from_secs_f64(n as f64 / self.sample_rate as f64 / 3.0);
+        let short_deadline = now + Duration::from_secs_f64(block_secs / 3.0);
 
-        self.mix.clear();
-        self.mix.resize(n * ch, 0.0);
+        // 1. generators, each into its own buffer at the output's width
+        let silence = vec![0.0f32; n * ch];
+        let mut chans: Vec<Vec<f32>> = Vec::with_capacity(self.gens.len());
         for g in &mut self.gens {
             g.peak *= PEAK_FALLOFF;
-            let Some(mut chunk) = g.collect(seq, deadline, short_deadline) else { continue };
-            g.sanitize(&mut chunk);
+            let buf = match (g.collect(seq, st.deadline, short_deadline), g.channels()) {
+                (Some(mut chunk), Some(gch)) => {
+                    g.sanitize(&mut chunk);
+                    adapt_channels(&chunk, gch, ch)
+                }
+                _ => silence.clone(),
+            };
+            chans.push(buf);
+        }
+
+        // 2. generator insert chains
+        let chains: Vec<Vec<String>> = self.gens.iter().map(|g| g.inserts.clone()).collect();
+        run_chains(&mut self.fx, &chains, &mut chans, &st);
+
+        // 3. faders into the mix; sends (post-fader, linear amounts) into
+        //    each send effect's input
+        self.mix.clear();
+        self.mix.resize(n * ch, 0.0);
+        let mut send_in: Vec<Option<Vec<f32>>> = self.fx.iter().map(|f| f.owner.is_none().then(|| silence.clone())).collect();
+        for (g, buf) in self.gens.iter_mut().zip(&chans) {
             let gain = g.gain();
-            let Some(gch) = g.channels() else { continue };
             if gain == 0.0 {
                 continue;
             }
-            g.peak = chunk.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
-            for (f, out) in self.mix.chunks_exact_mut(ch).enumerate() {
-                let src = &chunk[f * gch..(f + 1) * gch];
-                for (c, o) in out.iter_mut().enumerate() {
-                    // mono to every channel; otherwise channel by channel,
-                    // repeating the last one on wider devices
-                    *o += src[c.min(gch - 1)] * gain;
+            g.peak = buf.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
+            add_scaled(&mut self.mix, buf, gain);
+            for (fx, amount) in &g.sends {
+                if let Some(Some(input)) = self.fx.iter().position(|f| &f.name == fx).map(|i| send_in[i].as_mut()) {
+                    add_scaled(input, buf, gain * *amount as f32);
                 }
             }
         }
 
+        // 4. send effects, all in parallel; each returns through its own
+        //    fader. A send effect that's restarting or late returns nothing
+        //    (passing its input through would double the dry signal).
+        for (f, input) in self.fx.iter_mut().zip(&send_in) {
+            if let Some(input) = input {
+                f.peak *= PEAK_FALLOFF;
+                f.request(seq, req, input, ch);
+            }
+        }
+        for (f, input) in self.fx.iter_mut().zip(&send_in) {
+            if input.is_none() {
+                continue;
+            }
+            let (Some(mut chunk), Some(fch)) = (f.collect(seq, st.deadline, short_deadline), f.channels()) else { continue };
+            f.sanitize(&mut chunk);
+            let gain = f.gain();
+            if gain == 0.0 {
+                continue;
+            }
+            let out = adapt_channels(&chunk, fch, ch);
+            f.peak = out.iter().fold(f.peak, |p, s| p.max(s.abs() * gain));
+            add_scaled(&mut self.mix, &out, gain);
+        }
+
+        // 5. click (not through the master chain), master gain, soft clip
         if self.click_on {
             let (playing, spb, gain) = (self.playing, self.samples_per_beat(), db_to_gain(self.click_db));
             self.click.render(&mut self.mix, ch, self.beats_per_bar, gain, |i| playing.then(|| beat0 + i as f64 / spb));
         }
-
         // Soft clip so stacked generators saturate instead of wrapping.
         let master = db_to_gain(self.master_db);
         let mut peak = self.master_peak * PEAK_FALLOFF;
@@ -375,6 +494,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
         playing: true,
         tonality: opts.tonality,
         gens: Vec::new(),
+        fx: Vec::new(),
         spawned_tx,
         click: Click::new(sample_rate as f64),
         click_on: opts.click,
@@ -413,7 +533,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     drop(stream);
     let _ = std::fs::remove_file(&opts.socket);
     // Close every generator's stdin at once, then wait until all are gone.
-    let reapers: Vec<_> = m.gens.iter_mut().filter_map(Slot::shutdown).collect();
+    let reapers: Vec<_> = m.gens.iter_mut().chain(m.fx.iter_mut()).filter_map(Slot::shutdown).collect();
     for r in reapers {
         let _ = r.join();
     }
@@ -435,11 +555,11 @@ fn mix_loop(m: &mut Mixer, jobs: Receiver<Job>, spawned: Receiver<Spawned>) {
             return;
         }
         while let Ok(s) = spawned.try_recv() {
-            if let Some(g) = m.gens.iter_mut().find(|g| g.name == s.name) {
+            if let Some(g) = m.gens.iter_mut().chain(m.fx.iter_mut()).find(|g| g.name == s.name) {
                 g.spawned(s);
             }
         }
-        for g in &mut m.gens {
+        for g in m.gens.iter_mut().chain(m.fx.iter_mut()) {
             g.maybe_restart(&m.spawned_tx);
         }
         fill(m);

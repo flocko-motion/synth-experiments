@@ -1,9 +1,10 @@
-//! Generators available to add: the executables in one directory
-//! (`target/release` by default) that answer `--info` the way `gen-api`'s
-//! CLI does. A freshly built generator shows up without restarting the
+//! Generators and effects available to add: the executables in one
+//! directory (`target/release` by default) that answer `--info --json` the
+//! way `gen-api`'s CLI does. A freshly built generator shows up without restarting the
 //! daemon. Answers are cached per binary until it's rebuilt.
 
-use serde::Serialize;
+use crate::gen::ParamDesc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -18,9 +19,23 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Serialize, Clone)]
 pub struct Entry {
     pub name: String,
+    /// "generator" or "effect" (has inputs).
+    pub kind: &'static str,
     pub description: String,
     pub channels: u16,
+    pub inputs: u16,
+    pub params: Vec<ParamDesc>,
     pub path: String,
+}
+
+#[derive(Deserialize)]
+struct Info {
+    description: String,
+    channels: u16,
+    #[serde(default)]
+    inputs: u16,
+    #[serde(default)]
+    params: Vec<ParamDesc>,
 }
 
 pub struct Catalog {
@@ -72,12 +87,11 @@ impl Catalog {
     }
 }
 
-/// Runs `path --info` and parses gen-api's three lines: name, description,
-/// `channels: N`. Anything else, or no answer within the timeout, means
-/// it's not a generator.
+/// Runs `path --info --json`. Anything that isn't the description JSON, or
+/// no answer within the timeout, means it's not a generator.
 fn ask_info(path: &Path, file: &str) -> Option<Entry> {
     let mut child = Command::new(path)
-        .arg("--info")
+        .args(["--info", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -99,9 +113,14 @@ fn ask_info(path: &Path, file: &str) -> Option<Entry> {
     }
     let mut text = String::new();
     std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).ok()?;
-    let mut lines = text.lines();
-    let _name = lines.next()?;
-    let description = lines.next()?.to_owned();
-    let channels = lines.next()?.strip_prefix("channels:")?.trim().parse().ok()?;
-    Some(Entry { name: file.to_owned(), description, channels, path: path.to_string_lossy().into_owned() })
+    let info: Info = serde_json::from_str(text.trim()).ok()?;
+    Some(Entry {
+        name: file.to_owned(),
+        kind: if info.inputs > 0 { "effect" } else { "generator" },
+        description: info.description,
+        channels: info.channels,
+        inputs: info.inputs,
+        params: info.params,
+        path: path.to_string_lossy().into_owned(),
+    })
 }

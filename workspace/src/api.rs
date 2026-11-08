@@ -78,6 +78,7 @@ pub struct State {
     pub underruns: u64,
     pub sample_rate: u32,
     pub generators: Vec<Generator>,
+    pub effects: Vec<Effect>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +111,66 @@ pub struct Generator {
     pub restarts: u64,
     pub peak: f32,
     pub last_error: Option<LastError>,
+    /// Insert effects, by name, in signal order.
+    pub inserts: Vec<String>,
+    /// Post-fader send amounts (linear 0..1) to send effects, by name.
+    /// Absent means 0.
+    pub sends: BTreeMap<String, f64>,
+}
+
+#[derive(Serialize)]
+pub struct Effect {
+    pub name: String,
+    pub command: Vec<String>,
+    pub description: String,
+    /// "send": its own bus, fed by every generator's send to it and
+    /// returned through its fader. "insert": in `owner`'s chain.
+    pub role: &'static str,
+    pub owner: Option<String>,
+    pub channels: Option<usize>,
+    pub inputs: Option<usize>,
+    pub params: Vec<Param>,
+    /// Send effects: return level. Insert effects: unused.
+    pub gain_db: f64,
+    pub muted: bool,
+    /// Insert effects: passing input straight through.
+    pub bypass: bool,
+    pub state: String,
+    pub late: u64,
+    pub restarts: u64,
+    pub peak: f32,
+    pub last_error: Option<LastError>,
+}
+
+fn params_of(g: &Slot) -> Vec<Param> {
+    g.params().unwrap_or_default().iter().map(|d| Param { desc: d.clone(), value: g.value_of(d) }).collect()
+}
+
+fn last_error_of(g: &Slot) -> Option<LastError> {
+    g.last_error.as_ref().map(|(m, at)| LastError { message: m.clone(), seconds_ago: at.elapsed().as_secs_f64() })
+}
+
+impl Effect {
+    pub fn of(f: &Slot) -> Effect {
+        Effect {
+            name: f.name.clone(),
+            command: f.spec.argv.clone(),
+            description: f.description().unwrap_or_default().to_owned(),
+            role: if f.owner.is_some() { "insert" } else { "send" },
+            owner: f.owner.clone(),
+            channels: f.channels(),
+            inputs: f.inputs(),
+            params: params_of(f),
+            gain_db: f.gain_db,
+            muted: f.muted,
+            bypass: f.bypass,
+            state: f.state_label(),
+            late: f.late,
+            restarts: f.restarts,
+            peak: f.peak,
+            last_error: last_error_of(f),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -133,14 +194,16 @@ impl Generator {
             description: g.description().unwrap_or_default().to_owned(),
             channels: g.channels(),
             inputs: g.inputs(),
-            params: g.params().unwrap_or_default().iter().map(|d| Param { desc: d.clone(), value: g.value_of(d) }).collect(),
+            params: params_of(g),
             gain_db: g.gain_db,
             muted: g.muted,
             state: g.state_label(),
             late: g.late,
             restarts: g.restarts,
             peak: g.peak,
-            last_error: g.last_error.as_ref().map(|(m, at)| LastError { message: m.clone(), seconds_ago: at.elapsed().as_secs_f64() }),
+            last_error: last_error_of(g),
+            inserts: g.inserts.clone(),
+            sends: g.sends.clone(),
         }
     }
 }
@@ -188,6 +251,37 @@ pub struct NewGenerator {
 pub struct GeneratorPatch {
     pub gain_db: Option<f64>,
     pub muted: Option<bool>,
+    /// Send amounts by send-effect name, linear 0..1; 0 or null removes.
+    pub sends: Option<BTreeMap<String, Option<f64>>>,
+}
+
+/// Exactly one of `effect` and `command`.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NewEffect {
+    pub name: Option<String>,
+    /// An effect from the catalog, by name.
+    pub effect: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub seed: Option<u64>,
+    /// Initial parameter values by id.
+    pub params: Option<BTreeMap<String, f64>>,
+    /// Send effects: return level.
+    pub gain_db: Option<f64>,
+    pub muted: Option<bool>,
+    /// Inserts: index in the chain, 0 = first; default last.
+    pub position: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EffectPatch {
+    pub gain_db: Option<f64>,
+    pub muted: Option<bool>,
+    /// Inserts only.
+    pub bypass: Option<bool>,
+    /// Inserts only: move to this index in the chain.
+    pub position: Option<usize>,
 }
 
 // ---------------------------------------------------------------- validation
@@ -236,7 +330,9 @@ fn check_name(name: &str) -> Result<()> {
 
 /// `base`, or `base-2`, `base-3`, … whichever is free first.
 fn free_name(m: &Mixer, base: &str) -> String {
-    let taken = |n: &str| m.gens.iter().any(|g| g.name == n);
+    // Generators and effects share one namespace (log lines are tagged by
+    // name).
+    let taken = |n: &str| m.gens.iter().chain(&m.fx).any(|g| g.name == n);
     if !taken(base) {
         return base.to_owned();
     }
@@ -257,6 +353,39 @@ fn base_name(program: &str) -> String {
 
 fn find<'a>(m: &'a mut Mixer, name: &str) -> Result<&'a mut Slot> {
     m.gens.iter_mut().find(|g| g.name == name).ok_or_else(|| ApiError::NotFound(format!("no generator named {name}")))
+}
+
+fn find_fx<'a>(m: &'a mut Mixer, name: &str) -> Result<&'a mut Slot> {
+    m.fx.iter_mut().find(|g| g.name == name).ok_or_else(|| ApiError::NotFound(format!("no effect named {name}")))
+}
+
+fn taken(m: &Mixer, name: &str) -> bool {
+    m.gens.iter().chain(&m.fx).any(|g| g.name == name)
+}
+
+/// Checks param ids against the running proc (if it is running) and stores
+/// the values.
+fn apply_params(g: &mut Slot, values: BTreeMap<String, f64>) -> Result<()> {
+    if let Some((id, _)) = values.iter().find(|(_, v)| !v.is_finite()) {
+        return Err(bad(format!("{id}: not a number")));
+    }
+    if let Some(params) = g.params() {
+        if let Some(id) = values.keys().find(|id| !params.iter().any(|d| &d.id == *id)) {
+            let known: Vec<&str> = params.iter().map(|d| d.id.as_str()).collect();
+            return Err(ApiError::NotFound(format!("{} has no parameter {id}; it has: {}", g.name, known.join(", "))));
+        }
+    }
+    g.values.extend(values);
+    Ok(())
+}
+
+/// Removes effect slots and every reference to them.
+fn drop_effects(m: &mut Mixer, names: &[String]) {
+    m.fx.retain(|f| !names.contains(&f.name));
+    for g in &mut m.gens {
+        g.inserts.retain(|n| !names.contains(n));
+        g.sends.retain(|n, _| !names.contains(n));
+    }
 }
 
 // ---------------------------------------------------------------- operations
@@ -339,21 +468,55 @@ impl Ctl {
     /// audio. A first start that fails is reported and nothing is added;
     /// later crashes are restarted.
     pub fn add(&self, g: NewGenerator, cwd: &Path) -> Result<Generator> {
-        let mut argv = match (g.generator, g.command) {
-            (Some(gen), None) => {
-                let path = self.catalog.path_of(&gen).ok_or_else(|| ApiError::NotFound(format!("no generator {gen} in the catalog")))?;
+        let gain_db = g.gain_db.map(check_db).transpose()?;
+        let (mut slot, explicit) = self.spawn_slot(g.name, g.generator, g.command, g.seed, cwd, "generator")?;
+        if slot.inputs() != Some(0) {
+            return Err(ApiError::Unprocessable(format!(
+                "{} is an effect; add it with POST /api/effects (send) or POST /api/generators/{{name}}/inserts",
+                slot.name
+            )));
+        }
+        slot.gain_db = gain_db.unwrap_or(0.0);
+        slot.muted = g.muted.unwrap_or(false);
+        self.on_mixer(move |m| {
+            if taken(m, &slot.name) {
+                if explicit {
+                    return Err(ApiError::Conflict(format!("{} already exists", slot.name)));
+                }
+                slot.name = free_name(m, &slot.name);
+            }
+            let view = Generator::of(&slot);
+            m.gens.push(slot);
+            Ok(view)
+        })?
+    }
+
+    /// Resolves the program, picks a name and starts the process. Spawning
+    /// and the handshake happen on the calling thread, not the mixer, so a
+    /// slow start doesn't hold up audio.
+    fn spawn_slot(
+        &self,
+        name: Option<String>,
+        from_catalog: Option<String>,
+        command: Option<Vec<String>>,
+        seed: Option<u64>,
+        cwd: &Path,
+        what: &str,
+    ) -> Result<(Slot, bool)> {
+        let mut argv = match (from_catalog, command) {
+            (Some(c), None) => {
+                let path = self.catalog.path_of(&c).ok_or_else(|| ApiError::NotFound(format!("no {what} {c} in the catalog")))?;
                 vec![path.to_string_lossy().into_owned()]
             }
             (None, Some(cmd)) if cmd.first().is_some_and(|p| !p.is_empty()) => cmd,
             (None, Some(_)) => return Err(bad("command is empty")),
-            _ => return Err(bad("give exactly one of generator and command")),
+            _ => return Err(bad(format!("give exactly one of {what} and command"))),
         };
-        if let Some(seed) = g.seed {
+        if let Some(seed) = seed {
             argv.extend(["--seed".into(), seed.to_string()]);
         }
-        let gain_db = g.gain_db.map(check_db).transpose()?;
-        let explicit = g.name.is_some();
-        let name = match g.name {
+        let explicit = name.is_some();
+        let name = match name {
             Some(n) => {
                 check_name(&n)?;
                 n
@@ -367,29 +530,127 @@ impl Ctl {
         if explicit && free != name {
             return Err(ApiError::Conflict(format!("{name} already exists")));
         }
-        let name = free;
         let spec = Spec { argv, cwd: cwd.to_owned(), sample_rate: self.sample_rate, max_frames: BLOCK as u32 };
-        let proc = Proc::spawn(&name, &spec).map_err(ApiError::Unprocessable)?;
-        let mut slot = Slot::new(&name, spec, proc);
+        let proc = Proc::spawn(&free, &spec).map_err(ApiError::Unprocessable)?;
+        Ok((Slot::new(&free, spec, proc), explicit))
+    }
+
+    pub fn effects(&self) -> Result<Vec<Effect>> {
+        self.on_mixer(|m| m.fx.iter().map(Effect::of).collect())
+    }
+
+    /// Adds an effect: a send effect when `owner` is None, otherwise an
+    /// insert in that generator's chain.
+    pub fn add_effect(&self, e: NewEffect, owner: Option<String>, cwd: &Path) -> Result<Effect> {
+        let gain_db = e.gain_db.map(check_db).transpose()?;
+        if let Some(o) = owner.clone() {
+            self.on_mixer(move |m| find(m, &o).map(|_| ()))??;
+        }
+        let (mut slot, explicit) = self.spawn_slot(e.name, e.effect, e.command, e.seed, cwd, "effect")?;
+        if slot.inputs() == Some(0) {
+            return Err(ApiError::Unprocessable(format!("{} is a generator, not an effect (it takes no input)", slot.name)));
+        }
+        if let Some(values) = e.params {
+            apply_params(&mut slot, values)?;
+        }
         slot.gain_db = gain_db.unwrap_or(0.0);
-        slot.muted = g.muted.unwrap_or(false);
+        slot.muted = e.muted.unwrap_or(false);
+        slot.owner = owner;
         self.on_mixer(move |m| {
-            if m.gens.iter().any(|s| s.name == slot.name) {
+            if taken(m, &slot.name) {
                 if explicit {
                     return Err(ApiError::Conflict(format!("{} already exists", slot.name)));
                 }
                 slot.name = free_name(m, &slot.name);
             }
-            let view = Generator::of(&slot);
-            m.gens.push(slot);
+            if let Some(o) = &slot.owner {
+                let g = find(m, o)?;
+                let at = e.position.unwrap_or(g.inserts.len()).min(g.inserts.len());
+                g.inserts.insert(at, slot.name.clone());
+            }
+            let view = Effect::of(&slot);
+            m.fx.push(slot);
             Ok(view)
+        })?
+    }
+
+    pub fn patch_effect(&self, name: String, p: EffectPatch) -> Result<Effect> {
+        let gain_db = p.gain_db.map(check_db).transpose()?;
+        self.on_mixer(move |m| {
+            let f = find_fx(m, &name)?;
+            let owner = f.owner.clone();
+            if owner.is_none() && (p.bypass.is_some() || p.position.is_some()) {
+                return Err(bad("bypass and position are for insert effects; mute a send effect or set its gain_db"));
+            }
+            if let Some(db) = gain_db {
+                f.gain_db = db;
+            }
+            if let Some(muted) = p.muted {
+                f.muted = muted;
+            }
+            if let Some(b) = p.bypass {
+                f.bypass = b;
+            }
+            let view_name = f.name.clone();
+            if let (Some(pos), Some(o)) = (p.position, owner) {
+                let g = find(m, &o)?;
+                g.inserts.retain(|n| *n != view_name);
+                let at = pos.min(g.inserts.len());
+                g.inserts.insert(at, view_name.clone());
+            }
+            Ok(Effect::of(find_fx(m, &view_name)?))
+        })?
+    }
+
+    pub fn set_effect_params(&self, name: String, values: BTreeMap<String, f64>) -> Result<Effect> {
+        if values.is_empty() {
+            return Err(bad("no parameters given"));
+        }
+        self.on_mixer(move |m| {
+            let f = find_fx(m, &name)?;
+            apply_params(f, values)?;
+            Ok(Effect::of(f))
+        })?
+    }
+
+    pub fn remove_effect(&self, name: String) -> Result<()> {
+        self.on_mixer(move |m| {
+            find_fx(m, &name)?;
+            drop_effects(m, &[name]);
+            Ok(())
+        })?
+    }
+
+    pub fn restart_effect(&self, name: String) -> Result<Effect> {
+        self.on_mixer(move |m| {
+            let f = find_fx(m, &name)?;
+            f.restart_now();
+            Ok(Effect::of(f))
         })?
     }
 
     pub fn patch_generator(&self, name: String, p: GeneratorPatch) -> Result<Generator> {
         let gain_db = p.gain_db.map(check_db).transpose()?;
+        if let Some((fx, _)) = p.sends.iter().flatten().find(|(_, a)| a.is_some_and(|a| !(0.0..=1.0).contains(&a))) {
+            return Err(bad(format!("send to {fx}: amounts are 0..1")));
+        }
         self.on_mixer(move |m| {
+            if let Some(sends) = &p.sends {
+                for fx in sends.keys() {
+                    match m.fx.iter().find(|f| &f.name == fx) {
+                        None => return Err(ApiError::NotFound(format!("no effect named {fx}"))),
+                        Some(f) if f.owner.is_some() => return Err(bad(format!("{fx} is an insert effect; only send effects take sends"))),
+                        Some(_) => {}
+                    }
+                }
+            }
             let g = find(m, &name)?;
+            for (fx, amount) in p.sends.into_iter().flatten() {
+                match amount {
+                    Some(a) if a > 0.0 => g.sends.insert(fx, a),
+                    _ => g.sends.remove(&fx),
+                };
+            }
             if let Some(db) = gain_db {
                 g.gain_db = db;
             }
@@ -407,31 +668,26 @@ impl Ctl {
         if values.is_empty() {
             return Err(bad("no parameters given"));
         }
-        if let Some((id, _)) = values.iter().find(|(_, v)| !v.is_finite()) {
-            return Err(bad(format!("{id}: not a number")));
-        }
         self.on_mixer(move |m| {
             let g = find(m, &name)?;
-            if let Some(params) = g.params() {
-                if let Some(id) = values.keys().find(|id| !params.iter().any(|d| &d.id == *id)) {
-                    let known: Vec<&str> = params.iter().map(|d| d.id.as_str()).collect();
-                    return Err(ApiError::NotFound(format!("{name} has no parameter {id}; it has: {}", known.join(", "))));
-                }
-            }
-            g.values.extend(values);
+            apply_params(g, values)?;
             Ok(Generator::of(g))
         })?
     }
 
+    /// Removes a generator and its insert effects.
     pub fn remove(&self, name: String) -> Result<()> {
         self.on_mixer(move |m| {
-            let before = m.gens.len();
+            let inserts = find(m, &name)?.inserts.clone();
+            drop_effects(m, &inserts);
             m.gens.retain(|g| g.name != name);
-            if m.gens.len() == before {
-                return Err(ApiError::NotFound(format!("no generator named {name}")));
-            }
             Ok(())
         })?
+    }
+
+    fn is_effect(&self, name: &str) -> Result<bool> {
+        let n = name.to_owned();
+        self.on_mixer(move |m| m.fx.iter().any(|f| f.name == n))
     }
 
     pub fn restart(&self, name: String) -> Result<Generator> {
@@ -474,22 +730,71 @@ impl Ctl {
                 let g = self.add(NewGenerator { name, command: Some(cmd.to_vec()), ..Default::default() }, cwd)?;
                 Ok(format!("added {} ({} ch)\n", g.name, g.channels.unwrap_or(0)))
             }
-            "rm" => self.remove(arg(0, "NAME")?).map(|_| format!("removed {}\n", rest[0])),
-            "restart" => self.restart(arg(0, "NAME")?).map(|g| format!("restarting {}\n", g.name)),
+            "rm" => {
+                let name = arg(0, "NAME")?;
+                if self.is_effect(&name)? { self.remove_effect(name.clone())? } else { self.remove(name.clone())? }
+                Ok(format!("removed {name}\n"))
+            }
+            "restart" => {
+                let name = arg(0, "NAME")?;
+                if self.is_effect(&name)? { self.restart_effect(name.clone()).map(|_| ())? } else { self.restart(name.clone()).map(|_| ())? }
+                Ok(format!("restarting {name}\n"))
+            }
+            "effect" => {
+                // ws effect [--name NAME] [--insert GENERATOR] COMMAND [ARGS...]
+                let mut rest = rest;
+                let (mut name, mut owner) = (None, None);
+                loop {
+                    match rest {
+                        [flag, v, more @ ..] if flag == "--name" => (name, rest) = (Some(v.clone()), more),
+                        [flag, v, more @ ..] if flag == "--insert" => (owner, rest) = (Some(v.clone()), more),
+                        _ => break,
+                    }
+                }
+                if rest.is_empty() {
+                    return Err(bad("usage: ws effect [--name NAME] [--insert GENERATOR] COMMAND [ARGS...]"));
+                }
+                let e = self.add_effect(NewEffect { name, command: Some(rest.to_vec()), ..Default::default() }, owner, cwd)?;
+                Ok(match &e.owner {
+                    Some(o) => format!("added {} as an insert on {o}\n", e.name),
+                    None => format!("added send effect {}; send to it with: ws send GENERATOR {} AMOUNT\n", e.name, e.name),
+                })
+            }
+            "send" => {
+                let (gen, fx) = (arg(0, "GENERATOR")?, arg(1, "EFFECT")?);
+                let amount = num(arg(2, "AMOUNT (0..1)")?, "a number")?;
+                self.patch_generator(gen.clone(), GeneratorPatch { sends: Some(BTreeMap::from([(fx.clone(), Some(amount))])), ..Default::default() })?;
+                Ok(format!("{gen} -> {fx} {amount}\n"))
+            }
+            "bypass" => {
+                let on = match arg(1, "on|off")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(bad(format!("bypass: expected on or off, not {other}"))),
+                };
+                let e = self.patch_effect(arg(0, "EFFECT")?, EffectPatch { bypass: Some(on), ..Default::default() })?;
+                Ok(format!("{} bypass {}\n", e.name, if on { "on" } else { "off" }))
+            }
             "gain" => {
                 let name = arg(0, "NAME")?;
                 let db = num(arg(1, "DB")?, "a dB value")?;
                 match name.as_str() {
                     "master" => transport(TransportPatch { master_db: Some(db), ..Default::default() })?,
                     "click" => transport(TransportPatch { click_db: Some(db), ..Default::default() })?,
+                    _ if self.is_effect(&name)? => self.patch_effect(name.clone(), EffectPatch { gain_db: Some(db), ..Default::default() }).map(|_| ())?,
                     _ => self.patch_generator(name.clone(), GeneratorPatch { gain_db: Some(db), ..Default::default() }).map(|_| ())?,
                 }
                 Ok(format!("{name} {db:+.1} dB\n"))
             }
             "mute" | "unmute" => {
                 let muted = cmd == "mute";
-                let g = self.patch_generator(arg(0, "NAME")?, GeneratorPatch { muted: Some(muted), ..Default::default() })?;
-                Ok(format!("{} {cmd}d\n", g.name))
+                let name = arg(0, "NAME")?;
+                if self.is_effect(&name)? {
+                    self.patch_effect(name.clone(), EffectPatch { muted: Some(muted), ..Default::default() })?;
+                } else {
+                    self.patch_generator(name.clone(), GeneratorPatch { muted: Some(muted), ..Default::default() })?;
+                }
+                Ok(format!("{name} {cmd}d\n"))
             }
             "bpm" => {
                 let bpm = num(arg(0, "BPM")?, "a number")?;
@@ -519,13 +824,18 @@ impl Ctl {
                 Ok(format!("seek to bar {bar}\n"))
             }
             "params" => {
-                let g = self.generators()?.into_iter().find(|g| g.name == rest.first().cloned().unwrap_or_default());
-                let g = g.ok_or_else(|| ApiError::NotFound(format!("no generator named {}", rest.first().map_or("", |s| s.as_str()))))?;
-                if g.params.is_empty() {
-                    return Ok(format!("{} has no parameters{}\n", g.name, if g.channels.is_none() { " (not running)" } else { "" }));
+                let name = arg(0, "NAME")?;
+                let found = self.generators()?.into_iter().find(|g| g.name == name).map(|g| (g.params, g.channels));
+                let found = match found {
+                    Some(f) => Some(f),
+                    None => self.effects()?.into_iter().find(|e| e.name == name).map(|e| (e.params, e.channels)),
+                };
+                let (params, channels) = found.ok_or_else(|| ApiError::NotFound(format!("no generator or effect named {name}")))?;
+                if params.is_empty() {
+                    return Ok(format!("{name} has no parameters{}\n", if channels.is_none() { " (not running)" } else { "" }));
                 }
-                let w = g.params.iter().map(|p| p.desc.id.len()).max().unwrap_or(2);
-                Ok(g.params
+                let w = params.iter().map(|p| p.desc.id.len()).max().unwrap_or(2);
+                Ok(params
                     .iter()
                     .map(|p| {
                         let range = match &p.desc.labels {
@@ -539,9 +849,10 @@ impl Ctl {
             "set" => {
                 let (name, id) = (arg(0, "NAME")?, arg(1, "PARAM")?);
                 let value = num(arg(2, "VALUE")?, "a number")?;
-                let g = self.set_params(name, BTreeMap::from([(id.clone(), value)]))?;
-                let actual = g.params.iter().find(|p| p.desc.id == id).map_or(value, |p| p.value);
-                Ok(format!("{} {id} = {actual}\n", g.name))
+                let values = BTreeMap::from([(id.clone(), value)]);
+                let params = if self.is_effect(&name)? { self.set_effect_params(name.clone(), values)?.params } else { self.set_params(name.clone(), values)?.params };
+                let actual = params.iter().find(|p| p.desc.id == id).map_or(value, |p| p.value);
+                Ok(format!("{name} {id} = {actual}\n"))
             }
             "quit" => self.quit().map(|_| "workspace stopping\n".into()),
             other => Err(bad(format!("unknown command {other}; see ws help"))),

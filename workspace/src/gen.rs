@@ -57,6 +57,33 @@ struct Job {
     req: Request,
     /// Every parameter's value, in description order.
     params: Vec<f64>,
+    /// Effects: `frames * inputs` samples, interleaved. Empty means silence.
+    input: Vec<f32>,
+}
+
+/// Remixes interleaved audio from `from` to `to` channels: mono goes to
+/// every channel, more to fewer is averaged, otherwise channels map by index
+/// and the last one repeats.
+pub fn adapt_channels(src: &[f32], from: usize, to: usize) -> Vec<f32> {
+    if from == to || from == 0 {
+        return src.to_vec();
+    }
+    let frames = src.len() / from;
+    let mut out = Vec::with_capacity(frames * to);
+    for f in src.chunks_exact(from) {
+        if to < from {
+            // Average groups so stereo -> mono keeps both sides.
+            for c in 0..to {
+                let group: Vec<f32> = f.iter().skip(c).step_by(to).copied().collect();
+                out.push(group.iter().sum::<f32>() / group.len() as f32);
+            }
+        } else {
+            for c in 0..to {
+                out.push(f[c.min(from - 1)]);
+            }
+        }
+    }
+    out
 }
 
 /// What a generator says about itself in the handshake (the same JSON as
@@ -117,8 +144,7 @@ struct Chunk {
 pub struct Proc {
     name: String,
     pub channels: usize,
-    /// Input channels; non-zero for effects. Fed silence until routing
-    /// exists.
+    /// Input channels; non-zero for effects.
     pub inputs: usize,
     pub desc: Description,
     jobs: Option<Sender<Job>>,
@@ -245,6 +271,17 @@ pub struct Slot {
     pub late: u64,
     pub restarts: u64,
     pub last_error: Option<(String, Instant)>,
+    /// Generators: effects in this generator's insert chain, by name, in
+    /// order.
+    pub inserts: Vec<String>,
+    /// Generators: post-fader sends to send effects, linear 0..1, by effect
+    /// name.
+    pub sends: BTreeMap<String, f64>,
+    /// Effects: the generator whose insert chain this effect is in; None
+    /// for a send effect.
+    pub owner: Option<String>,
+    /// Insert effects: pass input straight through.
+    pub bypass: bool,
     /// Parameter values set by the user, by id; kept across restarts.
     /// Unset params use the generator's default.
     pub values: BTreeMap<String, f64>,
@@ -276,6 +313,10 @@ impl Slot {
             late: 0,
             restarts: 0,
             last_error: None,
+            inserts: Vec::new(),
+            sends: BTreeMap::new(),
+            owner: None,
+            bypass: false,
             values: BTreeMap::new(),
             peak: 0.0,
             state: State::Running(proc),
@@ -344,7 +385,10 @@ impl Slot {
         }
     }
 
-    pub fn request(&mut self, seq: u64, req: Request) {
+    /// Sends a block request. `input` is the effect's input audio with
+    /// `input_channels` channels (adapted to what the effect takes); empty
+    /// for generators.
+    pub fn request(&mut self, seq: u64, req: Request, input: &[f32], input_channels: usize) {
         self.asked = false;
         self.drain();
         let State::Running(p) = &mut self.state else { return };
@@ -353,7 +397,8 @@ impl Slot {
             return self.check_hang();
         }
         let params = p.desc.params.iter().map(|d| self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v))).collect();
-        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params }).is_ok());
+        let input = if p.inputs == 0 || input.is_empty() { Vec::new() } else { adapt_channels(input, input_channels, p.inputs) };
+        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params, input }).is_ok());
         if !sent {
             return self.fail("exited".into(), false);
         }
@@ -603,8 +648,14 @@ fn worker(
     let mut silence = Vec::new();
     for job in jobs {
         let result = (|| -> Result<Chunk, String> {
-            silence.resize(job.req.frames as usize * inputs, 0.0);
-            write_request(&mut stdin, &job.req, &job.params, &silence).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
+            let want = job.req.frames as usize * inputs;
+            let input = if job.input.len() == want {
+                &job.input[..]
+            } else {
+                silence.resize(want, 0.0);
+                &silence[..]
+            };
+            write_request(&mut stdin, &job.req, &job.params, input).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
             let mut header = [0u8; CHUNK_HEADER_LEN];
             stdout.read_exact(&mut header).map_err(|_| "exited".to_string())?;
             let frames = decode_chunk_header(&header).map_err(|_| "garbled output (something printed to stdout?)".to_string())?;
@@ -620,5 +671,17 @@ fn worker(
         if chunks.send(result).is_err() || failed {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adapt_channels;
+
+    #[test]
+    fn adapts_channel_counts() {
+        assert_eq!(adapt_channels(&[1.0, 2.0], 1, 2), vec![1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(adapt_channels(&[1.0, 3.0, 2.0, 4.0], 2, 1), vec![2.0, 3.0]);
+        assert_eq!(adapt_channels(&[1.0, 2.0], 2, 2), vec![1.0, 2.0]);
     }
 }
