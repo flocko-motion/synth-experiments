@@ -1,4 +1,4 @@
-//! The metronome. One short sine blip per beat. Pitch and level rise with the
+//! The metronome. One short sine beep per beat. Pitch and level rise with the
 //! grid level the beat starts: beat < bar < cycle < epoch, so you can hear
 //! where you are.
 

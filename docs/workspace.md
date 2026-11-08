@@ -13,7 +13,7 @@ target/release/ws add --name hats target/release/percussion
 target/release/ws                                  # status
 target/release/ws pos                              # 2.1.3.4.1  bar 23 ...
 target/release/ws bpm 150; target/release/ws key F# minor
-target/release/ws gain bass -3; target/release/ws mute blip
+target/release/ws gain psybass -3; target/release/ws mute hats
 target/release/ws seek 17; target/release/ws stop; target/release/ws play
 target/release/ws quit
 ```
@@ -79,7 +79,7 @@ curl -s -N $A/api/events                                 # live state + log (SSE
   re-anchored on tempo, transport and seek changes, so position never
   drifts. Changes apply at the render head, so you hear them `--ahead` ms
   later.
-- **Click**: a blip per beat. Pitch and level rise for bar, cycle and epoch
+- **Click**: a beep per beat. Pitch and level rise for bar, cycle and epoch
   starts. `ws click on|off`, `ws gain click DB`.
 - **Sample rate** is the device's (44.1 kHz on the built-in output), passed
   to generators in the hello.
