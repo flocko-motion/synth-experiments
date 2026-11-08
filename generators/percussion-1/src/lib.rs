@@ -7,14 +7,17 @@
 //! - the last bar of an epoch often carries a snare roll into the next one
 
 use dsp::{decay_coef, pan_gains, Svf};
-use gen_api::{Config, Context, Generator, Info, Rng, StepClock};
+use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock};
 use std::f64::consts::PI;
 
 const SLOTS: usize = 64; // 16ths in a cycle (4 bars)
 const CYCLES_PER_EPOCH: u64 = 4;
 
 /// Fixed output stage: soft clip, then a -1 dBFS ceiling.
-const DRIVE: f64 = 1.0;
+const DRIVE: usize = 0;
+
+/// The built-in output saturation, exposed.
+const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.0)];
 const CEILING: f64 = 0.891;
 
 /// Closed-hat velocity per 16th within a beat; slot 2 belongs to the open hat.
@@ -230,6 +233,8 @@ pub struct Percussion {
     epoch: Option<Epoch>,
     cycle: Option<Cycle>,
     clock: StepClock,
+    drive: f64,
+    param_smooth: f64,
     ohat: Metal,
     chat: Metal,
     ride: Metal,
@@ -400,6 +405,8 @@ impl Generator for Percussion {
             epoch: None,
             cycle: None,
             clock: StepClock::new(),
+            drive: PARAMS[DRIVE].default,
+            param_smooth: 1.0 - (-1.0 / (0.02 * sr)).exp(),
             ohat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.35, bp: 9000.0, hp: 6500.0, decay: 0.07, gain: 3.2 }, sr),
             chat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.45, bp: 10000.0, hp: 7500.0, decay: 0.012, gain: 2.6 }, sr),
             ride: Metal::new(MetalSound { pitch: 1.2 * tone, noise: 0.15, bp: 5500.0, hp: 3500.0, decay: 0.35, gain: 0.7 }, sr),
@@ -409,6 +416,10 @@ impl Generator for Percussion {
             perc: Perc::default(),
             rng,
         }
+    }
+
+    fn params(&self) -> &'static [Param] {
+        &PARAMS
     }
 
     fn info(&self) -> Info {
@@ -439,8 +450,9 @@ impl Generator for Percussion {
             let p = self.perc.tick(sr);
             l += p * pl;
             r += p * pr;
-            frame[0] = ((l * DRIVE).tanh() * CEILING) as f32;
-            frame[1] = ((r * DRIVE).tanh() * CEILING) as f32;
+            self.drive += (ctx.param(DRIVE) - self.drive) * self.param_smooth;
+            frame[0] = ((l * self.drive).tanh() * CEILING) as f32;
+            frame[1] = ((r * self.drive).tanh() * CEILING) as f32;
         }
         self.clock.finish(steps);
     }

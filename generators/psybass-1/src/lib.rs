@@ -8,14 +8,17 @@
 //! Assumes 4/4, as psytrance does.
 
 use dsp::{saw, Svf};
-use gen_api::{Config, Context, Generator, Info, Rng, StepClock, Tonality};
+use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock, Tonality};
 use std::f64::consts::PI;
 
 const PHRASE_BARS: u64 = 8;
 const PHRASE_SLOTS: usize = PHRASE_BARS as usize * 16;
 
 /// Fixed output stage: soft clip, then a -1 dBFS ceiling.
-const DRIVE: f64 = 1.25;
+const DRIVE: usize = 0;
+
+/// The built-in output saturation, exposed.
+const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.25)];
 const CEILING: f64 = 0.891;
 
 /// Which of the three off-kick 16ths in a beat carry a bass note.
@@ -168,6 +171,8 @@ pub struct Psybass {
     cut_from: f64,
     phrase: Option<Phrase>,
     clock: StepClock,
+    drive: f64,
+    param_smooth: f64,
     kick: Kick,
     bass: Bass,
 }
@@ -286,6 +291,8 @@ impl Generator for Psybass {
             cut_from,
             phrase: None,
             clock: StepClock::new(),
+            drive: PARAMS[DRIVE].default,
+            param_smooth: 1.0 - (-1.0 / (0.02 * config.sample_rate)).exp(),
             kick: Kick::default(),
             bass: Bass::default(),
         }
@@ -299,6 +306,10 @@ impl Generator for Psybass {
         }
     }
 
+    fn params(&self) -> &'static [Param] {
+        &PARAMS
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let mut steps = self.clock.block(ctx);
         for (i, o) in out.iter_mut().enumerate() {
@@ -306,7 +317,8 @@ impl Generator for Psybass {
                 self.trigger(slot, ctx);
             }
             let x = self.kick.tick(self.sr, &mut self.noise) + self.bass.tick(self.sr);
-            *o = ((x * DRIVE).tanh() * CEILING) as f32;
+            self.drive += (ctx.param(DRIVE) - self.drive) * self.param_smooth;
+            *o = ((x * self.drive).tanh() * CEILING) as f32;
         }
         self.clock.finish(steps);
     }

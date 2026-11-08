@@ -30,13 +30,17 @@ const CUTOFF: usize = 0;
 const RESONANCE: usize = 1;
 const DELAY_MIX: usize = 2;
 const FEEDBACK: usize = 3;
+const DRIVE: usize = 4;
 
-/// Offsets on top of the generator's own tweak, plus the delay.
-const PARAMS: [Param; 4] = [
+/// Offsets on top of the generator's own tweak, plus the built-in delay
+/// and drive.
+const PARAMS: [Param; 5] = [
     Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct"),
     Param::continuous("resonance", "Resonance offset", -0.4, 0.3, 0.0),
     Param::continuous("delay", "Delay mix", 0.0, 1.0, 0.4),
     Param::continuous("feedback", "Delay feedback", 0.0, 0.85, 0.42),
+    // Multiplies the seed's own drive amount.
+    Param::continuous("drive", "Drive", 0.25, 4.0, 1.0).unit("x"),
 ];
 
 /// Scale degrees and their weights: root, octave, 2nd (the phrygian b2),
@@ -212,7 +216,7 @@ impl Voice {
         self.slide_into = false;
     }
 
-    fn tick(&mut self, c: &Character, cutoff: f64, res: f64, sr: f64) -> f64 {
+    fn tick(&mut self, c: &Character, drive: f64, cutoff: f64, res: f64, sr: f64) -> f64 {
         self.lf += (self.lf_target - self.lf) * self.glide;
         let dt = self.lf.exp2() / sr;
         let osc = if c.square { square(self.phase, dt) } else { saw(self.phase, dt) };
@@ -236,7 +240,7 @@ impl Voice {
         let fc = cutoff * (self.fenv * env_oct + self.wow * 1.2).exp2();
         let res = res + if self.accent { 0.08 * self.fenv } else { 0.0 };
         let y = self.filter.tick(osc * 0.8, fc, res, sr);
-        let y = (y * c.drive).tanh() / c.drive.tanh();
+        let y = (y * drive).tanh() / drive.tanh();
         y * self.amp * if self.accent { 1.3 } else { 1.0 }
     }
 }
@@ -297,6 +301,7 @@ pub struct Acid {
     cutoff: f64,
     cutoff_smooth: f64,
     param_smooth: f64,
+    drive: f64,
 }
 
 impl Acid {
@@ -419,6 +424,7 @@ impl Generator for Acid {
             cutoff: 300.0,
             cutoff_smooth: 1.0 - (-1.0 / (0.05 * sr)).exp(),
             param_smooth: 1.0 - (-1.0 / (0.02 * sr)).exp(),
+            drive: PARAMS[DRIVE].default,
             rng,
         }
     }
@@ -463,7 +469,9 @@ impl Generator for Acid {
             self.delay.feedback += (ctx.param(FEEDBACK) - self.delay.feedback) * ps;
             self.cutoff += (target - self.cutoff) * self.cutoff_smooth;
 
-            let dry = self.voice.tick(&self.character, self.cutoff, res, sr) * 0.38;
+            self.drive += (ctx.param(DRIVE) - self.drive) * ps;
+            let drive = self.character.drive * self.drive;
+            let dry = self.voice.tick(&self.character, drive, self.cutoff, res, sr) * 0.38;
             let (wl, wr) = self.delay.tick(dry, delay_samples);
             frame[0] = ((dry + wl).tanh() * CEILING) as f32;
             frame[1] = ((dry + wr).tanh() * CEILING) as f32;
