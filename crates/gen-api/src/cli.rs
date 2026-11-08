@@ -302,6 +302,7 @@ pub fn run<G: Generator>() {
         let mut buf = vec![0.0f32; BLOCK_FRAMES * ch];
         let mut input = vec![0.0f32; BLOCK_FRAMES * inputs];
         let mut scratch = Vec::new();
+        let mut events = Vec::new();
         let mut frame: u64 = 0;
         loop {
             let mut n = match total_frames {
@@ -319,6 +320,9 @@ pub fn run<G: Generator>() {
             let ctx = Context { sample_rate: sr, transport, tonality, params: &values, input: &input[..n * inputs] };
             let out = &mut buf[..n * ch];
             gen.process(&ctx, out);
+            // Standalone there's nothing to duck; drain so events don't pile up.
+            events.clear();
+            gen.take_events(&mut events);
             wav::write_samples(&mut w, out, &mut scratch)?;
             frame += n as u64;
         }

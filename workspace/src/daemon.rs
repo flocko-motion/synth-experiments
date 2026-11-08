@@ -57,6 +57,25 @@ pub struct Opts {
 /// Per-block falloff of the level meters (about -20 dB in 0.4 s).
 const PEAK_FALLOFF: f32 = 0.93;
 
+/// Duck envelope: how fast it reaches an event's strength (a short ramp
+/// instead of a jump, so pads don't click) and how long it takes to recover,
+/// in beats so it breathes with the tempo.
+const DUCK_ATTACK_SECS: f64 = 0.002;
+const DUCK_RELEASE_BEATS: f64 = 0.6;
+
+/// Scales each frame of interleaved `buf` by `1 - sensitivity * env[frame]`.
+fn apply_duck(buf: &mut [f32], channels: usize, env: &[f32], sensitivity: f32) {
+    if sensitivity <= 0.0 {
+        return;
+    }
+    for (frame, e) in buf.chunks_exact_mut(channels).zip(env) {
+        let k = 1.0 - sensitivity * e;
+        for x in frame {
+            *x *= k;
+        }
+    }
+}
+
 /// What every stage of a block shares.
 struct Stage {
     seq: u64,
@@ -139,6 +158,13 @@ pub struct Mixer {
     pub click_db: f64,
     pub master_db: f64,
     pub master_peak: f32,
+    /// The shared duck envelope, 0..1, and its attack target (0 when
+    /// releasing).
+    duck_env: f32,
+    duck_target: f32,
+    /// (frame, envelope) at each block's start, so the API can report the
+    /// envelope at the audible position rather than the render position.
+    duck_history: std::collections::VecDeque<(u64, f32)>,
     pub quit: bool,
     mix: Vec<f32>,
 }
@@ -186,6 +212,12 @@ impl Mixer {
         self.beat_at(self.played.load(Ordering::Relaxed))
     }
 
+    /// The duck envelope as heard now (the block that is playing).
+    fn audible_duck(&self) -> f32 {
+        let played = self.played.load(Ordering::Relaxed);
+        self.duck_history.iter().rev().find(|(f, _)| *f <= played).map_or(0.0, |&(_, e)| e)
+    }
+
     pub fn audible_position(&self) -> Position {
         Position::at(self.audible_beat(), self.beats_per_bar)
     }
@@ -212,6 +244,7 @@ impl Mixer {
             click_db: self.click_db,
             master_db: self.master_db,
             master_peak: self.master_peak,
+            duck: self.audible_duck(),
             ahead_ms: self.ahead_frames as f64 * 1000.0 / self.sample_rate as f64,
             underruns: self.underruns.load(Ordering::Relaxed),
             sample_rate: self.sample_rate,
@@ -283,6 +316,40 @@ impl Mixer {
             .collect()
     }
 
+    /// The duck envelope for the next `n` frames, from this block's duck
+    /// events (frame, strength). An event raises the envelope to its
+    /// strength (never lowers it); then it recovers exponentially.
+    fn duck_envelope(&mut self, n: usize, events: &mut [(u32, f32)]) -> Vec<f32> {
+        events.sort_by_key(|e| e.0);
+        let sr = self.sample_rate as f64;
+        let attack_step = (1.0 / (DUCK_ATTACK_SECS * sr)) as f32;
+        // Time constant a quarter of the release: about 2% left at the end.
+        let tau = DUCK_RELEASE_BEATS * self.samples_per_beat() / 4.0;
+        let coef = (-1.0 / tau).exp() as f32;
+        let mut env = Vec::with_capacity(n);
+        let mut k = 0;
+        for i in 0..n {
+            while k < events.len() && events[k].0 as usize <= i {
+                let s = events[k].1;
+                if s > self.duck_env && s > self.duck_target {
+                    self.duck_target = s;
+                }
+                k += 1;
+            }
+            if self.duck_target > 0.0 {
+                self.duck_env += attack_step;
+                if self.duck_env >= self.duck_target {
+                    self.duck_env = self.duck_target;
+                    self.duck_target = 0.0;
+                }
+            } else {
+                self.duck_env *= coef;
+            }
+            env.push(self.duck_env);
+        }
+        env
+    }
+
     fn render_block(&mut self) {
         let n = BLOCK;
         let ch = self.channels;
@@ -328,15 +395,30 @@ impl Mixer {
         let chains: Vec<Vec<String>> = self.gens.iter().map(|g| g.inserts.clone()).collect();
         run_chains(&mut self.fx, &chains, &mut chans, &st);
 
-        // 3. faders into the mix; sends (post-fader, linear amounts) into
-        //    each send effect's input
+        // 3. the duck envelope, from every generator's and insert's events
+        let mut events: Vec<(u32, f32)> = self.gens.iter().chain(self.fx.iter().filter(|f| f.owner.is_some())).flat_map(|s| s.ducks.iter().copied()).collect();
+        let env = self.duck_envelope(n, &mut events);
+        let ducking = env.iter().any(|&e| e > 1e-4);
+        // The block's peak, so a meter sees the dip even between polls.
+        let top = env.iter().copied().fold(0.0, f32::max);
+        self.duck_history.push_back((self.frame, top));
+        while self.duck_history.len() > 1024 {
+            self.duck_history.pop_front();
+        }
+
+        // 4. faders into the mix, ducked post-fader by each channel's
+        //    sensitivity (so its sends are ducked too); sends (linear
+        //    amounts) into each send effect's input
         self.mix.clear();
         self.mix.resize(n * ch, 0.0);
         let mut send_in: Vec<Option<Vec<f32>>> = self.fx.iter().map(|f| f.owner.is_none().then(|| silence.clone())).collect();
-        for (g, buf) in self.gens.iter_mut().zip(&chans) {
+        for (g, buf) in self.gens.iter_mut().zip(chans.iter_mut()) {
             let gain = g.gain();
             if gain == 0.0 {
                 continue;
+            }
+            if ducking {
+                apply_duck(buf, ch, &env, g.duck_sensitivity().unwrap_or(0.0) as f32);
             }
             g.peak = buf.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
             add_scaled(&mut self.mix, buf, gain);
@@ -347,8 +429,8 @@ impl Mixer {
             }
         }
 
-        // 4. send effects, all in parallel; each returns through its own
-        //    fader. A send effect that's restarting or late returns nothing
+        // 5. send effects, all in parallel; each returns through its own
+        //    fader, ducked by its own sensitivity. A send effect that's restarting or late returns nothing
         //    (passing its input through would double the dry signal).
         for (f, input) in self.fx.iter_mut().zip(&send_in) {
             if let Some(input) = input {
@@ -366,12 +448,15 @@ impl Mixer {
             if gain == 0.0 {
                 continue;
             }
-            let out = adapt_channels(&chunk, fch, ch);
+            let mut out = adapt_channels(&chunk, fch, ch);
+            if ducking {
+                apply_duck(&mut out, ch, &env, f.duck_sensitivity().unwrap_or(0.0) as f32);
+            }
             f.peak = out.iter().fold(f.peak, |p, s| p.max(s.abs() * gain));
             add_scaled(&mut self.mix, &out, gain);
         }
 
-        // 5. click (not through the master chain), master gain, soft clip
+        // 6. click (not through the master chain), master gain, soft clip
         if self.click_on {
             let (playing, spb, gain) = (self.playing, self.samples_per_beat(), db_to_gain(self.click_db));
             self.click.render(&mut self.mix, ch, self.beats_per_bar, gain, |i| playing.then(|| beat0 + i as f64 / spb));
@@ -501,6 +586,9 @@ pub fn run(opts: Opts) -> Result<(), String> {
         click_db: -12.0,
         master_db: 0.0,
         master_peak: 0.0,
+        duck_env: 0.0,
+        duck_target: 0.0,
+        duck_history: std::collections::VecDeque::new(),
         quit: false,
         mix: Vec::new(),
     };

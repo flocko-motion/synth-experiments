@@ -345,6 +345,23 @@ impl Param {
     }
 }
 
+/// Something a plugin tells the host, at a frame within the block it
+/// belongs to. Returned alongside the audio by [`Generator::take_events`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Event {
+    /// Frame within the block, 0-based.
+    pub frame: u32,
+    pub kind: EventKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EventKind {
+    /// "Duck the other channels now": typically a kick. The host ducks every
+    /// channel by its [`Generator::duck_sensitivity`] × `strength` (0..1)
+    /// and lets it recover along its duck envelope.
+    Duck { strength: f32 },
+}
+
 /// A plugin: a generator, or an effect (a generator with audio inputs).
 pub trait Generator {
     fn new(config: &Config) -> Self
@@ -364,8 +381,19 @@ pub trait Generator {
         0
     }
 
+    /// How strongly the host ducks this plugin when a duck event arrives,
+    /// 0 (never: the kick itself) .. 1 (fully: pads, reverb). Fixed per
+    /// plugin.
+    fn duck_sensitivity(&self) -> f64 {
+        0.0
+    }
+
     /// Render one block. See the crate docs for the contract.
     fn process(&mut self, ctx: &Context, out: &mut [f32]);
+
+    /// Move the events of the block just rendered into `out`. The host calls
+    /// this after every `process`, so events must not pile up.
+    fn take_events(&mut self, _out: &mut Vec<Event>) {}
 }
 
 /// Machine-readable description: what `--info --json` prints and the pipe
@@ -397,11 +425,12 @@ pub fn describe_json(g: &dyn Generator) -> String {
         })
         .collect();
     format!(
-        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"params\":[{}]}}",
+        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"duck_sensitivity\":{},\"params\":[{}]}}",
         json_str(info.name),
         json_str(info.description),
         info.channels,
         g.inputs(),
+        json_num(g.duck_sensitivity().clamp(0.0, 1.0)),
         params.join(",")
     )
 }

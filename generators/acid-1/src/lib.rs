@@ -433,6 +433,10 @@ impl Generator for Acid {
         &PARAMS
     }
 
+    fn duck_sensitivity(&self) -> f64 {
+        0.6
+    }
+
     fn info(&self) -> Info {
         Info {
             name: "acid",

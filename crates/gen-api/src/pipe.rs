@@ -6,8 +6,8 @@
 //! little-endian.
 //!
 //! ```text
-//! host -> gen   hello     16 bytes   "WSH3" | u32 sample_rate | u32 max_frames | u32 reserved
-//! gen  -> host  hello     16 bytes   "WSG3" | u16 channels | u16 inputs | u16 params
+//! host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 reserved
+//! gen  -> host  hello     16 bytes   "WSG4" | u16 channels | u16 inputs | u16 params
 //!                                    | u16 reserved | u32 json_len
 //!                         + json_len bytes: the plugin's description, the
 //!                           same JSON `--info --json` prints
@@ -16,8 +16,12 @@
 //!                         + params * f64: every parameter's value, in
 //!                           description order (a full snapshot each time)
 //!                         + frames * inputs * f32, interleaved (effects only)
-//! gen  -> host  chunk      8 bytes   "WSC3" | u32 frames
+//! gen  -> host  chunk     12 bytes   "WSC4" | u32 frames | u32 events
+//!                          + events * 12 bytes: u32 frame | u16 kind | u16 reserved | f32 value
 //!                          + frames * channels * f32, interleaved
+//!
+//! Event kinds: 1 = duck (value = strength 0..1). Events are in frame order,
+//! frames within the chunk. Most plugins send none.
 //! ```
 //!
 //! Plugins without inputs or params send requests that are just the 32-byte
@@ -35,34 +39,78 @@
 //!
 //! A generator in another language only has to implement this file: read 16,
 //! write 16 + its JSON, then loop reading `32 + params * 8 + frames * inputs
-//! * 4` and writing `8 + frames * channels * 4` bytes, and log only to stderr.
+//! * 4` and writing `12 + frames * channels * 4` bytes (plus 12 per event, if
+//! it sends any), and log only to stderr.
 
-use crate::{describe_json, Config, Context, Generator, Scale, Tonality, Transport};
+use crate::{describe_json, Config, Context, Event, EventKind, Generator, Scale, Tonality, Transport};
 use std::io::{self, BufWriter, Read, Write};
 
-pub const HOST_MAGIC: [u8; 4] = *b"WSH3";
-pub const GEN_MAGIC: [u8; 4] = *b"WSG3";
-pub const CHUNK_MAGIC: [u8; 4] = *b"WSC3";
+pub const HOST_MAGIC: [u8; 4] = *b"WSH4";
+pub const GEN_MAGIC: [u8; 4] = *b"WSG4";
+pub const CHUNK_MAGIC: [u8; 4] = *b"WSC4";
 pub const HELLO_LEN: usize = 16;
 pub const GEN_HELLO_LEN: usize = 16;
 /// Upper bound on the description in the generator hello.
 pub const MAX_JSON_LEN: u32 = 1 << 20;
 pub const REQUEST_LEN: usize = 32;
-pub const CHUNK_HEADER_LEN: usize = 8;
+pub const CHUNK_HEADER_LEN: usize = 12;
+pub const EVENT_LEN: usize = 12;
+/// Upper bound on events in one chunk; more means a garbled stream.
+pub const MAX_EVENTS: u32 = 4096;
 
-pub fn encode_chunk_header(frames: u32) -> [u8; CHUNK_HEADER_LEN] {
+const KIND_DUCK: u16 = 1;
+
+/// What a chunk header announces: the events, then the audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkHeader {
+    pub frames: u32,
+    pub events: u32,
+}
+
+pub fn encode_chunk_header(h: ChunkHeader) -> [u8; CHUNK_HEADER_LEN] {
     let mut b = [0u8; CHUNK_HEADER_LEN];
     b[0..4].copy_from_slice(&CHUNK_MAGIC);
-    b[4..8].copy_from_slice(&frames.to_le_bytes());
+    b[4..8].copy_from_slice(&h.frames.to_le_bytes());
+    b[8..12].copy_from_slice(&h.events.to_le_bytes());
     b
 }
 
-/// The frame count of a chunk header, or an error if the bytes aren't one.
-pub fn decode_chunk_header(b: &[u8; CHUNK_HEADER_LEN]) -> io::Result<u32> {
+/// Decode a chunk header, or fail if the bytes aren't one.
+pub fn decode_chunk_header(b: &[u8; CHUNK_HEADER_LEN]) -> io::Result<ChunkHeader> {
     if b[0..4] != CHUNK_MAGIC {
         return Err(bad("garbled chunk (stray output on stdout?)"));
     }
-    Ok(u32_at(b, 4))
+    let h = ChunkHeader { frames: u32_at(b, 4), events: u32_at(b, 8) };
+    if h.events > MAX_EVENTS {
+        return Err(bad("garbled chunk (absurd event count)"));
+    }
+    Ok(h)
+}
+
+pub fn encode_event(e: &Event) -> [u8; EVENT_LEN] {
+    let (kind, value) = match e.kind {
+        EventKind::Duck { strength } => (KIND_DUCK, strength),
+    };
+    let mut b = [0u8; EVENT_LEN];
+    b[0..4].copy_from_slice(&e.frame.to_le_bytes());
+    b[4..6].copy_from_slice(&kind.to_le_bytes());
+    b[8..12].copy_from_slice(&value.to_le_bytes());
+    b
+}
+
+/// Host side: decode `events * EVENT_LEN` bytes that follow a chunk header.
+/// Unknown kinds are skipped, so newer plugins work with older hosts.
+pub fn decode_events(b: &[u8]) -> Vec<Event> {
+    b.chunks_exact(EVENT_LEN)
+        .filter_map(|e| {
+            let frame = u32_at(e, 0);
+            let value = f32::from_le_bytes(e[8..12].try_into().unwrap());
+            match u16::from_le_bytes([e[4], e[5]]) {
+                KIND_DUCK => Some(Event { frame, kind: EventKind::Duck { strength: value.clamp(0.0, 1.0) } }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Host greeting, sent once before any request.
@@ -286,6 +334,7 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
     let mut input: Vec<f32> = Vec::with_capacity(max * inputs);
     let mut buf = vec![0.0f32; max * ch];
     let mut bytes = Vec::with_capacity(buf.len() * 4);
+    let mut events: Vec<Event> = Vec::new();
     while read_message(&mut stdin, &mut rb)? {
         let req = Request::decode(&rb)?;
         let n = req.frames as usize;
@@ -309,8 +358,15 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
         let ctx = Context { sample_rate, transport: req.transport, tonality: req.tonality, params: &values, input: &input };
         let out = &mut buf[..n * ch];
         gen.process(&ctx, out);
+        events.clear();
+        gen.take_events(&mut events);
+        events.retain(|e| e.frame < req.frames);
+        events.truncate(MAX_EVENTS as usize);
         bytes.clear();
-        bytes.extend_from_slice(&encode_chunk_header(req.frames));
+        bytes.extend_from_slice(&encode_chunk_header(ChunkHeader { frames: req.frames, events: events.len() as u32 }));
+        for e in &events {
+            bytes.extend_from_slice(&encode_event(e));
+        }
         for s in out.iter() {
             // NaN passes through on purpose: the host detects it and
             // restarts the generator, whose state is likely broken.
@@ -347,7 +403,19 @@ mod tests {
         wire.extend_from_slice(&[b'x'; 120]);
         let (h, json) = read_gen_hello(&mut &wire[..]).unwrap();
         assert_eq!((h, json.len()), (g, 120));
-        assert_eq!(decode_chunk_header(&encode_chunk_header(512)).unwrap(), 512);
-        assert!(decode_chunk_header(b"hello!\n\0").is_err());
+        let ch = ChunkHeader { frames: 512, events: 2 };
+        assert_eq!(decode_chunk_header(&encode_chunk_header(ch)).unwrap(), ch);
+        assert!(decode_chunk_header(b"hello!\n\0\0\0\0\0").is_err());
+    }
+
+    #[test]
+    fn events_round_trip() {
+        let evs = [Event { frame: 0, kind: EventKind::Duck { strength: 1.0 } }, Event { frame: 300, kind: EventKind::Duck { strength: 0.5 } }];
+        let mut bytes: Vec<u8> = evs.iter().flat_map(encode_event).collect();
+        // an unknown kind from a newer plugin is skipped
+        let mut unknown = encode_event(&evs[0]);
+        unknown[4] = 99;
+        bytes.extend_from_slice(&unknown);
+        assert_eq!(decode_events(&bytes), evs.to_vec());
     }
 }

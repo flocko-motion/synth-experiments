@@ -8,7 +8,7 @@
 //! Assumes 4/4, as psytrance does.
 
 use dsp::{saw, Svf};
-use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock, Tonality};
+use gen_api::{Config, Context, Event, EventKind, Generator, Info, Param, Rng, StepClock, Tonality};
 use std::f64::consts::PI;
 
 const PHRASE_BARS: u64 = 8;
@@ -173,6 +173,8 @@ pub struct Psybass {
     clock: StepClock,
     drive: f64,
     param_smooth: f64,
+    /// Duck events for the block being rendered: one per kick played.
+    events: Vec<Event>,
     kick: Kick,
     bass: Bass,
 }
@@ -257,7 +259,7 @@ impl Psybass {
         ph
     }
 
-    fn trigger(&mut self, slot: u64, ctx: &Context) {
+    fn trigger(&mut self, slot: u64, frame: usize, ctx: &Context) {
         let index = slot / PHRASE_SLOTS as u64;
         if self.phrase.as_ref().map(|p| p.index) != Some(index) {
             self.phrase = Some(self.compose(index, &ctx.tonality));
@@ -270,6 +272,8 @@ impl Psybass {
         let root = root_hz(&ctx.tonality);
         if kick {
             self.kick.trigger((six * 1.05 * self.sr) as usize, root);
+            // Fills without kick send nothing, so nothing ducks there.
+            self.events.push(Event { frame: frame as u32, kind: EventKind::Duck { strength: 1.0 } });
         }
         if let Some(ev) = note {
             let freq = root * 2f64.powf(ev.semis as f64 / 12.0);
@@ -292,6 +296,7 @@ impl Generator for Psybass {
             phrase: None,
             clock: StepClock::new(),
             drive: PARAMS[DRIVE].default,
+            events: Vec::new(),
             param_smooth: 1.0 - (-1.0 / (0.02 * config.sample_rate)).exp(),
             kick: Kick::default(),
             bass: Bass::default(),
@@ -310,11 +315,20 @@ impl Generator for Psybass {
         &PARAMS
     }
 
+    /// The kick is what everything else ducks away from.
+    fn duck_sensitivity(&self) -> f64 {
+        0.0
+    }
+
+    fn take_events(&mut self, out: &mut Vec<Event>) {
+        out.append(&mut self.events);
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let mut steps = self.clock.block(ctx);
         for (i, o) in out.iter_mut().enumerate() {
             while let Some(slot) = steps.due(i) {
-                self.trigger(slot, ctx);
+                self.trigger(slot, i, ctx);
             }
             let x = self.kick.tick(self.sr, &mut self.noise) + self.bass.tick(self.sr);
             self.drive += (ctx.param(DRIVE) - self.drive) * self.param_smooth;

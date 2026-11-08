@@ -13,7 +13,8 @@
 
 use crate::log::wlog;
 use crate::sys;
-use gen_api::pipe::{decode_chunk_header, read_gen_hello, write_request, Hello, Request, CHUNK_HEADER_LEN};
+use gen_api::pipe::{decode_chunk_header, decode_events, read_gen_hello, write_request, Hello, Request, CHUNK_HEADER_LEN, EVENT_LEN};
+use gen_api::EventKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -96,6 +97,9 @@ pub struct Description {
     pub description: String,
     #[serde(default)]
     pub params: Vec<ParamDesc>,
+    /// How much the mixer's duck envelope turns this plugin down, 0..1.
+    #[serde(default)]
+    pub duck_sensitivity: f64,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -138,6 +142,8 @@ struct Ready {
 struct Chunk {
     seq: u64,
     samples: Vec<f32>,
+    /// Duck events: (frame within the chunk, strength 0..1).
+    ducks: Vec<(u32, f32)>,
 }
 
 /// One running generator subprocess.
@@ -287,6 +293,8 @@ pub struct Slot {
     pub values: BTreeMap<String, f64>,
     /// Output level after gain, falling back slowly; for meters.
     pub peak: f32,
+    /// Duck events from the chunk `collect` returned last.
+    pub ducks: Vec<(u32, f32)>,
     pub state: State,
     /// Bumped on every (re)start, so a stale spawn result is ignored.
     pub generation: u64,
@@ -319,6 +327,7 @@ impl Slot {
             bypass: false,
             values: BTreeMap::new(),
             peak: 0.0,
+            ducks: Vec::new(),
             state: State::Running(proc),
             generation: 0,
             backoff: 0,
@@ -343,6 +352,14 @@ impl Slot {
     pub fn description(&self) -> Option<&str> {
         match &self.state {
             State::Running(p) => Some(&p.desc.description),
+            _ => None,
+        }
+    }
+
+    /// The running plugin's declared duck sensitivity, 0..1.
+    pub fn duck_sensitivity(&self) -> Option<f64> {
+        match &self.state {
+            State::Running(p) => Some(p.desc.duck_sensitivity.clamp(0.0, 1.0)),
             _ => None,
         }
     }
@@ -410,6 +427,7 @@ impl Slot {
     /// once it's behind, only until `short_deadline`, so one stuck generator
     /// can't drain the output buffer.
     pub fn collect(&mut self, seq: u64, deadline: Instant, short_deadline: Instant) -> Option<Vec<f32>> {
+        self.ducks.clear();
         if !self.asked {
             return None;
         }
@@ -422,6 +440,7 @@ impl Slot {
                     p.last_progress = Instant::now();
                     if c.seq == seq {
                         self.on_time = true;
+                        self.ducks = c.ducks;
                         return Some(c.samples);
                     }
                     // an earlier, late chunk: drop it
@@ -658,14 +677,24 @@ fn worker(
             write_request(&mut stdin, &job.req, &job.params, input).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
             let mut header = [0u8; CHUNK_HEADER_LEN];
             stdout.read_exact(&mut header).map_err(|_| "exited".to_string())?;
-            let frames = decode_chunk_header(&header).map_err(|_| "garbled output (something printed to stdout?)".to_string())?;
-            if frames != job.req.frames {
-                return Err(format!("garbled output (asked for {} frames, got {frames})", job.req.frames));
+            let h = decode_chunk_header(&header).map_err(|e| format!("garbled output ({e})"))?;
+            if h.frames != job.req.frames {
+                return Err(format!("garbled output (asked for {} frames, got {})", job.req.frames, h.frames));
             }
-            bytes.resize(frames as usize * channels * 4, 0);
+            // Events come before the audio.
+            bytes.resize(h.events as usize * EVENT_LEN, 0);
+            stdout.read_exact(&mut bytes).map_err(|_| "exited".to_string())?;
+            let ducks = decode_events(&bytes)
+                .into_iter()
+                .filter(|e| e.frame < h.frames)
+                .map(|e| match e.kind {
+                    EventKind::Duck { strength } => (e.frame, strength),
+                })
+                .collect();
+            bytes.resize(h.frames as usize * channels * 4, 0);
             stdout.read_exact(&mut bytes).map_err(|_| "exited".to_string())?;
             let samples = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-            Ok(Chunk { seq: job.seq, samples })
+            Ok(Chunk { seq: job.seq, samples, ducks })
         })();
         let failed = result.is_err();
         if chunks.send(result).is_err() || failed {

@@ -6,7 +6,7 @@
 //! - per cycle (4 bars): the actual pattern, with a fill at its end
 //! - the last bar of an epoch often carries a snare roll into the next one
 
-use dsp::{decay_coef, pan_gains, Svf};
+use dsp::{decay_coef, midi_hz, pan_gains, Svf};
 use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock};
 use std::f64::consts::PI;
 
@@ -205,7 +205,8 @@ struct Step {
     ride: f64,
     snare: f64,
     perc: f64,
-    perc_hz: f64,
+    /// Scale degree, resolved against the host key when it plays.
+    perc_degree: f64,
     perc_pan: f64,
 }
 
@@ -289,7 +290,9 @@ impl Percussion {
 
         // One bar of percs, repeated, with the last bar varied.
         let n_pitches = 2 + (r.next_u64() % 2) as usize;
-        let pitches: Vec<f64> = (0..n_pitches).map(|_| 280.0 * 5f64.powf(r.f())).collect();
+        // Percs are tuned: scale degrees from the root up about an octave
+        // and a half, so they sit in key with the bass and acid.
+        let pitches: Vec<f64> = (0..n_pitches).map(|_| (r.next_u64() % 12) as f64).collect();
         let mut perc_bar = [(0.0, 0.0, 0.0); 16];
         let mut side = if r.chance(0.5) { 1.0 } else { -1.0 };
         let mut roll_perc = |r: &mut Rng| {
@@ -326,7 +329,7 @@ impl Percussion {
                     if bar == 3 && s % 4 != 0 && r.chance(0.3) {
                         p = if r.chance(e.perc_density.max(0.1)) { roll_perc(r) } else { (0.0, 0.0, 0.0) };
                     }
-                    (st.perc, st.perc_hz, st.perc_pan) = p;
+                    (st.perc, st.perc_degree, st.perc_pan) = p;
                 }
             }
         }
@@ -388,7 +391,10 @@ impl Percussion {
             self.snare.decay = (six * 0.5).min(0.08);
         }
         if st.perc > 0.0 {
-            self.perc = Perc { vel: st.perc, hz: st.perc_hz, pan: st.perc_pan, ..Perc::default() };
+            // C4..B4 for the root, then up the scale.
+            let t = &ctx.tonality;
+            let hz = midi_hz(60.0 + t.root as f64 + t.degree(st.perc_degree as i32) as f64);
+            self.perc = Perc { vel: st.perc, hz, pan: st.perc_pan, ..Perc::default() };
         }
     }
 }
@@ -420,6 +426,11 @@ impl Generator for Percussion {
 
     fn params(&self) -> &'static [Param] {
         &PARAMS
+    }
+
+    /// Off-beat hats already sit between the kicks; duck only lightly.
+    fn duck_sensitivity(&self) -> f64 {
+        0.2
     }
 
     fn info(&self) -> Info {

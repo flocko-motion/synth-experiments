@@ -25,6 +25,7 @@ pub struct Entry {
     pub channels: u16,
     pub inputs: u16,
     pub params: Vec<ParamDesc>,
+    pub duck_sensitivity: f64,
     pub path: String,
 }
 
@@ -36,6 +37,8 @@ struct Info {
     inputs: u16,
     #[serde(default)]
     params: Vec<ParamDesc>,
+    #[serde(default)]
+    duck_sensitivity: f64,
 }
 
 pub struct Catalog {
@@ -121,6 +124,7 @@ fn ask_info(path: &Path, file: &str) -> Option<Entry> {
         channels: info.channels,
         inputs: info.inputs,
         params: info.params,
+        duck_sensitivity: info.duck_sensitivity,
         path: path.to_string_lossy().into_owned(),
     })
 }

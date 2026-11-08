@@ -168,18 +168,19 @@ the only other flag accepted is `--seed`; tempo and key come from the host.
 All values are little-endian. The generator's stderr is free for logging,
 and the host prefixes it with the generator's name.
 
-Protocol version 3:
+Protocol version 4:
 
 ```text
-host -> gen   hello     16 bytes   "WSH3" | u32 sample_rate | u32 max_frames | u32 reserved
-gen  -> host  hello     16 bytes   "WSG3" | u16 channels | u16 inputs | u16 params
+host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 reserved
+gen  -> host  hello     16 bytes   "WSG4" | u16 channels | u16 inputs | u16 params
                                    | u16 reserved | u32 json_len
                         + json_len bytes: the plugin description (as `--info --json`)
 then, repeated:
 host -> gen   request   32 bytes   header, see below
                         + params × f64       snapshot of every parameter
                         + frames × inputs × f32, interleaved   (effects only)
-gen  -> host  chunk      8 bytes   "WSC3" | u32 frames
+gen  -> host  chunk     12 bytes   "WSC4" | u32 frames | u32 events
+                         + events × 12 bytes   u32 frame | u16 kind | u16 reserved | f32 value
                          + frames × channels × f32, interleaved
 ```
 
@@ -212,7 +213,8 @@ Request layout:
 The host closes stdin to stop the generator, which then exits (it's killed
 after 300 ms if it doesn't). A generator in another language only needs to
 implement this: read 16 bytes, write 16 plus its JSON, then loop reading
-`32 + params × 8 + frames × inputs × 4` and writing `8 + frames × channels × 4`.
+`32 + params × 8 + frames × inputs × 4` and writing `12 + frames × channels × 4`
+(plus 12 bytes per event, if it sends any).
 
 Expect skipped requests: a generator that falls behind gets a gap in
 `frame`/`beat`, which it treats like a seek. A restarted generator's first
@@ -258,6 +260,37 @@ Rules:
 
 On the CLI: `--set ID=VALUE` (numbers, `on`/`off`, or a choice label),
 listed with ranges by `--help`; `--info --json` prints the description.
+
+## Events and ducking
+
+Plugins can tell the host about things happening at a frame within the
+block, through `Generator::take_events`, which the host calls after every
+`process`. On the wire they travel in the chunk, between header and audio,
+in frame order. Event kinds:
+
+| Kind | Value | Meaning |
+|---|---|---|
+| 1 duck | strength 0..1 | "Duck the other channels now", typically a kick |
+
+Hosts skip kinds they don't know, so newer plugins work with older hosts.
+
+Ducking is native to the mixer, not a plugin. psybass sends a duck event for
+every kick it actually plays; fills without kick send none, so nothing
+ducks there. Every plugin declares a fixed `Generator::duck_sensitivity`
+(also in the description JSON as `duck_sensitivity`), and the mixer ducks
+its channel by `sensitivity × strength`, recovering along a duck envelope
+whose release and curve are mix settings:
+
+| Plugin | Sensitivity |
+|---|---|
+| psybass | 0 (it's the kick) |
+| percussion | 0.2 |
+| acid | 0.6 |
+| atmos | 0.9 |
+
+The mixer gets every chunk of a block before mixing, so a duck can apply in
+the same block, sample-accurate. Adjustable sensitivity per channel is
+captured in [ideas.md](ideas.md).
 
 ## Effects
 

@@ -74,6 +74,9 @@ pub struct State {
     pub click_db: f64,
     pub master_db: f64,
     pub master_peak: f32,
+    /// The shared duck envelope as heard now (its peak within the playing
+    /// block), 0..1.
+    pub duck: f32,
     pub ahead_ms: f64,
     pub underruns: u64,
     pub sample_rate: u32,
@@ -111,6 +114,9 @@ pub struct Generator {
     pub restarts: u64,
     pub peak: f32,
     pub last_error: Option<LastError>,
+    /// How much the duck envelope turns this channel down, 0..1, as the
+    /// generator declares it; null while not running.
+    pub duck_sensitivity: Option<f64>,
     /// Insert effects, by name, in signal order.
     pub inserts: Vec<String>,
     /// Post-fader send amounts (linear 0..1) to send effects, by name.
@@ -140,6 +146,8 @@ pub struct Effect {
     pub restarts: u64,
     pub peak: f32,
     pub last_error: Option<LastError>,
+    /// Send effects: how much the duck envelope turns the return down.
+    pub duck_sensitivity: Option<f64>,
 }
 
 fn params_of(g: &Slot) -> Vec<Param> {
@@ -169,6 +177,7 @@ impl Effect {
             restarts: f.restarts,
             peak: f.peak,
             last_error: last_error_of(f),
+            duck_sensitivity: f.duck_sensitivity(),
         }
     }
 }
@@ -202,6 +211,7 @@ impl Generator {
             restarts: g.restarts,
             peak: g.peak,
             last_error: last_error_of(g),
+            duck_sensitivity: g.duck_sensitivity(),
             inserts: g.inserts.clone(),
             sends: g.sends.clone(),
         }

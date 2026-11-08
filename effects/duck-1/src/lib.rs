@@ -45,6 +45,12 @@ impl Generator for Duck {
         2
     }
 
+    /// An insert follows its channel's ducking; as a send effect its return
+    /// shouldn't be ducked a second time on top of its own dips.
+    fn duck_sensitivity(&self) -> f64 {
+        0.0
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let tr = &ctx.transport;
         let spb = tr.samples_per_beat(ctx.sample_rate);

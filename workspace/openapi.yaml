@@ -30,6 +30,13 @@ info:
     effects. An insert that is bypassed, restarting or late passes its input
     through unchanged. A send effect in that state returns silence.
 
+    **Ducking.** Ducking is native to the mixer. Generators emit duck events
+    (psybass on every kick), which drive one shared envelope: it jumps to
+    the event's strength and recovers over about 0.6 of a beat. Each
+    generator and send effect declares a fixed `duck_sensitivity` (0..1) and
+    is turned down by `sensitivity × envelope`, post-fader and before its
+    sends. `duck` in the state is the envelope as heard now.
+
     **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
     that long after the response.
 
@@ -506,7 +513,7 @@ components:
 
     State:
       type: object
-      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, ahead_ms, underruns, sample_rate, generators, effects]
+      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, duck, ahead_ms, underruns, sample_rate, generators, effects]
       properties:
         playing: { type: boolean }
         position: { $ref: "#/components/schemas/Position" }
@@ -518,6 +525,7 @@ components:
         click_db: { $ref: "#/components/schemas/Decibels" }
         master_db: { $ref: "#/components/schemas/Decibels" }
         master_peak: { $ref: "#/components/schemas/Peak" }
+        duck: { type: number, minimum: 0, maximum: 1, description: "The shared duck envelope as heard now (its peak in the playing block)." }
         ahead_ms: { type: number, description: How far ahead the mixer renders. }
         underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
         sample_rate: { type: integer }
@@ -554,7 +562,7 @@ components:
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, inserts, sends]
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -588,6 +596,7 @@ components:
               properties:
                 message: { type: string, examples: ["hung (no output for 1s)", "exited", "garbled output (something printed to stdout?)"] }
                 seconds_ago: { type: number }
+        duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
         inserts:
           type: array
           items: { $ref: "#/components/schemas/GeneratorName" }
@@ -650,6 +659,12 @@ components:
               - type: "null"
               - { type: number, minimum: 0, maximum: 1 }
 
+    DuckSensitivity:
+      type: [number, "null"]
+      minimum: 0
+      maximum: 1
+      description: How much the duck envelope turns this down, as the plugin declares it (read-only; the kick is 0, pads high). Null while not running.
+
     Sends:
       type: object
       description: Post-fader send amounts (linear 0..1) by send-effect name. Absent means 0.
@@ -657,7 +672,7 @@ components:
 
     Effect:
       type: object
-      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error]
+      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command: { type: array, items: { type: string } }
@@ -677,6 +692,7 @@ components:
           $ref: "#/components/schemas/Decibels"
         muted: { type: boolean }
         bypass: { type: boolean, description: Inserts only. }
+        duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
         state: { $ref: "#/components/schemas/GeneratorState" }
         late: { type: integer, minimum: 0 }
         restarts: { type: integer, minimum: 0 }
@@ -722,13 +738,14 @@ components:
 
     CatalogEntry:
       type: object
-      required: [name, kind, description, channels, inputs, params, path]
+      required: [name, kind, description, channels, inputs, params, duck_sensitivity, path]
       properties:
         name: { type: string, description: "Pass as `generator` to addGenerator, or as `effect` to addSendEffect/addInsert." }
         kind: { type: string, enum: [generator, effect] }
         description: { type: string }
         channels: { type: integer }
         inputs: { type: integer, description: Non-zero for effects. }
+        duck_sensitivity: { type: number, minimum: 0, maximum: 1 }
         params:
           type: array
           description: Parameter descriptions (defaults, no current values).

@@ -301,6 +301,11 @@ impl Generator for Atmos {
         &PARAMS
     }
 
+    /// A pad: the classic pumping layer, ducked almost fully.
+    fn duck_sensitivity(&self) -> f64 {
+        0.9
+    }
+
     fn info(&self) -> Info {
         Info {
             name: "atmos",
