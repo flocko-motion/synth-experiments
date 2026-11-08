@@ -6,7 +6,8 @@
 //! - per cycle (4 bars): the actual pattern, with a fill at its end
 //! - the last bar of an epoch often carries a snare roll into the next one
 
-use gen_api::{Config, Context, Generator, Info, Rng};
+use dsp::{decay_coef, pan_gains, Svf};
+use gen_api::{Config, Context, Generator, Info, Rng, StepClock};
 use std::f64::consts::PI;
 
 const SLOTS: usize = 64; // 16ths in a cycle (4 bars)
@@ -24,49 +25,6 @@ const CHAT_STYLES: [(&str, [f64; 4]); 3] = [
 ];
 const CHAT_WEIGHTS: [f64; 3] = [3.0, 2.0, 1.0];
 const SHAKER_VEL: [f64; 4] = [0.5, 0.85, 0.6, 0.95];
-
-// ---------------------------------------------------------------- dsp
-
-/// Zavalishin TPT state-variable filter with fixed coefficients.
-#[derive(Default, Clone, Copy)]
-struct Svf {
-    ic1: f64,
-    ic2: f64,
-    a1: f64,
-    a2: f64,
-    a3: f64,
-    k: f64,
-}
-
-impl Svf {
-    fn new(fc: f64, res: f64, sr: f64) -> Svf {
-        let g = (PI * fc.clamp(20.0, sr * 0.45) / sr).tan();
-        let k = 2.0 - 2.0 * res.clamp(0.0, 0.97);
-        let a1 = 1.0 / (1.0 + g * (g + k));
-        Svf { ic1: 0.0, ic2: 0.0, a1, a2: g * a1, a3: g * g * a1, k }
-    }
-
-    /// Returns (lowpass, bandpass, highpass).
-    fn tick(&mut self, x: f64) -> (f64, f64, f64) {
-        let v3 = x - self.ic2;
-        let v1 = self.a1 * self.ic1 + self.a2 * v3;
-        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
-        self.ic1 = 2.0 * v1 - self.ic1;
-        self.ic2 = 2.0 * v2 - self.ic2;
-        (v2, v1, x - self.k * v1 - v2)
-    }
-}
-
-/// Per-sample multiplier for an exponential decay with time constant `tau`.
-fn decay_coef(tau: f64, sr: f64) -> f64 {
-    (-1.0 / (tau * sr)).exp()
-}
-
-/// Equal-power pan, -1 = left … 1 = right.
-fn pan_gains(pan: f64) -> (f64, f64) {
-    let a = (pan.clamp(-1.0, 1.0) + 1.0) * PI / 4.0;
-    (a.cos(), a.sin())
-}
 
 // ---------------------------------------------------------------- voices
 
@@ -271,7 +229,7 @@ pub struct Percussion {
     noise: Rng,
     epoch: Option<Epoch>,
     cycle: Option<Cycle>,
-    next_slot: Option<u64>,
+    clock: StepClock,
     ohat: Metal,
     chat: Metal,
     ride: Metal,
@@ -441,7 +399,7 @@ impl Generator for Percussion {
             noise: Rng::new(config.seed ^ 0x401_5E),
             epoch: None,
             cycle: None,
-            next_slot: None,
+            clock: StepClock::new(),
             ohat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.35, bp: 9000.0, hp: 6500.0, decay: 0.07, gain: 3.2 }, sr),
             chat: Metal::new(MetalSound { pitch: 1.6 * tone, noise: 0.45, bp: 10000.0, hp: 7500.0, decay: 0.012, gain: 2.6 }, sr),
             ride: Metal::new(MetalSound { pitch: 1.2 * tone, noise: 0.15, bp: 5500.0, hp: 3500.0, decay: 0.35, gain: 0.7 }, sr),
@@ -462,26 +420,12 @@ impl Generator for Percussion {
     }
 
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
-        const EPS: f64 = 1e-9;
-        let tr = &ctx.transport;
-        let slot_len = ctx.sample_rate * 60.0 / tr.bpm / 4.0; // samples per 16th
-        let start = tr.beat * 4.0; // position in 16ths
-
-        // On the first block or after a seek, resume at the next boundary.
-        let mut next = match self.next_slot {
-            Some(n) if (n as f64) >= start - EPS && (n as f64) <= start + 1.0 + EPS => n,
-            _ => (start - EPS).ceil().max(0.0) as u64,
-        };
-
+        let mut steps = self.clock.block(ctx);
         let sr = self.sr;
         let pans = [pan_gains(PAN_OHAT), pan_gains(PAN_CHAT), pan_gains(PAN_RIDE), pan_gains(PAN_SHAKER)];
         for (i, frame) in out.chunks_exact_mut(2).enumerate() {
-            if tr.playing {
-                let pos = start + i as f64 / slot_len;
-                while next as f64 <= pos + EPS {
-                    self.trigger(next, ctx);
-                    next += 1;
-                }
+            while let Some(slot) = steps.due(i) {
+                self.trigger(slot, ctx);
             }
             let n = &mut self.noise;
             let mono = [self.ohat.tick(sr, n), self.chat.tick(sr, n), self.ride.tick(sr, n), self.shaker.tick(sr, n)];
@@ -498,7 +442,7 @@ impl Generator for Percussion {
             frame[0] = ((l * DRIVE).tanh() * CEILING) as f32;
             frame[1] = ((r * DRIVE).tanh() * CEILING) as f32;
         }
-        self.next_slot = Some(next);
+        self.clock.finish(steps);
     }
 }
 

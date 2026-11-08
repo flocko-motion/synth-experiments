@@ -7,7 +7,8 @@
 //!
 //! Assumes 4/4, as psytrance does.
 
-use gen_api::{Config, Context, Generator, Info, Rng, Tonality};
+use dsp::{saw, Svf};
+use gen_api::{Config, Context, Generator, Info, Rng, StepClock, Tonality};
 use std::f64::consts::PI;
 
 const PHRASE_BARS: u64 = 8;
@@ -53,43 +54,7 @@ fn root_hz(t: &Tonality) -> f64 {
     440.0 * 2f64.powf((midi - 69) as f64 / 12.0)
 }
 
-// ---------------------------------------------------------------- dsp
-
-fn poly_blep(t: f64, dt: f64) -> f64 {
-    if t < dt {
-        let x = t / dt;
-        2.0 * x - x * x - 1.0
-    } else if t > 1.0 - dt {
-        let x = (t - 1.0) / dt;
-        x * x + 2.0 * x + 1.0
-    } else {
-        0.0
-    }
-}
-
-/// Zavalishin TPT state-variable filter, lowpass output.
-#[derive(Default)]
-struct Svf {
-    ic1: f64,
-    ic2: f64,
-}
-
-impl Svf {
-    fn lp(&mut self, x: f64, fc: f64, res: f64, sr: f64) -> f64 {
-        let fc = fc.clamp(20.0, sr * 0.45);
-        let g = (PI * fc / sr).tan();
-        let k = 2.0 - 2.0 * res.clamp(0.0, 0.97);
-        let a1 = 1.0 / (1.0 + g * (g + k));
-        let a2 = g * a1;
-        let a3 = g * a2;
-        let v3 = x - self.ic2;
-        let v1 = a1 * self.ic1 + a2 * v3;
-        let v2 = self.ic2 + a2 * self.ic1 + a3 * v3;
-        self.ic1 = 2.0 * v1 - self.ic1;
-        self.ic2 = 2.0 * v2 - self.ic2;
-        v2
-    }
-}
+// ---------------------------------------------------------------- voices
 
 /// Short, punchy kick tuned to the root, about one 16th long so it's gone
 /// before the first bass note lands.
@@ -179,8 +144,8 @@ impl Bass {
             return 0.0;
         }
         let dt2 = self.dt * 1.004;
-        let s1 = 2.0 * self.p1 - 1.0 - poly_blep(self.p1, self.dt);
-        let s2 = 2.0 * self.p2 - 1.0 - poly_blep(self.p2, dt2);
+        let s1 = saw(self.p1, self.dt);
+        let s2 = saw(self.p2, dt2);
         self.p1 = (self.p1 + self.dt).fract();
         self.p2 = (self.p2 + dt2).fract();
         let osc = 0.65 * s1 + 0.35 * s2;
@@ -202,8 +167,7 @@ pub struct Psybass {
     res: f64,
     cut_from: f64,
     phrase: Option<Phrase>,
-    /// Next 16th (absolute, from the host's position) not yet triggered.
-    next_slot: Option<u64>,
+    clock: StepClock,
     kick: Kick,
     bass: Bass,
 }
@@ -321,7 +285,7 @@ impl Generator for Psybass {
             res,
             cut_from,
             phrase: None,
-            next_slot: None,
+            clock: StepClock::new(),
             kick: Kick::default(),
             bass: Bass::default(),
         }
@@ -336,28 +300,14 @@ impl Generator for Psybass {
     }
 
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
-        const EPS: f64 = 1e-9;
-        let tr = &ctx.transport;
-        let slot_len = ctx.sample_rate * 60.0 / tr.bpm / 4.0; // samples per 16th
-        let start = tr.beat * 4.0; // position in 16ths
-
-        // On the first block or after a seek, resume at the next boundary.
-        let mut next = match self.next_slot {
-            Some(n) if (n as f64) >= start - EPS && (n as f64) <= start + 1.0 + EPS => n,
-            _ => (start - EPS).ceil().max(0.0) as u64,
-        };
-
+        let mut steps = self.clock.block(ctx);
         for (i, o) in out.iter_mut().enumerate() {
-            if tr.playing {
-                let pos = start + i as f64 / slot_len;
-                while next as f64 <= pos + EPS {
-                    self.trigger(next, ctx);
-                    next += 1;
-                }
+            while let Some(slot) = steps.due(i) {
+                self.trigger(slot, ctx);
             }
             let x = self.kick.tick(self.sr, &mut self.noise) + self.bass.tick(self.sr);
             *o = ((x * DRIVE).tanh() * CEILING) as f32;
         }
-        self.next_slot = Some(next);
+        self.clock.finish(steps);
     }
 }

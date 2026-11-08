@@ -31,10 +31,12 @@
 //! `--pipe`, as a workspace subprocess (see [`pipe`]).
 
 pub mod cli;
+pub mod clock;
 pub mod pipe;
 mod rng;
 mod wav;
 
+pub use clock::{StepClock, Steps};
 pub use rng::Rng;
 
 /// What the host tells the generator at construction time.

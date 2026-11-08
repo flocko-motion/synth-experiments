@@ -100,12 +100,35 @@ to stderr when it composes a phrase.
 
 ### Finding grid boundaries in a block
 
-With `spx = sample_rate × 60 / bpm / 4` samples per 16th, and the block
-starting at 16th position `p0 = beat × 4`, sample `i` sits at 16th position
-`p0 + i / spx`. A 16th boundary `n` falls at the first sample `i` where
-`p0 + i / spx ≥ n`. Keep the next untriggered boundary as state; if the new
-block's `p0` is not within one 16th of it, treat it as a seek and resume at
-`ceil(p0)`. See `Psybass::process` for a worked implementation.
+Use `gen_api::StepClock`; it covers rules 2 and 4 above for step triggering:
+
+```rust
+fn process(&mut self, ctx: &Context, out: &mut [f32]) {
+    let mut steps = self.clock.block(ctx);
+    for (i, o) in out.iter_mut().enumerate() {
+        while let Some(step) = steps.due(i) {
+            self.trigger(step, ctx); // absolute 16th since 0
+        }
+        *o = self.render_one_sample();
+    }
+    self.clock.finish(steps);
+}
+```
+
+How it works: with `spx = sample_rate × 60 / bpm / 4` samples per 16th and
+the block starting at 16th position `p0 = beat × 4`, sample `i` sits at
+`p0 + i / spx`, and step `n` is due at the first sample where that reaches
+`n`. The clock keeps the next unfired step as state. If a block's `p0` isn't
+within one 16th of it (first block, seek, loop, restart, skipped blocks), it
+resumes at `ceil(p0)` instead of firing the missed steps. While the
+transport is stopped, nothing is due.
+
+## Shared DSP
+
+`crates/dsp` holds the building blocks generators share: `Svf` (TPT
+state-variable filter, LP/BP/HP), `Ladder` (4-pole resonant lowpass with
+saturation in the loop), `OnePole`, band-limited `saw` and `square`
+(PolyBLEP), `decay_coef`, `pan_gains`, `midi_hz`.
 
 ## Standard CLI
 
