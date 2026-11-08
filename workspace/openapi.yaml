@@ -1,0 +1,503 @@
+openapi: 3.1.0
+info:
+  title: Workspace API
+  version: 0.1.0
+  description: |
+    Control the workspace mixer: transport (tempo, key, play/stop, seek),
+    generators (add, remove, restart, volume, mute) and the click.
+
+    Served by `ws daemon` on loopback (default `http://127.0.0.1:7700`); this
+    spec is at `/api/openapi.yaml`.
+
+    **Position grid.** Each level is four of the one below:
+    tick (16th) → beat → bar → cycle (4 bars) → epoch (16 bars). Position
+    fields count from 0 within their parent level; `text` is the 1-based
+    DAW-style counter `epoch.cycle.bar.beat.tick`.
+
+    **Live updates.** `GET /api/events` is a server-sent event stream with a
+    `state` event about 20 times a second and a `log` event per log line.
+    Prefer it to polling `/api/state`. To animate the position smoothly
+    between events, extrapolate from `beat` and `bpm` while `playing`.
+
+    **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
+    that long after the response.
+
+    **Generators break.** A generator that crashes, hangs, garbles its output
+    or produces NaN is restarted automatically; watch `state`, `restarts` and
+    `last_error`. Its stderr (panics, debug prints) arrives as `log` events
+    prefixed with `[name]`.
+
+    **Access.** Only requests from local pages are accepted: `Host` must be
+    the loopback address and `Origin`, if sent, `http://localhost:*`,
+    `http://127.0.0.1:*` or `http://[::1]:*`. Cross-origin requests from
+    such pages (for example a dev server) are allowed via CORS. Request
+    bodies must be `application/json`.
+servers:
+  - url: http://127.0.0.1:7700
+
+# No authentication: the API is loopback-only and checks Host and Origin
+# (see Access above). The empty list says so explicitly.
+security: []
+
+paths:
+  /api/state:
+    get:
+      operationId: getState
+      summary: Transport, levels and all generators
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/State" }
+
+  /api/events:
+    get:
+      operationId: streamEvents
+      summary: Live state and log (server-sent events)
+      description: |
+        `text/event-stream` with two event types:
+
+        - `state`: `data` is a `State` object, about every 50 ms.
+        - `log`: `data` is a `LogLine`; the event `id` is its `seq`. The
+          most recent lines (up to 200) are replayed on connect.
+      responses:
+        "200":
+          description: Event stream; stays open
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: "SSE frames carrying State (`event: state`) and LogLine (`event: log`) JSON."
+
+  /api/transport:
+    patch:
+      operationId: patchTransport
+      summary: Change tempo, key, play/stop, click or master level
+      description: Only the fields given change. All are validated before any is applied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransportPatch" }
+            examples:
+              tempo: { value: { bpm: 150 } }
+              key: { value: { root: "F#", scale: minor } }
+              stop: { value: { playing: false } }
+      responses:
+        "200":
+          description: State after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/State" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /api/transport/seek:
+    post:
+      operationId: seek
+      summary: Jump to the start of a bar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [bar]
+              properties:
+                bar:
+                  type: integer
+                  minimum: 1
+                  description: Bar number from 1 (bar 17 = epoch 2).
+      responses:
+        "200":
+          description: State after the seek
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/State" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /api/generators:
+    get:
+      operationId: listGenerators
+      summary: Generators in the mix
+      responses:
+        "200":
+          description: All generators, in the order they were added
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Generator" }
+    post:
+      operationId: addGenerator
+      summary: Start a generator and add it to the mix
+      description: |
+        Give exactly one of `generator` (a name from `/api/catalog`) or
+        `command`. Without `name`, one is derived from the generator or
+        program (`psybass`, then `psybass-2`, `psybass-3`, …), so adds never
+        collide. An explicit `name` that's taken is a 409.
+
+        Responds once the generator has started and completed its handshake
+        (up to 5 s). If that first start fails, nothing is added (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewGenerator" }
+            examples:
+              fromCatalog: { value: { generator: psybass, seed: 4 } }
+              named: { value: { generator: percussion, name: drums, gain_db: -3 } }
+              command: { value: { command: ["./my-gen.py", "--wild"] } }
+      responses:
+        "201":
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generator" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /api/generators/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    patch:
+      operationId: patchGenerator
+      summary: Set a generator's volume or mute it
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GeneratorPatch" }
+            examples:
+              volume: { value: { gain_db: -6 } }
+              mute: { value: { muted: true } }
+      responses:
+        "200":
+          description: The generator after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generator" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+    delete:
+      operationId: removeGenerator
+      summary: Stop a generator and remove it
+      responses:
+        "204": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/generators/{name}/params:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    patch:
+      operationId: setParams
+      summary: Set a generator's parameters
+      description: |
+        Keys are parameter `id`s from the generator's `params`. Values are
+        clamped to each parameter's range (integer, toggle and choice
+        parameters snap to whole numbers); the response has the values
+        actually used. Values are kept across restarts. While the generator
+        is restarting, ids can't be checked and are stored as given.
+        Changes apply from the next block; generators smooth them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              additionalProperties: { type: number }
+            examples:
+              filter: { value: { cutoff: 0.5, resonance: 0.1 } }
+      responses:
+        "200":
+          description: The generator after the change
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generator" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+
+  /api/generators/{name}/restart:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      operationId: restartGenerator
+      summary: Restart a generator now, e.g. after rebuilding it
+      description: The restart happens in the background; watch `state` go from `starting` to `ok`.
+      responses:
+        "202":
+          description: Restart scheduled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generator" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/catalog:
+    get:
+      operationId: listCatalog
+      summary: Generators available to add
+      description: |
+        Executables in the daemon's catalog directory (default
+        `target/release`) that answer `--info` like gen-api generators. A
+        newly built generator appears without restarting the daemon.
+      responses:
+        "200":
+          description: Available generators, sorted by name
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CatalogEntry" }
+
+  /api/log:
+    get:
+      operationId: getLog
+      summary: Recent log lines (the daemon keeps the last 1000)
+      parameters:
+        - name: after
+          in: query
+          description: Only lines with a higher `seq`.
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: Log lines, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LogLine" }
+
+components:
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/GeneratorName" }
+
+  responses:
+    BadRequest:
+      description: Malformed body or a value out of range
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such generator (or catalog entry)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: The name is taken
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unprocessable:
+      description: The generator didn't start (missing program, no `--pipe` support, failed handshake)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UnsupportedMediaType:
+      description: The body wasn't sent as application/json
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: Message for humans. }
+
+    GeneratorName:
+      type: string
+      pattern: "^[A-Za-z0-9._-]{1,32}$"
+      description: Unique within the mix; `master` and `click` are reserved.
+
+    Decibels:
+      type: number
+      minimum: -96
+      maximum: 24
+      description: Gain in dB; 0 is unity.
+
+    Root:
+      type: string
+      description: Pitch class. Sharps or flats; returned with sharps.
+      examples: ["C", "F#", "Bb"]
+
+    Scale:
+      type: string
+      enum: [phrygian, minor, harmonic-minor, dorian, major]
+
+    Peak:
+      type: number
+      minimum: 0
+      maximum: 1
+      description: Recent peak level (linear, after gain), falling back about 20 dB in 0.4 s. For meters.
+
+    Position:
+      type: object
+      required: [epoch, cycle, bar, beat, tick, absolute_bar, text]
+      properties:
+        epoch: { type: integer, minimum: 0, description: "Epochs (16 bars) since 0; unbounded." }
+        cycle: { type: integer, minimum: 0, maximum: 3, description: Cycle (4 bars) within the epoch. }
+        bar: { type: integer, minimum: 0, maximum: 3, description: Bar within the cycle. }
+        beat: { type: integer, minimum: 0, maximum: 3, description: Beat within the bar. }
+        tick: { type: integer, minimum: 0, maximum: 3, description: 16th within the beat. }
+        absolute_bar: { type: integer, minimum: 0, description: Bars since 0. }
+        text: { type: string, examples: ["2.1.3.4.1"], description: "1-based counter epoch.cycle.bar.beat.tick." }
+
+    State:
+      type: object
+      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, ahead_ms, underruns, sample_rate, generators]
+      properties:
+        playing: { type: boolean }
+        position: { $ref: "#/components/schemas/Position" }
+        beat: { type: number, description: "Audible position in quarter notes since 0." }
+        bpm: { type: number, minimum: 20, maximum: 300 }
+        root: { $ref: "#/components/schemas/Root" }
+        scale: { $ref: "#/components/schemas/Scale" }
+        click: { type: boolean, description: Metronome on. }
+        click_db: { $ref: "#/components/schemas/Decibels" }
+        master_db: { $ref: "#/components/schemas/Decibels" }
+        master_peak: { $ref: "#/components/schemas/Peak" }
+        ahead_ms: { type: number, description: How far ahead the mixer renders. }
+        underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
+        sample_rate: { type: integer }
+        generators:
+          type: array
+          items: { $ref: "#/components/schemas/Generator" }
+
+    TransportPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        playing: { type: boolean, description: "false stops the transport; sounding voices ring out." }
+        bpm: { type: number, minimum: 20, maximum: 300 }
+        root: { $ref: "#/components/schemas/Root" }
+        scale: { $ref: "#/components/schemas/Scale" }
+        click: { type: boolean }
+        click_db: { $ref: "#/components/schemas/Decibels" }
+        master_db: { $ref: "#/components/schemas/Decibels" }
+
+    GeneratorState:
+      type: string
+      description: |
+        - `ok`: running and on time
+        - `late`: running but missing deadlines (its blocks play as silence)
+        - `nan`: producing NaN/inf (silenced; restarted if it persists)
+        - `muted`: running, muted
+        - `starting`: a restart is in progress
+        - `retry 1.2s`: waiting to restart after a failure (pattern `retry <seconds>s`)
+      examples: [ok, late, nan, muted, starting, "retry 1.2s"]
+
+    Generator:
+      type: object
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error]
+      properties:
+        name: { $ref: "#/components/schemas/GeneratorName" }
+        command:
+          type: array
+          items: { type: string }
+          description: Program and arguments (without the `--pipe` the workspace appends).
+        description:
+          type: string
+          description: From the generator itself; empty while not running.
+        channels:
+          type: [integer, "null"]
+          description: 1 (mono) or 2 (stereo); null while not running.
+        inputs:
+          type: [integer, "null"]
+          description: Input channels; non-zero for effects (fed silence until routing exists). Null while not running.
+        params:
+          type: array
+          items: { $ref: "#/components/schemas/Param" }
+          description: The running generator's parameters with current values; empty while not running.
+        gain_db: { $ref: "#/components/schemas/Decibels" }
+        muted: { type: boolean }
+        state: { $ref: "#/components/schemas/GeneratorState" }
+        late: { type: integer, minimum: 0, description: Blocks played as silence because output was late. }
+        restarts: { type: integer, minimum: 0 }
+        peak: { $ref: "#/components/schemas/Peak" }
+        last_error:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [message, seconds_ago]
+              properties:
+                message: { type: string, examples: ["hung (no output for 1s)", "exited", "garbled output (something printed to stdout?)"] }
+                seconds_ago: { type: number }
+
+    Param:
+      type: object
+      required: [id, name, min, max, default, kind, log, unit, value]
+      properties:
+        id: { type: string, description: "Stable key; use it in setParams." }
+        name: { type: string, description: For humans. }
+        min: { type: number }
+        max: { type: number }
+        default: { type: number }
+        kind:
+          type: string
+          enum: [continuous, integer, toggle, choice]
+          description: "toggle: 0 or 1. choice: an index into `labels`."
+        log: { type: boolean, description: "Display hint: use a logarithmic scale (frequencies)." }
+        unit: { type: string, examples: ["Hz", "oct", "dB", ""] }
+        labels:
+          type: array
+          items: { type: string }
+          description: Only for `choice`.
+        value: { type: number, description: The value in use (clamped). }
+
+    NewGenerator:
+      type: object
+      additionalProperties: false
+      description: Exactly one of `generator` and `command`.
+      properties:
+        name: { $ref: "#/components/schemas/GeneratorName" }
+        generator: { type: string, description: "A `name` from /api/catalog." }
+        command:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: Program and arguments; relative paths resolve against the daemon's directory.
+        seed: { type: integer, minimum: 0, description: "Appended as `--seed N`." }
+        gain_db: { $ref: "#/components/schemas/Decibels" }
+        muted: { type: boolean }
+      oneOf:
+        - required: [generator]
+        - required: [command]
+
+    GeneratorPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        gain_db: { $ref: "#/components/schemas/Decibels" }
+        muted: { type: boolean }
+
+    CatalogEntry:
+      type: object
+      required: [name, description, channels, path]
+      properties:
+        name: { type: string, description: "Pass as `generator` to addGenerator." }
+        description: { type: string }
+        channels: { type: integer }
+        path: { type: string }
+
+    LogLine:
+      type: object
+      required: [seq, line]
+      properties:
+        seq: { type: integer, description: Increasing; use as `after` to fetch only newer lines. }
+        line: { type: string, examples: ["[psybass] bars 9-16 rolling K B B B"] }

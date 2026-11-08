@@ -7,8 +7,9 @@
 //! - **mixer** (main thread): owns the clock and all state. It keeps the ring
 //!   `ahead` ms full. For each block it sends one request to every generator,
 //!   collects the chunks, adds the click, and pushes the mix into the ring.
-//! - **control**: accepts `ws` commands on a unix socket and runs them on the
-//!   mixer's state as closures, between blocks.
+//! - **control**: `ws` commands on a unix socket and the HTTP API (see
+//!   [`crate::api`], [`crate::http`]). Both run operations on the mixer's
+//!   state as closures, between blocks.
 //!
 //! Generators are expected to break; see [`crate::gen`] for how they are
 //! restarted.
@@ -16,15 +17,19 @@
 //! Because the mixer renders ahead, a tempo, key or transport change is heard
 //! `ahead` ms after the command is given.
 
+use crate::api::{self, ApiError, Ctl, Job};
+use crate::catalog::Catalog;
 use crate::click::Click;
-use crate::gen::{Proc, Slot, Spawned, Spec};
+use crate::gen::{Slot, Spawned};
+use crate::log::wlog;
 use crate::ring::Ring;
 use crate::sys;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use gen_api::pipe::Request;
-use gen_api::{Position, Scale, Tonality, Transport};
+use gen_api::{Position, Tonality, Transport};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -41,10 +46,16 @@ pub struct Opts {
     pub tonality: Tonality,
     pub ahead_ms: f64,
     pub click: bool,
+    /// Where to serve the HTTP API; None turns it off.
+    pub http: Option<SocketAddr>,
+    /// Where the catalog looks for generator binaries.
+    pub catalog: PathBuf,
+    /// Where the web UI's files are served from.
+    pub ui: PathBuf,
 }
 
-/// A command from the control thread, run on the mixer's state.
-type Job = Box<dyn FnOnce(&mut Mixer) -> Result<String, String> + Send>;
+/// Per-block falloff of the level meters (about -20 dB in 0.4 s).
+const PEAK_FALLOFF: f32 = 0.93;
 
 pub struct Mixer {
     pub sample_rate: u32,
@@ -76,7 +87,8 @@ pub struct Mixer {
     pub click_on: bool,
     pub click_db: f64,
     pub master_db: f64,
-    quit: bool,
+    pub master_peak: f32,
+    pub quit: bool,
     mix: Vec<f32>,
 }
 
@@ -127,8 +139,33 @@ impl Mixer {
         Position::at(self.audible_beat(), self.beats_per_bar)
     }
 
-    pub fn find(&mut self, name: &str) -> Result<&mut Slot, String> {
-        self.gens.iter_mut().find(|g| g.name == name).ok_or_else(|| format!("no generator named {name}"))
+    pub fn state(&self) -> api::State {
+        let beat = self.audible_beat();
+        let p = Position::at(beat, self.beats_per_bar);
+        api::State {
+            playing: self.playing,
+            position: api::PositionView {
+                epoch: p.epoch,
+                cycle: p.cycle,
+                bar: p.bar,
+                beat: p.beat,
+                tick: p.tick,
+                absolute_bar: p.absolute_bar(),
+                text: p.to_string(),
+            },
+            beat,
+            bpm: self.bpm,
+            root: self.tonality.root_name().to_owned(),
+            scale: self.tonality.scale.name().to_owned(),
+            click: self.click_on,
+            click_db: self.click_db,
+            master_db: self.master_db,
+            master_peak: self.master_peak,
+            ahead_ms: self.ahead_frames as f64 * 1000.0 / self.sample_rate as f64,
+            underruns: self.underruns.load(Ordering::Relaxed),
+            sample_rate: self.sample_rate,
+            generators: self.gens.iter().map(api::Generator::of).collect(),
+        }
     }
 
     pub fn status(&self) -> String {
@@ -196,6 +233,7 @@ impl Mixer {
         self.mix.clear();
         self.mix.resize(n * ch, 0.0);
         for g in &mut self.gens {
+            g.peak *= PEAK_FALLOFF;
             let Some(mut chunk) = g.collect(seq, deadline, short_deadline) else { continue };
             g.sanitize(&mut chunk);
             let gain = g.gain();
@@ -203,6 +241,7 @@ impl Mixer {
             if gain == 0.0 {
                 continue;
             }
+            g.peak = chunk.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
             for (f, out) in self.mix.chunks_exact_mut(ch).enumerate() {
                 let src = &chunk[f * gch..(f + 1) * gch];
                 for (c, o) in out.iter_mut().enumerate() {
@@ -220,9 +259,12 @@ impl Mixer {
 
         // Soft clip so stacked generators saturate instead of wrapping.
         let master = db_to_gain(self.master_db);
+        let mut peak = self.master_peak * PEAK_FALLOFF;
         for x in &mut self.mix {
             *x = (*x * master).tanh();
+            peak = peak.max(x.abs());
         }
+        self.master_peak = peak;
 
         self.ring.push(&self.mix);
         self.frame += n as u64;
@@ -284,7 +326,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
                     }
                     played.fetch_add((n / channels) as u64, Ordering::Relaxed);
                 },
-                |e| eprintln!("audio: {e}"),
+                |e| wlog!("audio: {e}"),
                 None,
             )
             .map_err(|e| format!("open output stream: {e}"))?
@@ -292,11 +334,29 @@ pub fn run(opts: Opts) -> Result<(), String> {
 
     sys::install_stop_handlers();
     let listener = UnixListener::bind(&opts.socket).map_err(|e| format!("{}: {e}", opts.socket.display()))?;
-    let (job_tx, job_rx) = mpsc::channel::<(Job, Sender<Result<String, String>>)>();
-    thread::Builder::new()
-        .name("control".into())
-        .spawn(move || control(listener, job_tx, sample_rate))
-        .map_err(|e| e.to_string())?;
+    let http = match opts.http.map(crate::http::bind) {
+        Some(Ok(l)) => Some(l),
+        Some(Err(e)) => {
+            crate::http::log_bind_failure(&e);
+            None
+        }
+        None => None,
+    };
+    let http_url = http.as_ref().and_then(|l| l.local_addr().ok()).map(|a| format!("http://{a}"));
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let catalog_dir = cwd.join(&opts.catalog);
+    let ui_dir = cwd.join(&opts.ui);
+    let ctl = Ctl { jobs: job_tx, sample_rate, http_url: http_url.clone(), catalog: Arc::new(Catalog::new(catalog_dir)) };
+    {
+        let ctl = ctl.clone();
+        thread::Builder::new().name("control".into()).spawn(move || control(listener, ctl)).map_err(|e| e.to_string())?;
+    }
+    if let Some(l) = http {
+        let ctl = ctl.clone();
+        let (cwd, ui) = (cwd.clone(), ui_dir.clone());
+        thread::Builder::new().name("http".into()).spawn(move || crate::http::serve(l, ctl, cwd, ui)).map_err(|e| e.to_string())?;
+    }
 
     let (spawned_tx, spawned_rx) = mpsc::channel();
     let mut m = Mixer {
@@ -320,11 +380,12 @@ pub fn run(opts: Opts) -> Result<(), String> {
         click_on: opts.click,
         click_db: -12.0,
         master_db: 0.0,
+        master_peak: 0.0,
         quit: false,
         mix: Vec::new(),
     };
 
-    eprintln!(
+    wlog!(
         "workspace  {} Hz  {} ch  {} bpm  {} {}  ahead {} ms",
         sample_rate,
         channels,
@@ -333,7 +394,15 @@ pub fn run(opts: Opts) -> Result<(), String> {
         opts.tonality.scale.name(),
         opts.ahead_ms
     );
-    eprintln!("listening on {}", opts.socket.display());
+    wlog!("listening on {}", opts.socket.display());
+    match &http_url {
+        Some(u) => {
+            wlog!("http api on {u}  (spec: {u}/api/openapi.yaml, catalog: {})", ctl.catalog.dir().display());
+            let missing = if ui_dir.is_dir() { "" } else { "  (missing)" };
+            wlog!("web ui on {u}/  from {}{missing}", ui_dir.display());
+        }
+        None => {}
+    }
 
     // Prime the buffer before the device starts pulling.
     fill(&mut m);
@@ -348,7 +417,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     for r in reapers {
         let _ = r.join();
     }
-    eprintln!("workspace stopped");
+    wlog!("workspace stopped");
     Ok(())
 }
 
@@ -359,10 +428,10 @@ fn fill(m: &mut Mixer) {
     }
 }
 
-fn mix_loop(m: &mut Mixer, jobs: Receiver<(Job, Sender<Result<String, String>>)>, spawned: Receiver<Spawned>) {
+fn mix_loop(m: &mut Mixer, jobs: Receiver<Job>, spawned: Receiver<Spawned>) {
     loop {
         if sys::stop_requested() {
-            eprintln!("shutting down");
+            wlog!("shutting down");
             return;
         }
         while let Ok(s) = spawned.try_recv() {
@@ -377,8 +446,8 @@ fn mix_loop(m: &mut Mixer, jobs: Receiver<(Job, Sender<Result<String, String>>)>
         // Sleep until a command arrives or about a block's worth of audio has
         // played.
         match jobs.recv_timeout(Duration::from_millis(2)) {
-            Ok((job, reply)) => {
-                let _ = reply.send(job(m));
+            Ok(job) => {
+                job(m);
                 if m.quit {
                     return;
                 }
@@ -391,182 +460,29 @@ fn mix_loop(m: &mut Mixer, jobs: Receiver<(Job, Sender<Result<String, String>>)>
 
 // ---------------------------------------------------------------- control
 
+/// `ws` CLI requests over the unix socket.
 /// Request: NUL-separated arguments `cwd, command, args...`, then EOF.
-/// Reply: `ok\n` or `error\n`, then text for the user.
-fn control(listener: UnixListener, jobs: Sender<(Job, Sender<Result<String, String>>)>, sample_rate: u32) {
+/// Reply: `ok\n` or `error\n`, then text for the terminal.
+fn control(listener: UnixListener, ctl: Ctl) {
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else { continue };
-        let mut raw = Vec::new();
-        if conn.read_to_end(&mut raw).is_err() {
-            continue;
-        }
-        let args: Vec<String> = String::from_utf8_lossy(&raw).split('\0').map(str::to_owned).collect();
-        let result = match args.split_first() {
-            Some((cwd, rest)) if !rest.is_empty() => handle(Path::new(cwd), rest, &jobs, sample_rate),
-            _ => Err("empty request".into()),
-        };
-        let reply = match result {
-            Ok(text) => format!("ok\n{text}"),
-            Err(text) => format!("error\n{text}"),
-        };
-        let _ = conn.write_all(reply.as_bytes());
-    }
-}
-
-/// Runs `f` on the mixer and waits for its answer.
-fn on_mixer(
-    jobs: &Sender<(Job, Sender<Result<String, String>>)>,
-    f: impl FnOnce(&mut Mixer) -> Result<String, String> + Send + 'static,
-) -> Result<String, String> {
-    let (tx, rx) = mpsc::channel();
-    jobs.send((Box::new(f), tx)).map_err(|_| "mixer stopped".to_string())?;
-    rx.recv().map_err(|_| "mixer stopped".to_string())?
-}
-
-fn parse_db(s: &str) -> Result<f64, String> {
-    let db: f64 = s.trim_end_matches("dB").trim_end_matches("db").parse().map_err(|_| format!("{s}: not a dB value"))?;
-    if !(-96.0..=24.0).contains(&db) {
-        return Err("gain must be between -96 and +24 dB".into());
-    }
-    Ok(db)
-}
-
-fn handle(
-    cwd: &Path,
-    args: &[String],
-    jobs: &Sender<(Job, Sender<Result<String, String>>)>,
-    sample_rate: u32,
-) -> Result<String, String> {
-    let cmd = args[0].as_str();
-    let rest = &args[1..];
-    let arg = |i: usize, what: &str| rest.get(i).cloned().ok_or_else(|| format!("{cmd}: missing {what}"));
-    match cmd {
-        "status" => on_mixer(jobs, |m| Ok(m.status())),
-        "pos" => on_mixer(jobs, |m| {
-            let beat = m.audible_beat();
-            let pos = m.audible_position();
-            Ok(format!("{pos}  bar {}  beat {beat:.3}  {} bpm\n", pos.absolute_bar() + 1, fmt_num(m.bpm)))
-        }),
-        "add" => {
-            let name = arg(0, "NAME")?;
-            if name == "master" || name == "click" || name.is_empty() || name.contains(char::is_whitespace) {
-                return Err(format!("{name:?} can't be used as a generator name"));
+        let ctl = ctl.clone();
+        // A thread per request: `add` can take seconds to start a generator.
+        thread::spawn(move || {
+            let mut raw = Vec::new();
+            if conn.read_to_end(&mut raw).is_err() {
+                return;
             }
-            if rest.len() < 2 {
-                return Err("usage: ws add NAME COMMAND [ARGS...]".into());
-            }
-            let n = name.clone();
-            on_mixer(jobs, move |m| match m.gens.iter().any(|g| g.name == n) {
-                true => Err(format!("{n} already exists; ws rm {n} first")),
-                false => Ok(String::new()),
-            })?;
-            // Spawn and handshake here, not on the mixer, so a slow start
-            // doesn't hold up audio. A first start that fails is reported
-            // and not added; later crashes are restarted.
-            let spec = Spec { argv: rest[1..].to_vec(), cwd: cwd.to_owned(), sample_rate, max_frames: BLOCK as u32 };
-            let proc = Proc::spawn(&name, &spec)?;
-            let msg = format!("added {name} ({} ch)\n", proc.channels);
-            let slot = Slot::new(&name, spec, proc);
-            on_mixer(jobs, move |m| {
-                if m.gens.iter().any(|g| g.name == slot.name) {
-                    return Err(format!("{} already exists", slot.name));
-                }
-                m.gens.push(slot);
-                Ok(msg)
-            })
-        }
-        "restart" => {
-            let name = arg(0, "NAME")?;
-            on_mixer(jobs, move |m| {
-                m.find(&name)?.restart_now();
-                Ok(format!("restarting {name}\n"))
-            })
-        }
-        "rm" => {
-            let name = arg(0, "NAME")?;
-            on_mixer(jobs, move |m| {
-                let before = m.gens.len();
-                m.gens.retain(|g| g.name != name);
-                if m.gens.len() == before {
-                    return Err(format!("no generator named {name}"));
-                }
-                Ok(format!("removed {name}\n"))
-            })
-        }
-        "gain" => {
-            let name = arg(0, "NAME")?;
-            let db = parse_db(&arg(1, "DB")?)?;
-            on_mixer(jobs, move |m| {
-                match name.as_str() {
-                    "master" => m.master_db = db,
-                    "click" => m.click_db = db,
-                    _ => m.find(&name)?.gain_db = db,
-                }
-                Ok(format!("{name} {db:+.1} dB\n"))
-            })
-        }
-        "mute" | "unmute" => {
-            let name = arg(0, "NAME")?;
-            let mute = cmd == "mute";
-            on_mixer(jobs, move |m| {
-                m.find(&name)?.muted = mute;
-                Ok(format!("{name} {}\n", if mute { "muted" } else { "unmuted" }))
-            })
-        }
-        "bpm" => {
-            let bpm: f64 = arg(0, "BPM")?.parse().map_err(|_| "bpm: not a number".to_string())?;
-            if !(20.0..=300.0).contains(&bpm) {
-                return Err("bpm must be 20-300".into());
-            }
-            on_mixer(jobs, move |m| {
-                m.set_bpm(bpm);
-                Ok(format!("{} bpm\n", fmt_num(bpm)))
-            })
-        }
-        "key" => {
-            let root = Tonality::parse_root(&arg(0, "ROOT")?).ok_or("key: expected a note name like F# or Bb")?;
-            let scale = match rest.get(1) {
-                Some(s) => Some(Scale::parse(s).ok_or_else(|| format!("key: unknown scale {s}; {}", scale_names()))?),
-                None => None,
+            let args: Vec<String> = String::from_utf8_lossy(&raw).split('\0').map(str::to_owned).collect();
+            let result = match args.split_first() {
+                Some((cwd, rest)) if !rest.is_empty() => ctl.command(Path::new(cwd), rest),
+                _ => Err(ApiError::BadRequest("empty request".into())),
             };
-            on_mixer(jobs, move |m| {
-                m.tonality = Tonality { root, scale: scale.unwrap_or(m.tonality.scale) };
-                Ok(format!("{} {}\n", m.tonality.root_name(), m.tonality.scale.name()))
-            })
-        }
-        "click" => {
-            let on = match arg(0, "on|off")?.as_str() {
-                "on" => true,
-                "off" => false,
-                other => return Err(format!("click: expected on or off, not {other}")),
+            let reply = match result {
+                Ok(text) => format!("ok\n{text}"),
+                Err(e) => format!("error\n{e}"),
             };
-            on_mixer(jobs, move |m| {
-                m.click_on = on;
-                Ok(format!("click {}\n", if on { "on" } else { "off" }))
-            })
-        }
-        "play" | "stop" => {
-            let playing = cmd == "play";
-            on_mixer(jobs, move |m| {
-                m.set_playing(playing);
-                Ok(format!("{} at {}\n", if playing { "playing" } else { "stopped" }, m.audible_position()))
-            })
-        }
-        "seek" => {
-            let bar: u64 = arg(0, "BAR")?.parse().ok().filter(|&b| b >= 1).ok_or("seek: BAR is a bar number from 1")?;
-            on_mixer(jobs, move |m| {
-                m.seek_bar(bar - 1);
-                Ok(format!("seek to bar {bar}\n"))
-            })
-        }
-        "quit" => on_mixer(jobs, |m| {
-            m.quit = true;
-            Ok("workspace stopping\n".into())
-        }),
-        other => Err(format!("unknown command {other}; see ws help")),
+            let _ = conn.write_all(reply.as_bytes());
+        });
     }
-}
-
-pub fn scale_names() -> String {
-    Scale::ALL.iter().map(|s| s.name()).collect::<Vec<_>>().join(", ")
 }

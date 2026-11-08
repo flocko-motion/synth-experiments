@@ -4,11 +4,17 @@
 //! device. Every other subcommand talks to the running daemon over a unix
 //! socket. See `ws help`.
 
+mod log;
+
+mod api;
+mod catalog;
 mod click;
 mod daemon;
 mod gen;
+mod http;
 mod ring;
 mod sys;
+mod ui;
 
 use gen_api::{Scale, Tonality};
 use std::io::{Read, Write};
@@ -20,32 +26,45 @@ fn usage() -> String {
     format!(
         "\
 usage: ws daemon [--bpm N] [--key ROOT] [--scale NAME] [--ahead MS] [--no-click]
+                 [--http ADDR | --no-http] [--catalog DIR] [--ui DIR]
        ws COMMAND [ARGS...]
+
+daemon options:
+  --http ADDR     serve the HTTP API here (default {DEFAULT_HTTP}, loopback only)
+  --catalog DIR   where to look for generator binaries (default target/release)
+  --ui DIR        serve the web UI from this directory at / (default workspace/ui)
 
 commands (sent to the running daemon):
   status                     transport, buffer and generators (default)
   pos                        audible position: epoch.cycle.bar.beat.tick
-  add NAME COMMAND [ARGS..]  start a generator (COMMAND gets --pipe appended);
+  add [--name NAME] COMMAND [ARGS..]
+                             start a generator (COMMAND gets --pipe appended);
                              it's restarted whenever it crashes, hangs or
-                             garbles its output
+                             garbles its output. NAME defaults to the
+                             program's name, with -2, -3, … if taken
   rm NAME                    stop and remove it
   restart NAME               restart it now, e.g. after rebuilding
   gain NAME|master|click DB  set a level, e.g. ws gain bass -3
   mute NAME / unmute NAME
+  params NAME                list a generator's parameters and values
+  set NAME PARAM VALUE       set one, e.g. ws set acid cutoff 0.5
   bpm N                      change tempo
   key ROOT [SCALE]           change key, e.g. ws key F# phrygian
   click on|off
   play / stop                start or stop the transport (stop lets voices ring)
   seek BAR                   jump to a bar, from 1
+  url                        the HTTP API's address
   quit                       stop the daemon and its generators
 
 grid: tick (16th) -> beat -> bar -> cycle (4 bars) -> epoch (16 bars)
 scales: {}
 socket: $WS_SOCKET, default {}",
-        daemon::scale_names(),
+        api::scale_names(),
         default_socket().display()
     )
 }
+
+const DEFAULT_HTTP: &str = "127.0.0.1:7700";
 
 fn default_socket() -> PathBuf {
     std::env::temp_dir().join("synth-ws.sock")
@@ -77,6 +96,9 @@ fn run_daemon(args: &[String]) {
         tonality: Tonality { root: 2, scale: Scale::Phrygian },
         ahead_ms: 200.0,
         click: true,
+        http: Some(DEFAULT_HTTP.parse().unwrap()),
+        catalog: PathBuf::from("target/release"),
+        ui: PathBuf::from("workspace/ui"),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -84,9 +106,13 @@ fn run_daemon(args: &[String]) {
         match a.as_str() {
             "--bpm" => opts.bpm = val().parse().ok().filter(|b| (20.0..=300.0).contains(b)).unwrap_or_else(|| fail("--bpm takes 20-300")),
             "--key" => opts.tonality.root = Tonality::parse_root(&val()).unwrap_or_else(|| fail("--key takes a note name like F# or Bb")),
-            "--scale" => opts.tonality.scale = Scale::parse(&val()).unwrap_or_else(|| fail(&format!("--scale takes one of {}", daemon::scale_names()))),
+            "--scale" => opts.tonality.scale = Scale::parse(&val()).unwrap_or_else(|| fail(&format!("--scale takes one of {}", api::scale_names()))),
             "--ahead" => opts.ahead_ms = val().parse().ok().filter(|ms| (20.0..=5000.0).contains(ms)).unwrap_or_else(|| fail("--ahead takes 20-5000 ms")),
             "--no-click" => opts.click = false,
+            "--http" => opts.http = Some(val().parse().unwrap_or_else(|_| fail("--http takes an address like 127.0.0.1:7700"))),
+            "--no-http" => opts.http = None,
+            "--catalog" => opts.catalog = PathBuf::from(val()),
+            "--ui" => opts.ui = PathBuf::from(val()),
             _ => fail(&format!("{a}: unknown option\n{}", usage())),
         }
     }

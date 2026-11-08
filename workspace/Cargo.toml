@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 gen-api = { path = "../crates/gen-api" }
 cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -11,8 +11,11 @@
 //! deadline. A chunk that misses its deadline is mixed as silence and dropped
 //! when it turns up.
 
+use crate::log::wlog;
 use crate::sys;
-use gen_api::pipe::{decode_chunk_header, read_message, GenHello, Hello, Request, CHUNK_HEADER_LEN, GEN_HELLO_LEN};
+use gen_api::pipe::{decode_chunk_header, read_gen_hello, write_request, Hello, Request, CHUNK_HEADER_LEN};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -52,6 +55,57 @@ pub struct Spec {
 struct Job {
     seq: u64,
     req: Request,
+    /// Every parameter's value, in description order.
+    params: Vec<f64>,
+}
+
+/// What a generator says about itself in the handshake (the same JSON as
+/// `--info --json`).
+#[derive(Deserialize, Clone, Debug)]
+pub struct Description {
+    #[allow(dead_code)] // part of the format; the slot has its own name
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub params: Vec<ParamDesc>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ParamDesc {
+    pub id: String,
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    /// continuous, integer, toggle or choice
+    pub kind: String,
+    #[serde(default)]
+    pub log: bool,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+}
+
+impl ParamDesc {
+    /// Clamps to the range; integer, toggle and choice params snap to
+    /// whole numbers.
+    pub fn clamp(&self, v: f64) -> f64 {
+        let v = if v.is_finite() { v.clamp(self.min, self.max) } else { self.default };
+        if self.kind == "continuous" {
+            v
+        } else {
+            v.round()
+        }
+    }
+}
+
+/// The handshake's result.
+struct Ready {
+    channels: usize,
+    inputs: usize,
+    desc: Description,
 }
 
 struct Chunk {
@@ -63,6 +117,10 @@ struct Chunk {
 pub struct Proc {
     name: String,
     pub channels: usize,
+    /// Input channels; non-zero for effects. Fed silence until routing
+    /// exists.
+    pub inputs: usize,
+    pub desc: Description,
     jobs: Option<Sender<Job>>,
     chunks: Receiver<Result<Chunk, String>>,
     child: Option<Child>,
@@ -112,8 +170,8 @@ impl Proc {
                 Err(_) => Err(format!("{program}: no handshake within {}s", HANDSHAKE_TIMEOUT.as_secs())),
             },
         };
-        let channels = match handshake {
-            Ok(ch) => ch,
+        let ready = match handshake {
+            Ok(r) => r,
             Err(e) => {
                 sys::kill_group(child.id());
                 let _ = child.kill();
@@ -125,7 +183,9 @@ impl Proc {
         let now = Instant::now();
         Ok(Proc {
             name: name.to_owned(),
-            channels,
+            channels: ready.channels,
+            inputs: ready.inputs,
+            desc: ready.desc,
             jobs: Some(job_tx),
             chunks: chunk_rx,
             child: Some(child),
@@ -155,7 +215,7 @@ impl Proc {
             sys::kill_group(pgid);
             let status = status.or_else(|| child.wait().ok());
             if let Some(s) = status.filter(|s| !s.success()) {
-                eprintln!("[{name}] exited ({s})");
+                wlog!("[{name}] exited ({s})");
             }
         }))
     }
@@ -185,6 +245,11 @@ pub struct Slot {
     pub late: u64,
     pub restarts: u64,
     pub last_error: Option<(String, Instant)>,
+    /// Parameter values set by the user, by id; kept across restarts.
+    /// Unset params use the generator's default.
+    pub values: BTreeMap<String, f64>,
+    /// Output level after gain, falling back slowly; for meters.
+    pub peak: f32,
     pub state: State,
     /// Bumped on every (re)start, so a stale spawn result is ignored.
     pub generation: u64,
@@ -211,6 +276,8 @@ impl Slot {
             late: 0,
             restarts: 0,
             last_error: None,
+            values: BTreeMap::new(),
+            peak: 0.0,
             state: State::Running(proc),
             generation: 0,
             backoff: 0,
@@ -222,6 +289,33 @@ impl Slot {
 
     pub fn command(&self) -> String {
         self.spec.argv.join(" ")
+    }
+
+    /// The running proc's parameters, if it's running.
+    pub fn params(&self) -> Option<&[ParamDesc]> {
+        match &self.state {
+            State::Running(p) => Some(&p.desc.params),
+            _ => None,
+        }
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        match &self.state {
+            State::Running(p) => Some(&p.desc.description),
+            _ => None,
+        }
+    }
+
+    pub fn inputs(&self) -> Option<usize> {
+        match &self.state {
+            State::Running(p) => Some(p.inputs),
+            _ => None,
+        }
+    }
+
+    /// The value sent for a param: the user's, clamped, or the default.
+    pub fn value_of(&self, d: &ParamDesc) -> f64 {
+        self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v))
     }
 
     pub fn channels(&self) -> Option<usize> {
@@ -258,7 +352,8 @@ impl Slot {
             self.late += 1;
             return self.check_hang();
         }
-        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req }).is_ok());
+        let params = p.desc.params.iter().map(|d| self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v))).collect();
+        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params }).is_ok());
         if !sent {
             return self.fail("exited".into(), false);
         }
@@ -366,7 +461,7 @@ impl Slot {
         }
         let delay = (BACKOFF_MIN * 2u32.pow(self.backoff.min(6))).min(BACKOFF_MAX);
         self.backoff += 1;
-        eprintln!("[{}] {why}; restarting in {:.2}s", self.name, delay.as_secs_f64());
+        wlog!("[{}] {why}; restarting in {:.2}s", self.name, delay.as_secs_f64());
         self.last_error = Some((why, Instant::now()));
         self.nan_blocks = 0;
         self.on_time = true;
@@ -405,7 +500,7 @@ impl Slot {
         }
         match s.result {
             Ok(p) => {
-                eprintln!("[{}] restarted", self.name);
+                wlog!("[{}] restarted", self.name);
                 self.restarts += 1;
                 self.on_time = true;
                 self.state = State::Running(p);
@@ -435,7 +530,7 @@ fn relay_log(tag: &str, mut stderr: ChildStderr) {
     let emit = |line: &[u8], shown: &mut u32, dropped: &mut u64, window: &mut Instant| {
         if window.elapsed() >= Duration::from_secs(1) {
             if *dropped > 0 {
-                eprintln!("[{tag}] … {dropped} lines dropped");
+                wlog!("[{tag}] … {dropped} lines dropped");
             }
             *window = Instant::now();
             *shown = 0;
@@ -451,7 +546,7 @@ fn relay_log(tag: &str, mut stderr: ChildStderr) {
             return;
         }
         *shown += 1;
-        eprintln!("[{tag}] {text}");
+        wlog!("[{tag}] {text}");
     };
     loop {
         let n = match stderr.read(&mut buf) {
@@ -476,22 +571,27 @@ fn worker(
     mut stdin: ChildStdin,
     mut stdout: ChildStdout,
     hello: Hello,
-    ready: Sender<Result<usize, String>>,
+    ready: Sender<Result<Ready, String>>,
     jobs: Receiver<Job>,
     chunks: Sender<Result<Chunk, String>>,
 ) {
-    let handshake = (|| -> Result<usize, String> {
+    let handshake = (|| -> Result<Ready, String> {
         stdin.write_all(&hello.encode()).and_then(|_| stdin.flush()).map_err(|e| e.to_string())?;
-        let mut b = [0u8; GEN_HELLO_LEN];
-        if !read_message(&mut stdout, &mut b).map_err(|e| e.to_string())? {
-            return Err("exited before answering".into());
+        let (h, json) = read_gen_hello(&mut stdout).map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => "exited before answering".to_string(),
+            _ => e.to_string(),
+        })?;
+        let desc: Description = serde_json::from_str(&json).map_err(|e| format!("bad description JSON: {e}"))?;
+        if desc.params.len() != h.params as usize {
+            return Err(format!("hello says {} params, description lists {}", h.params, desc.params.len()));
         }
-        Ok(GenHello::decode(&b).map_err(|e| e.to_string())?.channels as usize)
+        Ok(Ready { channels: h.channels as usize, inputs: h.inputs as usize, desc })
     })();
-    let channels = match handshake {
-        Ok(ch) => {
-            let _ = ready.send(Ok(ch));
-            ch
+    let (channels, inputs) = match handshake {
+        Ok(r) => {
+            let dims = (r.channels, r.inputs);
+            let _ = ready.send(Ok(r));
+            dims
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -500,9 +600,11 @@ fn worker(
     };
 
     let mut bytes = Vec::new();
+    let mut silence = Vec::new();
     for job in jobs {
         let result = (|| -> Result<Chunk, String> {
-            stdin.write_all(&job.req.encode()).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
+            silence.resize(job.req.frames as usize * inputs, 0.0);
+            write_request(&mut stdin, &job.req, &job.params, &silence).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
             let mut header = [0u8; CHUNK_HEADER_LEN];
             stdout.read_exact(&mut header).map_err(|_| "exited".to_string())?;
             let frames = decode_chunk_header(&header).map_err(|_| "garbled output (something printed to stdout?)".to_string())?;

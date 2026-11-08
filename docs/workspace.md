@@ -7,8 +7,9 @@ default audio device. Generators run as subprocesses over the pipe protocol.
 ```sh
 cargo build --release
 target/release/ws daemon --bpm 148 --key E &      # or in its own terminal
-target/release/ws add bass target/release/psybass --seed 4
-target/release/ws add blip target/release/blip --seed 3
+target/release/ws add target/release/psybass --seed 4         # named psybass
+target/release/ws add target/release/psybass                  # psybass-2
+target/release/ws add --name hats target/release/percussion
 target/release/ws                                  # status
 target/release/ws pos                              # 2.1.3.4.1  bar 23 ...
 target/release/ws bpm 150; target/release/ws key F# minor
@@ -17,9 +18,43 @@ target/release/ws seek 17; target/release/ws stop; target/release/ws play
 target/release/ws quit
 ```
 
+The root Makefile wraps the common steps: `make daemon` (takes `BPM`, `KEY`,
+`SCALE`), `make add psybass` (takes `SEED`, and `NAME` to pick the name), `make rm psybass`.
+
 `ws help` lists everything. Relative generator paths resolve against the
 directory `ws add` runs in. The socket is `$TMPDIR/synth-ws.sock`, or set
 `$WS_SOCKET`.
+
+## HTTP API
+
+The daemon also serves a JSON API on `http://127.0.0.1:7700` (`--http ADDR`
+to move it, `--no-http` to turn it off; `ws url` prints it). The contract is
+[`workspace/openapi.yaml`](../workspace/openapi.yaml), also served at
+`/api/openapi.yaml`, so clients can generate types from it.
+
+```sh
+A=http://127.0.0.1:7700
+curl -s $A/api/catalog                                   # what can be added
+curl -s -X POST $A/api/generators -H 'Content-Type: application/json' \
+     -d '{"generator": "psybass", "seed": 4}'             # → 201, named psybass
+curl -s -X PATCH $A/api/generators/psybass -H 'Content-Type: application/json' \
+     -d '{"gain_db": -6}'
+curl -s -X DELETE $A/api/generators/psybass              # → 204
+curl -s -N $A/api/events                                 # live state + log (SSE)
+```
+
+- **Adding**: `generator` is a name from `/api/catalog`: executables in
+  `--catalog DIR` (default `target/release`) that answer `--info`. Freshly
+  built generators show up without a restart. `command` takes any
+  pipe-protocol program instead. Leave out `name` and one is derived,
+  with `-2`, `-3`, … appended if taken.
+- **Live updates**: `/api/events` streams `state` about 20 times a second
+  and every log line, generator stderr included.
+- **Access**: loopback only. Requests must carry a loopback `Host`, and
+  an `Origin`, if present, of a localhost page. That allows dev servers on
+  any port (CORS) and keeps other websites from starting programs.
+  Bodies must be `application/json`.
+- The CLI and the API share one implementation (`workspace/src/api.rs`).
 
 ## How it runs
 

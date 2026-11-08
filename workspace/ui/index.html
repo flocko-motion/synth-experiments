@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workspace</title>
+  <!--
+    The workspace web UI: Lit components, no build step. Served by `ws daemon`
+    at /, and embedded in the binary (src/ui.rs). To work on it without
+    rebuilding, serve this directory with any static server and point it at
+    the daemon: http://localhost:8000/?api=http://127.0.0.1:7700
+  -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #121315;
+      --panel: #1c1e21;
+      --panel-2: #24272b;
+      --edge: #33373c;
+      --text: #d8dadd;
+      --dim: #858a91;
+      --accent: #f2a03d;
+      --led-off: #2b2e32;
+      --led-beat: #4ade80;
+      --led-bar: #f2a03d;
+      --led-cycle: #60a5fa;
+      --led-epoch: #f472b6;
+      --lcd-bg: #0b100c;
+      --lcd: #7dffa0;
+      --danger: #ef4444;
+      --warn: #facc15;
+      --mute: #f59e0b;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 var(--sans); }
+  </style>
+  <script type="module" src="ws-app.js"></script>
+</head>
+<body>
+  <ws-app></ws-app>
+</body>
+</html>
