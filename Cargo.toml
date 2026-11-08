@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "generators/*", "workspace"]
+members = ["crates/*", "generators/*", "effects/*", "workspace"]
 
 [profile.release]
 opt-level = 3

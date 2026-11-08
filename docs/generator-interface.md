@@ -39,6 +39,9 @@ pub trait Generator {
 
 ### Discovery: `Info`
 
+Besides `Info`, a plugin can override `params()` (see
+[Parameters](#parameters)) and `inputs()` (see [Effects](#effects)).
+
 | Field | Meaning |
 |---|---|
 | `name` | Short identifier, e.g. `psybass`. |
@@ -61,6 +64,8 @@ The host calls `process` once per block. `out.len()` is
 | `transport.playing` | `false`: trigger nothing new, let sounding voices ring out. |
 | `tonality.root` | Pitch class, 0 = C … 11 = B. |
 | `tonality.scale` | `Phrygian`, `Minor`, `HarmonicMinor`, `Dorian` or `Major`. `Tonality::degree(n)` maps a scale degree to semitones above the root. |
+| `params` | Every parameter's current value, in `params()` order; `ctx.param(i)`. Empty if the plugin has none. |
+| `input` | Effects only: this block's input audio, interleaved. Empty for generators. |
 
 `transport.beat` is the click: it tells the generator both *where* it is
 (pattern position) and, together with `bpm`, *when* the next subdivision
@@ -162,14 +167,26 @@ the only other flag accepted is `--seed`; tempo and key come from the host.
 All values are little-endian. The generator's stderr is free for logging,
 and the host prefixes it with the generator's name.
 
+Protocol version 3:
+
 ```text
-host -> gen   hello     16 bytes   "WSH2" | u32 sample_rate | u32 max_frames | u32 reserved
-gen  -> host  hello      8 bytes   "WSG2" | u16 channels    | u16 reserved
+host -> gen   hello     16 bytes   "WSH3" | u32 sample_rate | u32 max_frames | u32 reserved
+gen  -> host  hello     16 bytes   "WSG3" | u16 channels | u16 inputs | u16 params
+                                   | u16 reserved | u32 json_len
+                        + json_len bytes: the plugin description (as `--info --json`)
 then, repeated:
-host -> gen   request   32 bytes
-gen  -> host  chunk      8 bytes   "WSC2" | u32 frames
+host -> gen   request   32 bytes   header, see below
+                        + params × f64       snapshot of every parameter
+                        + frames × inputs × f32, interleaved   (effects only)
+gen  -> host  chunk      8 bytes   "WSC3" | u32 frames
                          + frames × channels × f32, interleaved
 ```
+
+The description travels in the handshake so the host always has the
+metadata of the exact process it talks to, also for plugins that aren't in
+any catalog. For a plugin without inputs or params a request is just the
+32-byte header. `gen_api::pipe` has host-side helpers: `Hello::encode`,
+`read_gen_hello`, `write_request`, `decode_chunk_header`.
 
 The chunk header lets the host notice a corrupted stream (typically a
 debug print on stdout). The host then kills and restarts the generator.
@@ -193,8 +210,8 @@ Request layout:
 
 The host closes stdin to stop the generator, which then exits (it's killed
 after 300 ms if it doesn't). A generator in another language only needs to
-implement this: read 16 bytes, write 8, then loop reading 32 and writing
-`8 + frames × channels × 4`.
+implement this: read 16 bytes, write 16 plus its JSON, then loop reading
+`32 + params × 8 + frames × inputs × 4` and writing `8 + frames × channels × 4`.
 
 Expect skipped requests: a generator that falls behind gets a gap in
 `frame`/`beat`, which it treats like a seek. A restarted generator's first
@@ -204,6 +221,62 @@ Alternatives considered: a dynamic library with a C ABI (fastest, but needs
 `unsafe` glue, and a crashing plugin takes the host down) and WASM
 components (sandboxed, but a heavy dependency and a more involved plugin
 build).
+
+## Parameters
+
+Plugins declare parameters by overriding `Generator::params`; the model
+follows CLAP's:
+
+```rust
+const PARAMS: [Param; 2] = [
+    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct"),
+    Param::choice("rate", "Rate", &["1/4", "1/8", "1/2"], 0),
+];
+fn params(&self) -> &'static [Param] { &PARAMS }
+// in process(): ctx.param(0)
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Stable, unique within the plugin. Hosts address and store values by it (the workspace API: `PATCH /api/generators/{name}/params` with `{"cutoff": 1.5}`), and values survive restarts by it. Never rename. |
+| `name`, `unit` | For humans. |
+| `min`, `max`, `default` | Plain units. |
+| `kind` | `Continuous`, `Integer`, `Toggle` (0/1) or `Choice(labels)` (index). |
+| `log` | UI hint: map knob travel logarithmically. |
+
+Rules:
+
+- Values arrive as a full snapshot with every block, in declaration order,
+  already clamped to the range (and rounded for integer kinds). Hosts send
+  the defaults until something is set, so the first block is complete.
+- Values change in steps once per block; smooth continuous parameters
+  inside the plugin to avoid zipper noise.
+- Automation lives in the host: it just sends different values.
+- The seed is not a parameter. It's fixed for an instance; a different seed
+  means a new instance.
+
+On the CLI: `--set ID=VALUE` (numbers, `on`/`off`, or a choice label),
+listed with ranges by `--help`; `--info --json` prints the description.
+
+## Effects
+
+An effect is a plugin with `Generator::inputs` > 0. It reads its input from
+`ctx.input` (interleaved, `inputs` channels, the same frame count as
+`out`); the host adapts channel counts, mono to every input and stereo to
+mono by averaging.
+
+The context describes the position of the input audio. The workspace runs
+effects one block behind their source so all plugins still render in
+parallel; don't assume output is sample-aligned with a live transport.
+
+On the CLI an effect reads WAV from stdin and stops when it ends (or after
+`bars`). Give it the same bpm as its source, which is assumed to start at
+bar 1:
+
+```text
+acid 145 | duck 145 | play -q --ignore-length -t wav -
+acid | duck --demo
+```
 
 ## Open questions
 

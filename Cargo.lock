@@ -210,6 +210,14 @@ name = "dsp"
 version = "0.1.0"
 
 [[package]]
+name = "duck"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "gen-api",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

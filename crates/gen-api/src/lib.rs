@@ -18,6 +18,16 @@
 //!   channels, and keeps samples within [-1, 1].
 //! - Tempo and tonality may change between blocks; follow them from the next
 //!   musically sensible point on.
+//! - Parameter values (`ctx.params`) change in steps once per block; smooth
+//!   continuous ones yourself.
+//!
+//! # Effects
+//!
+//! An effect is a generator that declares [`Generator::inputs`] > 0 and reads
+//! `ctx.input`. The host adapts channel counts, so the input always has
+//! exactly that many channels. The context describes the position of the
+//! input audio; a host may run effects a block behind their source, so don't
+//! assume output is sample-aligned with a live transport.
 //!
 //! # Making a generator
 //!
@@ -218,12 +228,124 @@ impl Tonality {
 
 /// Everything the host tells the generator for one block.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Context {
+pub struct Context<'a> {
     pub sample_rate: f64,
     pub transport: Transport,
     pub tonality: Tonality,
+    /// Current value of every parameter, in [`Generator::params`] order,
+    /// already clamped to its range. Changes in steps once per block;
+    /// smooth continuous parameters yourself.
+    pub params: &'a [f64],
+    /// Effects only: the input audio for this block, interleaved with
+    /// [`Generator::inputs`] channels, the same frame count as `out`.
+    /// Empty for generators.
+    pub input: &'a [f32],
 }
 
+impl Context<'_> {
+    /// Value of parameter `index` (its position in [`Generator::params`]).
+    pub fn param(&self, index: usize) -> f64 {
+        self.params[index]
+    }
+}
+
+/// How a parameter's value is interpreted. Values are always f64 in plain
+/// units; integer-like kinds hold whole numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamKind {
+    Continuous,
+    Integer,
+    /// 0 = off, 1 = on.
+    Toggle,
+    /// An index into the labels, 0-based.
+    Choice(&'static [&'static str]),
+}
+
+/// A parameter a plugin exposes to the host, modelled on CLAP's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Param {
+    /// Stable identifier, unique within the plugin. Hosts address and store
+    /// values by it, so don't rename it.
+    pub id: &'static str,
+    pub name: &'static str,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    pub kind: ParamKind,
+    /// Hint for UIs: map knob travel logarithmically (frequencies, times).
+    pub log: bool,
+    pub unit: &'static str,
+}
+
+impl Param {
+    pub const fn continuous(id: &'static str, name: &'static str, min: f64, max: f64, default: f64) -> Param {
+        Param { id, name, min, max, default, kind: ParamKind::Continuous, log: false, unit: "" }
+    }
+
+    pub const fn integer(id: &'static str, name: &'static str, min: i64, max: i64, default: i64) -> Param {
+        Param { kind: ParamKind::Integer, ..Param::continuous(id, name, min as f64, max as f64, default as f64) }
+    }
+
+    pub const fn toggle(id: &'static str, name: &'static str, default: bool) -> Param {
+        Param { kind: ParamKind::Toggle, ..Param::continuous(id, name, 0.0, 1.0, if default { 1.0 } else { 0.0 }) }
+    }
+
+    pub const fn choice(id: &'static str, name: &'static str, labels: &'static [&'static str], default: usize) -> Param {
+        let max = if labels.is_empty() { 0.0 } else { (labels.len() - 1) as f64 };
+        Param { kind: ParamKind::Choice(labels), ..Param::continuous(id, name, 0.0, max, default as f64) }
+    }
+
+    pub const fn log(self) -> Param {
+        Param { log: true, ..self }
+    }
+
+    pub const fn unit(self, unit: &'static str) -> Param {
+        Param { unit, ..self }
+    }
+
+    /// Clamp a value into range and round it as the kind requires.
+    pub fn clamp(&self, v: f64) -> f64 {
+        let v = if v.is_finite() { v.clamp(self.min, self.max) } else { self.default };
+        match self.kind {
+            ParamKind::Continuous => v,
+            ParamKind::Integer | ParamKind::Choice(_) => v.round(),
+            ParamKind::Toggle => {
+                if v >= 0.5 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    /// Parse a value as typed on the command line: a number, `on`/`off` for
+    /// toggles, or a label for choices.
+    pub fn parse(&self, s: &str) -> Option<f64> {
+        match self.kind {
+            ParamKind::Toggle if s == "on" || s == "true" => return Some(1.0),
+            ParamKind::Toggle if s == "off" || s == "false" => return Some(0.0),
+            ParamKind::Choice(labels) => {
+                if let Some(i) = labels.iter().position(|l| l.eq_ignore_ascii_case(s)) {
+                    return Some(i as f64);
+                }
+            }
+            _ => {}
+        }
+        s.parse::<f64>().ok().map(|v| self.clamp(v))
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self.kind {
+            ParamKind::Continuous => "continuous",
+            ParamKind::Integer => "integer",
+            ParamKind::Toggle => "toggle",
+            ParamKind::Choice(_) => "choice",
+        }
+    }
+}
+
+/// A plugin: a generator, or an effect (a generator with audio inputs).
 pub trait Generator {
     fn new(config: &Config) -> Self
     where
@@ -231,8 +353,80 @@ pub trait Generator {
 
     fn info(&self) -> Info;
 
+    /// The parameters this plugin exposes; `ctx.params` follows this order.
+    fn params(&self) -> &'static [Param] {
+        &[]
+    }
+
+    /// Input channels. 0 = generator; anything else makes it an effect that
+    /// gets its input in `ctx.input`.
+    fn inputs(&self) -> u16 {
+        0
+    }
+
     /// Render one block. See the crate docs for the contract.
     fn process(&mut self, ctx: &Context, out: &mut [f32]);
+}
+
+/// Machine-readable description: what `--info --json` prints and the pipe
+/// handshake carries.
+pub fn describe_json(g: &dyn Generator) -> String {
+    let info = g.info();
+    let params: Vec<String> = g
+        .params()
+        .iter()
+        .map(|p| {
+            let labels = match p.kind {
+                ParamKind::Choice(labels) => {
+                    format!(",\"labels\":[{}]", labels.iter().map(|l| json_str(l)).collect::<Vec<_>>().join(","))
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{{\"id\":{},\"name\":{},\"min\":{},\"max\":{},\"default\":{},\"kind\":\"{}\",\"log\":{},\"unit\":{}{}}}",
+                json_str(p.id),
+                json_str(p.name),
+                json_num(p.min),
+                json_num(p.max),
+                json_num(p.default),
+                p.kind_name(),
+                p.log,
+                json_str(p.unit),
+                labels
+            )
+        })
+        .collect();
+    format!(
+        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"params\":[{}]}}",
+        json_str(info.name),
+        json_str(info.description),
+        info.channels,
+        g.inputs(),
+        params.join(",")
+    )
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_num(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".into()
+    }
 }
 
 #[cfg(test)]

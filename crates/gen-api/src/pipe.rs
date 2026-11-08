@@ -6,13 +6,23 @@
 //! little-endian.
 //!
 //! ```text
-//! host -> gen   hello     16 bytes   "WSH2" | u32 sample_rate | u32 max_frames | u32 reserved
-//! gen  -> host  hello      8 bytes   "WSG2" | u16 channels    | u16 reserved
+//! host -> gen   hello     16 bytes   "WSH3" | u32 sample_rate | u32 max_frames | u32 reserved
+//! gen  -> host  hello     16 bytes   "WSG3" | u16 channels | u16 inputs | u16 params
+//!                                    | u16 reserved | u32 json_len
+//!                         + json_len bytes: the plugin's description, the
+//!                           same JSON `--info --json` prints
 //! then, repeated:
 //! host -> gen   request   32 bytes   see Request
-//! gen  -> host  chunk      8 bytes   "WSC2" | u32 frames
+//!                         + params * f64: every parameter's value, in
+//!                           description order (a full snapshot each time)
+//!                         + frames * inputs * f32, interleaved (effects only)
+//! gen  -> host  chunk      8 bytes   "WSC3" | u32 frames
 //!                          + frames * channels * f32, interleaved
 //! ```
+//!
+//! Plugins without inputs or params send requests that are just the 32-byte
+//! header. The host sends parameter defaults until something is set, and
+//! adapts input channels, so an effect always gets exactly `inputs`.
 //!
 //! The chunk header lets the host notice when stray bytes (a debug print on
 //! stdout) have corrupted the stream; it then restarts the generator.
@@ -24,17 +34,19 @@
 //! the previous request); when they aren't, the host seeked or skipped.
 //!
 //! A generator in another language only has to implement this file: read 16,
-//! write 8, then loop reading 32 and writing `8 + frames * channels * 4`
-//! bytes, and log only to stderr.
+//! write 16 + its JSON, then loop reading `32 + params * 8 + frames * inputs
+//! * 4` and writing `8 + frames * channels * 4` bytes, and log only to stderr.
 
-use crate::{Config, Context, Generator, Scale, Tonality, Transport};
+use crate::{describe_json, Config, Context, Generator, Scale, Tonality, Transport};
 use std::io::{self, BufWriter, Read, Write};
 
-pub const HOST_MAGIC: [u8; 4] = *b"WSH2";
-pub const GEN_MAGIC: [u8; 4] = *b"WSG2";
-pub const CHUNK_MAGIC: [u8; 4] = *b"WSC2";
+pub const HOST_MAGIC: [u8; 4] = *b"WSH3";
+pub const GEN_MAGIC: [u8; 4] = *b"WSG3";
+pub const CHUNK_MAGIC: [u8; 4] = *b"WSC3";
 pub const HELLO_LEN: usize = 16;
-pub const GEN_HELLO_LEN: usize = 8;
+pub const GEN_HELLO_LEN: usize = 16;
+/// Upper bound on the description in the generator hello.
+pub const MAX_JSON_LEN: u32 = 1 << 20;
 pub const REQUEST_LEN: usize = 32;
 pub const CHUNK_HEADER_LEN: usize = 8;
 
@@ -82,6 +94,12 @@ impl Hello {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenHello {
     pub channels: u16,
+    /// Input channels; 0 for generators, more for effects.
+    pub inputs: u16,
+    /// Number of f64 values in every request's parameter snapshot.
+    pub params: u16,
+    /// Length of the JSON description that follows the hello.
+    pub json_len: u32,
 }
 
 impl GenHello {
@@ -89,6 +107,9 @@ impl GenHello {
         let mut b = [0u8; GEN_HELLO_LEN];
         b[0..4].copy_from_slice(&GEN_MAGIC);
         b[4..6].copy_from_slice(&self.channels.to_le_bytes());
+        b[6..8].copy_from_slice(&self.inputs.to_le_bytes());
+        b[8..10].copy_from_slice(&self.params.to_le_bytes());
+        b[12..16].copy_from_slice(&self.json_len.to_le_bytes());
         b
     }
 
@@ -96,12 +117,48 @@ impl GenHello {
         if b[0..4] != GEN_MAGIC {
             return Err(bad("not a pipe generator, or a different protocol version (bad hello magic)"));
         }
-        let channels = u16::from_le_bytes([b[4], b[5]]);
-        if channels == 0 || channels > 8 {
+        let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let h = GenHello { channels: u16_at(4), inputs: u16_at(6), params: u16_at(8), json_len: u32_at(b, 12) };
+        if h.channels == 0 || h.channels > 8 {
             return Err(bad("generator reported an unsupported channel count"));
         }
-        Ok(GenHello { channels })
+        if h.inputs > 8 {
+            return Err(bad("generator reported an unsupported input channel count"));
+        }
+        if h.json_len > MAX_JSON_LEN {
+            return Err(bad("generator description too long"));
+        }
+        Ok(h)
     }
+}
+
+/// Host side: read the generator hello and the JSON description after it.
+pub fn read_gen_hello(r: &mut impl Read) -> io::Result<(GenHello, String)> {
+    let mut b = [0u8; GEN_HELLO_LEN];
+    if !read_message(r, &mut b)? {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let h = GenHello::decode(&b)?;
+    let mut json = vec![0u8; h.json_len as usize];
+    if !json.is_empty() && !read_message(r, &mut json)? {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let json = String::from_utf8(json).map_err(|_| bad("generator description is not UTF-8"))?;
+    Ok((h, json))
+}
+
+/// Host side: write one request with its parameter snapshot and, for
+/// effects, its input audio (`frames * inputs` samples, interleaved).
+pub fn write_request(w: &mut impl Write, req: &Request, params: &[f64], input: &[f32]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(REQUEST_LEN + params.len() * 8 + input.len() * 4);
+    bytes.extend_from_slice(&req.encode());
+    for p in params {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    for s in input {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    w.write_all(&bytes)
 }
 
 /// "Render the next `frames` frames, starting here."
@@ -210,22 +267,46 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
     let sample_rate = hello.sample_rate as f64;
     let mut gen = G::new(&Config { sample_rate, seed });
     let info = gen.info();
+    let params = gen.params();
     let ch = info.channels as usize;
-    eprintln!("{}  seed {seed}  {} Hz  {} ch", info.name, hello.sample_rate, ch);
+    let inputs = gen.inputs() as usize;
+    let json = describe_json(&gen);
+    eprintln!("{}  seed {seed}  {} Hz  {} ch  {} in  {} params", info.name, hello.sample_rate, ch, inputs, params.len());
 
-    stdout.write_all(&GenHello { channels: info.channels }.encode())?;
+    let gh = GenHello { channels: info.channels, inputs: inputs as u16, params: params.len() as u16, json_len: json.len() as u32 };
+    stdout.write_all(&gh.encode())?;
+    stdout.write_all(json.as_bytes())?;
     stdout.flush()?;
 
+    let max = hello.max_frames.max(1) as usize;
     let mut rb = [0u8; REQUEST_LEN];
-    let mut buf = vec![0.0f32; hello.max_frames.max(1) as usize * ch];
+    let mut pb = vec![0u8; params.len() * 8];
+    let mut values: Vec<f64> = params.iter().map(|p| p.default).collect();
+    let mut ib: Vec<u8> = Vec::new();
+    let mut input: Vec<f32> = Vec::with_capacity(max * inputs);
+    let mut buf = vec![0.0f32; max * ch];
     let mut bytes = Vec::with_capacity(buf.len() * 4);
     while read_message(&mut stdin, &mut rb)? {
         let req = Request::decode(&rb)?;
         let n = req.frames as usize;
+        if !pb.is_empty() && !read_message(&mut stdin, &mut pb)? {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        for (i, (v, p)) in values.iter_mut().zip(params).enumerate() {
+            *v = p.clamp(f64::from_le_bytes(pb[i * 8..i * 8 + 8].try_into().unwrap()));
+        }
+        input.clear();
+        if inputs > 0 {
+            ib.resize(n * inputs * 4, 0);
+            if !ib.is_empty() && !read_message(&mut stdin, &mut ib)? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            input.extend(ib.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+        }
         if buf.len() < n * ch {
             buf.resize(n * ch, 0.0);
         }
-        let ctx = Context { sample_rate, transport: req.transport, tonality: req.tonality };
+        let ctx = Context { sample_rate, transport: req.transport, tonality: req.tonality, params: &values, input: &input };
         let out = &mut buf[..n * ch];
         gen.process(&ctx, out);
         bytes.clear();
@@ -260,8 +341,12 @@ mod tests {
     fn hellos_round_trip() {
         let h = Hello { sample_rate: 44_100, max_frames: 1024 };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
-        let g = GenHello { channels: 2 };
+        let g = GenHello { channels: 2, inputs: 2, params: 3, json_len: 120 };
         assert_eq!(GenHello::decode(&g.encode()).unwrap(), g);
+        let mut wire = g.encode().to_vec();
+        wire.extend_from_slice(&[b'x'; 120]);
+        let (h, json) = read_gen_hello(&mut &wire[..]).unwrap();
+        assert_eq!((h, json.len()), (g, 120));
         assert_eq!(decode_chunk_header(&encode_chunk_header(512)).unwrap(), 512);
         assert!(decode_chunk_header(b"hello!\n\0").is_err());
     }

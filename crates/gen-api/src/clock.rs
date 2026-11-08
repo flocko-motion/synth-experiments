@@ -87,11 +87,13 @@ mod tests {
     use super::*;
     use crate::{Scale, Tonality, Transport};
 
-    fn ctx(beat: f64, playing: bool) -> Context {
+    fn ctx(beat: f64, playing: bool) -> Context<'static> {
         Context {
             sample_rate: 48_000.0,
             transport: Transport { bpm: 120.0, beat, beats_per_bar: 4, playing },
             tonality: Tonality { root: 0, scale: Scale::Minor },
+            params: &[],
+            input: &[],
         }
     }
 

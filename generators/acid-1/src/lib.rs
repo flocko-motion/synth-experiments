@@ -16,7 +16,7 @@
 //! scale changes from the host apply immediately.
 
 use dsp::{decay_coef, midi_hz, saw, square, Ladder, OnePole};
-use gen_api::{Config, Context, Generator, Info, Rng, StepClock, BARS_PER_CYCLE, CYCLES_PER_EPOCH};
+use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock, BARS_PER_CYCLE, CYCLES_PER_EPOCH};
 use std::f64::consts::PI;
 
 const BAR_STEPS: usize = 16;
@@ -25,6 +25,19 @@ const EPOCH_BARS: f64 = (BARS_PER_CYCLE * CYCLES_PER_EPOCH) as f64;
 
 /// Soft clip, then a -1 dBFS ceiling.
 const CEILING: f64 = 0.891;
+
+const CUTOFF: usize = 0;
+const RESONANCE: usize = 1;
+const DELAY_MIX: usize = 2;
+const FEEDBACK: usize = 3;
+
+/// Offsets on top of the generator's own tweak, plus the delay.
+const PARAMS: [Param; 4] = [
+    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct"),
+    Param::continuous("resonance", "Resonance offset", -0.4, 0.3, 0.0),
+    Param::continuous("delay", "Delay mix", 0.0, 1.0, 0.4),
+    Param::continuous("feedback", "Delay feedback", 0.0, 0.85, 0.42),
+];
 
 /// Scale degrees and their weights: root, octave, 2nd (the phrygian b2),
 /// 5th, 3rd, 7th below, 6th.
@@ -243,8 +256,9 @@ struct Delay {
 }
 
 impl Delay {
-    fn new(sr: f64, feedback: f64, wet: f64) -> Delay {
+    fn new(sr: f64) -> Delay {
         let n = (sr * 2.5) as usize;
+        let (feedback, wet) = (PARAMS[FEEDBACK].default, PARAMS[DELAY_MIX].default);
         Delay { l: vec![0.0; n], r: vec![0.0; n], w: 0, hp: OnePole::new(200.0, sr), lp: OnePole::new(3200.0, sr), feedback, wet }
     }
 
@@ -282,6 +296,7 @@ pub struct Acid {
     delay: Delay,
     cutoff: f64,
     cutoff_smooth: f64,
+    param_smooth: f64,
 }
 
 impl Acid {
@@ -389,7 +404,10 @@ impl Generator for Acid {
             env_oct: rng.range(1.5, 3.0),
             decay: rng.range(0.08, 0.3),
         };
-        let delay = Delay::new(sr, rng.range(0.35, 0.5), rng.range(0.35, 0.45));
+        // Delay feedback and mix used to come from the seed and are params
+        // now; the draws stay so every seed still composes the same lines.
+        let _ = (rng.f(), rng.f());
+        let delay = Delay::new(sr);
         Acid {
             sr,
             voice: Voice::new(&character, sr),
@@ -400,8 +418,13 @@ impl Generator for Acid {
             cycle: None,
             cutoff: 300.0,
             cutoff_smooth: 1.0 - (-1.0 / (0.05 * sr)).exp(),
+            param_smooth: 1.0 - (-1.0 / (0.02 * sr)).exp(),
             rng,
         }
+    }
+
+    fn params(&self) -> &'static [Param] {
+        &PARAMS
     }
 
     fn info(&self) -> Info {
@@ -433,7 +456,11 @@ impl Generator for Acid {
                 }
                 None => (0.3, 0.7),
             };
-            let target = 120.0 * (v * 4.2).exp2(); // 120 Hz … ~2.2 kHz
+            let target = 120.0 * (v * 4.2 + ctx.param(CUTOFF)).exp2(); // 120 Hz … ~2.2 kHz, plus offset
+            let res = (res + ctx.param(RESONANCE)).clamp(0.0, 1.05);
+            let ps = self.param_smooth;
+            self.delay.wet += (ctx.param(DELAY_MIX) - self.delay.wet) * ps;
+            self.delay.feedback += (ctx.param(FEEDBACK) - self.delay.feedback) * ps;
             self.cutoff += (target - self.cutoff) * self.cutoff_smooth;
 
             let dry = self.voice.tick(&self.character, self.cutoff, res, sr) * 0.38;
