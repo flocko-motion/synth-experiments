@@ -20,7 +20,7 @@
 use crate::api::{self, ApiError, Ctl, Job};
 use crate::catalog::Catalog;
 use crate::click::Click;
-use crate::gen::{adapt_channels, Slot, Spawned};
+use crate::gen::{adapt_channels, Entering, Slot, Spawned};
 use crate::log::wlog;
 use crate::ring::Ring;
 use crate::sys;
@@ -234,6 +234,13 @@ impl Mixer {
         self.sample_rate as f64 * 60.0 / self.bpm
     }
 
+    /// Starts `slot`'s entry from the next block to render. The mixer
+    /// renders ahead, so a bar gate opens at the first bar line after
+    /// roughly `ahead` ms from now.
+    pub fn start_entry(&self, slot: &mut Slot) {
+        slot.entering = slot.entry().and_then(|e| Entering::start(e, self.beat_at(self.frame), self.beats_per_bar));
+    }
+
     fn beat_at(&self, frame: u64) -> f64 {
         if !self.playing {
             return self.anchor_beat;
@@ -417,17 +424,34 @@ impl Mixer {
         let short_deadline = now + Duration::from_secs_f64(block_secs / 3.0);
 
         // 1. generators, each into its own buffer at the output's width
+        //    A generator still entering is gated or faded here, before its
+        //    inserts and sends, and so are its duck events.
         let silence = vec![0.0f32; n * ch];
         let mut chans: Vec<Vec<f32>> = Vec::with_capacity(self.gens.len());
+        let (beats_per_frame, playing, bpb) = (1.0 / self.samples_per_beat(), self.playing, self.beats_per_bar);
         for g in &mut self.gens {
             g.peak *= PEAK_FALLOFF;
-            let buf = match (g.collect(seq, st.deadline, short_deadline), g.channels()) {
+            let mut buf = match (g.collect(seq, st.deadline, short_deadline), g.channels()) {
                 (Some(mut chunk), Some(gch)) => {
                     g.sanitize(&mut chunk);
                     adapt_channels(&chunk, gch, ch)
                 }
                 _ => silence.clone(),
             };
+            if let Some(e) = &mut g.entering {
+                match e.block(beat0, beats_per_frame, playing, bpb, n) {
+                    Some(gains) => {
+                        for (frame, k) in buf.chunks_exact_mut(ch).zip(&gains) {
+                            frame.iter_mut().for_each(|x| *x *= k);
+                        }
+                        for (f, s) in &mut g.ducks {
+                            *s *= gains.get(*f as usize).copied().unwrap_or(1.0);
+                        }
+                        g.ducks.retain(|d| d.1 > 0.0);
+                    }
+                    None => g.entering = None,
+                }
+            }
             chans.push(buf);
         }
 

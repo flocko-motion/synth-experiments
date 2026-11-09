@@ -100,6 +100,102 @@ pub struct Description {
     /// How much the mixer's duck envelope turns this plugin down, 0..1.
     #[serde(default)]
     pub duck_sensitivity: f64,
+    /// How the generator wants to come into a running mix.
+    #[serde(default, deserialize_with = "lenient_entry")]
+    pub entry: Entry,
+}
+
+/// How a generator comes into the mix when it's added (`entry` in the
+/// plugin description).
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Entry {
+    /// Audible straight away.
+    #[default]
+    Now,
+    /// Silent until the next bar line.
+    Bar,
+    /// Fades in over `bars` bars of playing time.
+    Fade { bars: f64 },
+}
+
+/// Longest fade-in accepted, in bars.
+pub const MAX_FADE_BARS: f64 = 64.0;
+
+impl Entry {
+    /// A fade that isn't 0 < bars ≤ [`MAX_FADE_BARS`] is not an entry the
+    /// mixer can honour.
+    pub fn is_valid(&self) -> bool {
+        match *self {
+            Entry::Fade { bars } => bars.is_finite() && bars > 0.0 && bars <= MAX_FADE_BARS,
+            _ => true,
+        }
+    }
+}
+
+/// A plugin's `entry` that's malformed, unknown (from a newer plugin) or out
+/// of range counts as `now`, so it never stops the plugin from loading.
+pub fn lenient_entry<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Entry, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<Entry>(v).ok().filter(Entry::is_valid).unwrap_or_default())
+}
+
+/// A generator on its way into the mix, as its [`Entry`] asks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Entering {
+    /// Silent until this beat, a bar line.
+    Gate { beat: f64 },
+    /// Fading in: `at` of `len` beats of playing time done.
+    Fade { at: f64, len: f64 },
+}
+
+/// The first bar line at or after `beat`.
+fn next_bar(beat: f64, beats_per_bar: f64) -> f64 {
+    (beat / beats_per_bar - 1e-9).ceil().max(0.0) * beats_per_bar
+}
+
+impl Entering {
+    /// Starts an entry for a generator added with the block at `beat` next
+    /// to render. `Now` needs nothing.
+    pub fn start(entry: Entry, beat: f64, beats_per_bar: u32) -> Option<Entering> {
+        let bpb = beats_per_bar.max(1) as f64;
+        match entry {
+            Entry::Now => None,
+            Entry::Bar => Some(Entering::Gate { beat: next_bar(beat, bpb) }),
+            Entry::Fade { bars } => Some(Entering::Fade { at: 0.0, len: bars * bpb }),
+        }
+    }
+
+    /// The gain for each of the block's `n` frames, starting at `beat0` and
+    /// `beats_per_frame` apart; advances past the block. Returns None once
+    /// the generator is fully in (that block and every later one play at
+    /// full level).
+    ///
+    /// Both kinds only move while the transport plays. A seek back before
+    /// the gate moves the gate to the bar line after the new position, so
+    /// it never waits longer than a bar.
+    pub fn block(&mut self, beat0: f64, beats_per_frame: f64, playing: bool, beats_per_bar: u32, n: usize) -> Option<Vec<f32>> {
+        match self {
+            Entering::Gate { beat } => {
+                *beat = beat.min(next_bar(beat0, beats_per_bar.max(1) as f64));
+                if beat0 >= *beat {
+                    return None;
+                }
+                let open = if playing { ((*beat - beat0) / beats_per_frame).ceil() as usize } else { n };
+                Some((0..n).map(|i| if i < open { 0.0 } else { 1.0 }).collect())
+            }
+            Entering::Fade { at, len } => {
+                if *at >= *len {
+                    return None;
+                }
+                let step = if playing { beats_per_frame } else { 0.0 };
+                // Quadratic: slow at first, like a fader pushed up by ear.
+                let gains = (0..n).map(|i| ((*at + i as f64 * step) / *len).min(1.0).powi(2) as f32).collect();
+                *at += n as f64 * step;
+                Some(gains)
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -306,6 +402,11 @@ pub struct Slot {
     /// Effects: duck sensitivity set in the mixer, replacing the plugin's
     /// declared one.
     pub duck_override: Option<f64>,
+    /// Generators: the entry asked for when adding, replacing the plugin's
+    /// declared one.
+    pub entry_override: Option<Entry>,
+    /// Generators: still coming in after being added.
+    pub entering: Option<Entering>,
     /// Parameter values set by the user, by id; kept across restarts.
     /// Unset params use the generator's default.
     pub values: BTreeMap<String, f64>,
@@ -345,6 +446,8 @@ impl Slot {
             owner: None,
             bypass: false,
             duck_override: None,
+            entry_override: None,
+            entering: None,
             values: BTreeMap::new(),
             peak: 0.0,
             ducks: Vec::new(),
@@ -391,6 +494,19 @@ impl Slot {
         }
     }
 
+    /// How this generator comes into the mix: the one asked for when
+    /// adding, else what the running plugin declares.
+    pub fn entry(&self) -> Option<Entry> {
+        self.entry_override.or_else(|| self.declared_entry())
+    }
+
+    pub fn declared_entry(&self) -> Option<Entry> {
+        match &self.state {
+            State::Running(p) => Some(p.desc.entry),
+            _ => None,
+        }
+    }
+
     pub fn inputs(&self) -> Option<usize> {
         match &self.state {
             State::Running(p) => Some(p.inputs),
@@ -415,6 +531,7 @@ impl Slot {
             State::Running(_) if self.nan_blocks > 0 => "nan".into(),
             State::Running(_) if self.muted => "muted".into(),
             State::Running(_) if !self.on_time => "late".into(),
+            State::Running(_) if self.entering.is_some() => "entering".into(),
             State::Running(_) => "ok".into(),
             State::Starting => "starting".into(),
             State::Backoff(at) => format!("retry {:.1}s", at.saturating_duration_since(Instant::now()).as_secs_f64()),
@@ -732,12 +849,59 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::adapt_channels;
+    use super::{adapt_channels, Description, Entering, Entry};
 
     #[test]
     fn adapts_channel_counts() {
         assert_eq!(adapt_channels(&[1.0, 2.0], 1, 2), vec![1.0, 1.0, 2.0, 2.0]);
         assert_eq!(adapt_channels(&[1.0, 3.0, 2.0, 4.0], 2, 1), vec![2.0, 3.0]);
         assert_eq!(adapt_channels(&[1.0, 2.0], 2, 2), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn parses_entry_leniently() {
+        let d = |e: &str| serde_json::from_str::<Description>(&format!(r#"{{"name":"x"{e}}}"#)).unwrap().entry;
+        assert_eq!(d(""), Entry::Now);
+        assert_eq!(d(r#","entry":{"mode":"bar"}"#), Entry::Bar);
+        assert_eq!(d(r#","entry":{"mode":"fade","bars":4}"#), Entry::Fade { bars: 4.0 });
+        assert_eq!(d(r#","entry":{"mode":"fade","bars":0}"#), Entry::Now);
+        assert_eq!(d(r#","entry":{"mode":"swoosh"}"#), Entry::Now);
+        assert_eq!(d(r#","entry":"bar""#), Entry::Now);
+    }
+
+    #[test]
+    fn bar_gate_opens_on_the_next_bar_line() {
+        // added at beat 5.5 in 4/4: opens at beat 8, 4 frames per beat
+        let mut e = Entering::start(Entry::Bar, 5.5, 4).unwrap();
+        assert_eq!(e, Entering::Gate { beat: 8.0 });
+        assert_eq!(e.block(5.5, 0.25, true, 4, 4), Some(vec![0.0; 4]));
+        let g = e.block(7.5, 0.25, true, 4, 4).unwrap();
+        assert_eq!(g, vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(e.block(8.5, 0.25, true, 4, 4), None);
+        // on a bar line already: straight in
+        assert_eq!(Entering::start(Entry::Bar, 0.0, 4).unwrap().block(0.0, 0.25, false, 4, 4), None);
+        // stopped mid-bar: stays shut
+        let mut e = Entering::start(Entry::Bar, 1.0, 4).unwrap();
+        assert_eq!(e.block(1.0, 0.25, false, 4, 4), Some(vec![0.0; 4]));
+    }
+
+    #[test]
+    fn bar_gate_follows_a_seek_back() {
+        let mut e = Entering::start(Entry::Bar, 61.0, 4).unwrap();
+        e.block(1.0, 0.25, true, 4, 4);
+        assert_eq!(e, Entering::Gate { beat: 4.0 });
+    }
+
+    #[test]
+    fn fade_rises_over_playing_time() {
+        // 1 bar = 4 beats = 16 frames at 4 frames per beat
+        let mut e = Entering::start(Entry::Fade { bars: 1.0 }, 3.0, 4).unwrap();
+        assert_eq!(e.block(3.0, 0.25, false, 4, 4), Some(vec![0.0; 4]));
+        let first = e.block(3.0, 0.25, true, 4, 8).unwrap();
+        assert_eq!(first[0], 0.0);
+        assert!(first.windows(2).all(|w| w[1] > w[0]));
+        let second = e.block(5.0, 0.25, true, 4, 8).unwrap();
+        assert!(second[0] > first[7] && second[7] < 1.0);
+        assert_eq!(e.block(7.0, 0.25, true, 4, 8), None);
     }
 }

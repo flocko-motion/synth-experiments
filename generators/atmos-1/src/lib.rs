@@ -18,7 +18,7 @@
 //! transport stops the pad releases slowly; it never cuts off.
 
 use dsp::{decay_coef, midi_hz, saw, OnePole, Reverb, Svf};
-use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock, Tonality, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
+use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock, Tonality, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
 use std::f64::consts::PI;
 
 const EPOCH_BARS: f64 = (BARS_PER_CYCLE * CYCLES_PER_EPOCH) as f64;
@@ -304,6 +304,11 @@ impl Generator for Atmos {
     /// A pad: the classic pumping layer, ducked almost fully.
     fn duck_sensitivity(&self) -> f64 {
         0.9
+    }
+
+    /// A pad swells in rather than appearing.
+    fn entry(&self) -> Entry {
+        Entry::Fade { bars: 4.0 }
     }
 
     fn info(&self) -> Info {

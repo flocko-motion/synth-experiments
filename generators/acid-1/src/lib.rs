@@ -16,7 +16,7 @@
 //! scale changes from the host apply immediately.
 
 use dsp::{decay_coef, midi_hz, saw, square, Ladder, OnePole};
-use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock, BARS_PER_CYCLE, CYCLES_PER_EPOCH};
+use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock, BARS_PER_CYCLE, CYCLES_PER_EPOCH};
 use std::f64::consts::PI;
 
 const BAR_STEPS: usize = 16;
@@ -435,6 +435,11 @@ impl Generator for Acid {
 
     fn duck_sensitivity(&self) -> f64 {
         0.6
+    }
+
+    /// The line starts on the downbeat.
+    fn entry(&self) -> Entry {
+        Entry::Bar
     }
 
     fn info(&self) -> Info {

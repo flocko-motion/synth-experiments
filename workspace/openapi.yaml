@@ -47,6 +47,14 @@ info:
     (`patchEffect`), starting at the plugin's declared value. All duck
     readings in the API are as heard, not `ahead_ms` early.
 
+    **Entry.** A generator declares how it wants to come into a mix that's
+    already playing (`entry`): `now`, `bar` (silent until the next bar
+    line, for drums and bass) or `fade` over `bars` bars of playing time
+    (quadratic, for pads). The mixer applies it after adding, before inserts
+    and sends; its duck events are gated and faded with it. Neither moves
+    while the transport is stopped. `addGenerator` can replace the declared
+    entry, e.g. `{"mode": "now"}`. State is `entering` until it's fully in.
+
     **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
     that long after the response.
 
@@ -566,13 +574,14 @@ components:
         - `late`: running but missing deadlines (its blocks play as silence)
         - `nan`: producing NaN/inf (silenced; restarted if it persists)
         - `muted`: running, muted
+        - `entering`: just added, waiting for the bar line or fading in (see `entry`)
         - `starting`: a restart is in progress
         - `retry 1.2s`: waiting to restart after a failure (pattern `retry <seconds>s`)
-      examples: [ok, late, nan, muted, starting, "retry 1.2s"]
+      examples: [ok, late, nan, muted, entering, starting, "retry 1.2s"]
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, duck_source, duck_level, inserts, sends]
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -609,6 +618,11 @@ components:
         duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
         duck_source: { type: number, minimum: 0, maximum: 1, description: "How much this generator is ducking the others right now (its own duck events' envelope, as heard)." }
         duck_level: { type: number, minimum: 0, maximum: 1, description: "How much the other generators are ducking it right now, before its sensitivity. The gain reduction is duck_sensitivity × duck_level." }
+        entry:
+          description: How it comes into the mix when added, as asked in addGenerator or else as declared; null while not running.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Entry"
         inserts:
           type: array
           items: { $ref: "#/components/schemas/GeneratorName" }
@@ -652,6 +666,9 @@ components:
         seed: { type: integer, minimum: 0, description: "Appended as `--seed N`." }
         gain_db: { $ref: "#/components/schemas/Decibels" }
         muted: { type: boolean }
+        entry:
+          $ref: "#/components/schemas/Entry"
+          description: Replaces the generator's declared entry for this add.
       oneOf:
         - required: [generator]
         - required: [command]
@@ -670,6 +687,21 @@ components:
             oneOf:
               - type: "null"
               - { type: number, minimum: 0, maximum: 1 }
+
+    Entry:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      description: How a generator comes into a mix that's playing.
+      properties:
+        mode:
+          type: string
+          enum: [now, bar, fade]
+          description: "now: straight away. bar: silent until the next bar line. fade: fades in over `bars`."
+        bars: { type: number, exclusiveMinimum: 0, maximum: 64, description: "fade only: length in bars of playing time." }
+      examples:
+        - { mode: bar }
+        - { mode: fade, bars: 4 }
 
     DuckSensitivity:
       type: [number, "null"]
@@ -761,7 +793,7 @@ components:
 
     CatalogEntry:
       type: object
-      required: [name, kind, description, channels, inputs, params, duck_sensitivity, path]
+      required: [name, kind, description, channels, inputs, params, duck_sensitivity, entry, path]
       properties:
         name: { type: string, description: "Pass as `generator` to addGenerator, or as `effect` to addSendEffect/addInsert." }
         kind: { type: string, enum: [generator, effect] }
@@ -769,6 +801,7 @@ components:
         channels: { type: integer }
         inputs: { type: integer, description: Non-zero for effects. }
         duck_sensitivity: { type: number, minimum: 0, maximum: 1 }
+        entry: { $ref: "#/components/schemas/Entry" }
         params:
           type: array
           description: Parameter descriptions (defaults, no current values).

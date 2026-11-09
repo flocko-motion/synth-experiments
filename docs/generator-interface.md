@@ -292,6 +292,36 @@ The mixer gets every chunk of a block before mixing, so a duck can apply in
 the same block, sample-accurate. Adjustable sensitivity per channel is
 captured in [ideas.md](ideas.md).
 
+## Entry
+
+A generator added to a mix that's already playing shouldn't just appear
+mid-bar. Every generator declares how it wants to come in with
+`Generator::entry` (also in the description JSON as `entry`); the host
+applies it, and the generator plays as usual from the moment it's started.
+
+| `Entry` | JSON | Host behaviour |
+|---|---|---|
+| `Now` (default) | `{"mode":"now"}` | Audible straight away. |
+| `Bar` | `{"mode":"bar"}` | Silent until the next bar line, then full level. |
+| `Fade { bars }` | `{"mode":"fade","bars":4}` | Fades in over `bars` bars of playing time. |
+
+| Plugin | Entry |
+|---|---|
+| psybass | bar |
+| percussion | bar |
+| acid | bar |
+| atmos | fade, 4 bars |
+
+The generator is already running while it's gated, so its patterns are in
+place at the bar line: it follows the host position, not the moment it was
+added. Its duck events are gated and faded along with its audio.
+
+Hosts treat a missing, unknown or malformed `entry` (or a fade outside
+0 < bars ≤ 64) as `now`, so the field needed no new protocol version.
+Effects don't declare one. In the workspace, `POST /api/generators` can
+replace the declared entry, and a restarted generator comes back straight
+away.
+
 ## Effects
 
 An effect is a plugin with `Generator::inputs` > 0. It reads its input from

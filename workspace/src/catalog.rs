@@ -3,7 +3,7 @@
 //! way `gen-api`'s CLI does. A freshly built generator shows up without restarting the
 //! daemon. Answers are cached per binary until it's rebuilt.
 
-use crate::gen::ParamDesc;
+use crate::gen::{lenient_entry, Entry as EntryMode, ParamDesc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +26,7 @@ pub struct Entry {
     pub inputs: u16,
     pub params: Vec<ParamDesc>,
     pub duck_sensitivity: f64,
+    pub entry: EntryMode,
     pub path: String,
 }
 
@@ -39,6 +40,8 @@ struct Info {
     params: Vec<ParamDesc>,
     #[serde(default)]
     duck_sensitivity: f64,
+    #[serde(default, deserialize_with = "lenient_entry")]
+    entry: EntryMode,
 }
 
 pub struct Catalog {
@@ -125,6 +128,7 @@ fn ask_info(path: &Path, file: &str) -> Option<Entry> {
         inputs: info.inputs,
         params: info.params,
         duck_sensitivity: info.duck_sensitivity,
+        entry: info.entry,
         path: path.to_string_lossy().into_owned(),
     })
 }

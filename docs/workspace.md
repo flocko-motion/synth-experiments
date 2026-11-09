@@ -106,7 +106,7 @@ for example after rebuilding it.
 The first start in `ws add` is the exception: if the command doesn't
 exist or fails the handshake, `add` reports the error and adds nothing.
 
-`ws status` shows a generator's state (`ok`, `late`, `nan`, `muted`,
+`ws status` shows a generator's state (`ok`, `late`, `nan`, `muted`, `entering`,
 `starting`, `retry 1.2s`), its `LATE` and `RESTARTS` counts and its last
 error. Its stderr, including panic messages, goes to the daemon's log,
 prefixed with `[name]`. Ctrl-C, SIGTERM or a closed terminal shut the

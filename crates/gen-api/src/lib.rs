@@ -362,6 +362,18 @@ pub enum EventKind {
     Duck { strength: f32 },
 }
 
+/// How a generator wants to come in when it's added to a mix that's already
+/// playing. The host applies it; the generator just plays as usual.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Entry {
+    /// Audible straight away.
+    Now,
+    /// Silent until the next bar line, then in at full level: drums, bass.
+    Bar,
+    /// Fades in over `bars` bars of playing time: pads, atmospheres.
+    Fade { bars: f64 },
+}
+
 /// A plugin: a generator, or an effect (a generator with audio inputs).
 pub trait Generator {
     fn new(config: &Config) -> Self
@@ -386,6 +398,12 @@ pub trait Generator {
     /// plugin.
     fn duck_sensitivity(&self) -> f64 {
         0.0
+    }
+
+    /// How the host brings this generator into a running mix. Effects
+    /// don't need one.
+    fn entry(&self) -> Entry {
+        Entry::Now
     }
 
     /// Render one block. See the crate docs for the contract.
@@ -425,12 +443,18 @@ pub fn describe_json(g: &dyn Generator) -> String {
         })
         .collect();
     format!(
-        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"duck_sensitivity\":{},\"params\":[{}]}}",
+        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"duck_sensitivity\":{},\"entry\":{},\"params\":[{}]}}",
         json_str(info.name),
         json_str(info.description),
         info.channels,
         g.inputs(),
         json_num(g.duck_sensitivity().clamp(0.0, 1.0)),
+        match g.entry() {
+            Entry::Now => "{\"mode\":\"now\"}".to_owned(),
+            Entry::Bar => "{\"mode\":\"bar\"}".to_owned(),
+            Entry::Fade { bars } if bars.is_finite() && bars > 0.0 => format!("{{\"mode\":\"fade\",\"bars\":{}}}", json_num(bars)),
+            Entry::Fade { .. } => "{\"mode\":\"now\"}".to_owned(),
+        },
         params.join(",")
     )
 }

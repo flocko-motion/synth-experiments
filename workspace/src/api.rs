@@ -6,7 +6,7 @@
 
 use crate::catalog::Catalog;
 use crate::daemon::{Mixer, BLOCK};
-use crate::gen::{ParamDesc, Proc, Slot, Spec};
+use crate::gen::{Entry, ParamDesc, Proc, Slot, Spec, MAX_FADE_BARS};
 use gen_api::{Scale, Tonality};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -124,6 +124,9 @@ pub struct Generator {
     /// How much the others are ducking it right now, 0..1, before its
     /// sensitivity; the gain reduction is `duck_sensitivity × duck_level`.
     pub duck_level: f32,
+    /// How it comes into the mix when added: asked for when adding, else as
+    /// the generator declares it; null while not running.
+    pub entry: Option<Entry>,
     /// Insert effects, by name, in signal order.
     pub inserts: Vec<String>,
     /// Post-fader send amounts (linear 0..1) to send effects, by name.
@@ -226,6 +229,7 @@ impl Generator {
             duck_sensitivity: g.duck_sensitivity(),
             duck_source: g.duck.source,
             duck_level: g.duck.level,
+            entry: g.entry(),
             inserts: g.inserts.clone(),
             sends: g.sends.clone(),
         }
@@ -268,6 +272,8 @@ pub struct NewGenerator {
     pub seed: Option<u64>,
     pub gain_db: Option<f64>,
     pub muted: Option<bool>,
+    /// Replaces the generator's declared entry, e.g. `{"mode": "now"}`.
+    pub entry: Option<Entry>,
 }
 
 #[derive(Deserialize, Default)]
@@ -505,6 +511,10 @@ impl Ctl {
     /// later crashes are restarted.
     pub fn add(&self, g: NewGenerator, cwd: &Path) -> Result<Generator> {
         let gain_db = g.gain_db.map(check_db).transpose()?;
+        let entry = match g.entry {
+            Some(e) if !e.is_valid() => return Err(bad(format!("a fade is 0 < bars <= {MAX_FADE_BARS}"))),
+            e => e,
+        };
         let (mut slot, explicit) = self.spawn_slot(g.name, g.generator, g.command, g.seed, cwd, "generator")?;
         if slot.inputs() != Some(0) {
             return Err(ApiError::Unprocessable(format!(
@@ -514,6 +524,7 @@ impl Ctl {
         }
         slot.gain_db = gain_db.unwrap_or(0.0);
         slot.muted = g.muted.unwrap_or(false);
+        slot.entry_override = entry;
         self.on_mixer(move |m| {
             if taken(m, &slot.name) {
                 if explicit {
@@ -521,6 +532,7 @@ impl Ctl {
                 }
                 slot.name = free_name(m, &slot.name);
             }
+            m.start_entry(&mut slot);
             let view = Generator::of(&slot);
             m.gens.push(slot);
             Ok(view)

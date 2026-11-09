@@ -8,7 +8,7 @@
 //! Assumes 4/4, as psytrance does.
 
 use dsp::{saw, Svf};
-use gen_api::{Config, Context, Event, EventKind, Generator, Info, Param, Rng, StepClock, Tonality};
+use gen_api::{Config, Context, Entry, Event, EventKind, Generator, Info, Param, Rng, StepClock, Tonality};
 use std::f64::consts::PI;
 
 const PHRASE_BARS: u64 = 8;
@@ -318,6 +318,11 @@ impl Generator for Psybass {
     /// The kick is what everything else ducks away from.
     fn duck_sensitivity(&self) -> f64 {
         0.0
+    }
+
+    /// Kick and bass come in on the downbeat.
+    fn entry(&self) -> Entry {
+        Entry::Bar
     }
 
     fn take_events(&mut self, out: &mut Vec<Event>) {

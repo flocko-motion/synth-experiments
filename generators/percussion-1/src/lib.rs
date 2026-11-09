@@ -7,7 +7,7 @@
 //! - the last bar of an epoch often carries a snare roll into the next one
 
 use dsp::{decay_coef, midi_hz, pan_gains, Svf};
-use gen_api::{Config, Context, Generator, Info, Param, Rng, StepClock};
+use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock};
 use std::f64::consts::PI;
 
 const SLOTS: usize = 64; // 16ths in a cycle (4 bars)
@@ -431,6 +431,11 @@ impl Generator for Percussion {
     /// Off-beat hats already sit between the kicks; duck only lightly.
     fn duck_sensitivity(&self) -> f64 {
         0.2
+    }
+
+    /// Patterns start on the downbeat.
+    fn entry(&self) -> Entry {
+        Entry::Bar
     }
 
     fn info(&self) -> Info {
