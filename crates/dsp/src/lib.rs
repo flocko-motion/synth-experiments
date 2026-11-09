@@ -28,8 +28,9 @@ impl Svf {
         f
     }
 
+    /// `fc` is clamped to 5 Hz … 0.45 × `sr`.
     pub fn set(&mut self, fc: f64, res: f64, sr: f64) {
-        let fc = fc.clamp(20.0, sr * 0.45);
+        let fc = fc.clamp(5.0, sr * 0.45);
         let g = (PI * fc / sr).tan();
         self.k = 2.0 - 2.0 * res.clamp(0.0, 0.97);
         self.a1 = 1.0 / (1.0 + g * (g + self.k));
