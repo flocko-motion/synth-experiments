@@ -348,7 +348,7 @@ paths:
     patch:
       operationId: patchEffect
       summary: Return level, mute, bypass, chain position or duck sensitivity
-      description: "`gain_db` and `muted` apply to send effects (their return); `bypass` and `position` to inserts; `duck_sensitivity` to both."
+      description: "`gain_db` and `muted` apply to send effects (their return); `bypass` to inserts; `position` and `duck_sensitivity` to both (for send effects `position` is the order among send effects)."
       requestBody:
         required: true
         content:
@@ -817,6 +817,7 @@ components:
         muted: { type: boolean }
         solo: { type: boolean }
         duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "How much the others' ducking turns this channel down; replaces the generator's declared value." }
+        position: { type: integer, minimum: 0, description: "Move to this index among generators (0 = first; past the end = last). Display order only; generators are listed in this order." }
         sends:
           type: object
           description: Send amounts to set, by send-effect name; 0 or null removes. Others are unchanged.
@@ -940,7 +941,7 @@ components:
         gain_db: { $ref: "#/components/schemas/Decibels" }
         muted: { type: boolean }
         bypass: { type: boolean, description: Inserts only. }
-        position: { type: integer, minimum: 0, description: "Inserts only: move to this index." }
+        position: { type: integer, minimum: 0, description: "Inserts: move to this index in the chain (changes the sound). Send effects: move to this index among send effects (display order only)." }
         duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "How much the kick ducks this effect; replaces the plugin's declared value." }
 
     CatalogEntry:

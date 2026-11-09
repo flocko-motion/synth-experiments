@@ -316,6 +316,9 @@ pub struct GeneratorPatch {
     pub duck_sensitivity: Option<f64>,
     /// Send amounts by send-effect name, linear 0..1; 0 or null removes.
     pub sends: Option<BTreeMap<String, Option<f64>>>,
+    /// Move to this index among generators (0 = first; past the end =
+    /// last). Display order only.
+    pub position: Option<usize>,
 }
 
 /// Exactly one of `effect` and `command`.
@@ -686,8 +689,8 @@ impl Ctl {
         self.on_mixer(move |m| {
             let f = find_fx(m, &name)?;
             let owner = f.owner.clone();
-            if owner.is_none() && (p.bypass.is_some() || p.position.is_some()) {
-                return Err(bad("bypass and position are for insert effects; mute a send effect or set its gain_db"));
+            if owner.is_none() && p.bypass.is_some() {
+                return Err(bad("bypass is for insert effects; mute a send effect or set its gain_db"));
             }
             if let Some(db) = gain_db {
                 f.gain_db = db;
@@ -702,11 +705,22 @@ impl Ctl {
                 f.duck_override = duck;
             }
             let view_name = f.name.clone();
-            if let (Some(pos), Some(o)) = (p.position, owner) {
-                let g = find(m, &o)?;
-                g.inserts.retain(|n| *n != view_name);
-                let at = pos.min(g.inserts.len());
-                g.inserts.insert(at, view_name.clone());
+            match (p.position, owner) {
+                // insert: index in its generator's chain (changes the sound)
+                (Some(pos), Some(o)) => {
+                    let g = find(m, &o)?;
+                    g.inserts.retain(|n| *n != view_name);
+                    let at = pos.min(g.inserts.len());
+                    g.inserts.insert(at, view_name.clone());
+                }
+                // send effect: index among send effects (display only)
+                (Some(pos), None) => {
+                    let i = m.fx.iter().position(|f| f.name == view_name).unwrap();
+                    let slot = m.fx.remove(i);
+                    let at = m.fx.iter().enumerate().filter(|(_, f)| f.owner.is_none()).map(|(i, _)| i).nth(pos).unwrap_or(m.fx.len());
+                    m.fx.insert(at, slot);
+                }
+                (None, _) => {}
             }
             Ok(Effect::of(find_fx(m, &view_name)?))
         })?
@@ -785,6 +799,13 @@ impl Ctl {
             }
             if let Some(muted) = p.muted {
                 g.muted = muted;
+            }
+            if let Some(pos) = p.position {
+                let i = m.gens.iter().position(|g| g.name == name).unwrap();
+                let slot = m.gens.remove(i);
+                let at = pos.min(m.gens.len());
+                m.gens.insert(at, slot);
+                return Ok(Generator::of(&m.gens[at]));
             }
             Ok(Generator::of(g))
         })?
