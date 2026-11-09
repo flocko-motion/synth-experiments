@@ -78,6 +78,8 @@ pub struct State {
     /// block), 0..1: every generator's ducking combined. Effects are ducked
     /// by this.
     pub duck: f32,
+    /// Any generator soloed.
+    pub soloing: bool,
     /// Target size of the render-ahead buffer.
     pub ahead_ms: f64,
     /// How far in the future a change lands right now: from what's playing
@@ -119,6 +121,8 @@ pub struct Generator {
     pub params: Vec<Param>,
     pub gain_db: f64,
     pub muted: bool,
+    /// While any generator is soloed, only soloed ones are heard.
+    pub solo: bool,
     pub state: String,
     pub late: u64,
     pub restarts: u64,
@@ -236,6 +240,7 @@ impl Generator {
             params: params_of(g),
             gain_db: g.gain_db,
             muted: g.muted,
+            solo: g.solo,
             state: g.state_label(),
             late: g.late,
             restarts: g.restarts,
@@ -302,6 +307,7 @@ pub struct NewGenerator {
 pub struct GeneratorPatch {
     pub gain_db: Option<f64>,
     pub muted: Option<bool>,
+    pub solo: Option<bool>,
     /// 0..1, replacing the generator's declared value.
     pub duck_sensitivity: Option<f64>,
     /// Send amounts by send-effect name, linear 0..1; 0 or null removes.
@@ -744,6 +750,9 @@ impl Ctl {
             if duck.is_some() {
                 g.duck_override = duck;
             }
+            if let Some(solo) = p.solo {
+                g.solo = solo;
+            }
             for (fx, amount) in p.sends.into_iter().flatten() {
                 match amount {
                     Some(a) if a > 0.0 => g.sends.insert(fx, a),
@@ -867,6 +876,11 @@ impl Ctl {
                 let amount = num(arg(2, "AMOUNT (0..1)")?, "a number")?;
                 self.patch_generator(gen.clone(), GeneratorPatch { sends: Some(BTreeMap::from([(fx.clone(), Some(amount))])), ..Default::default() })?;
                 Ok(format!("{gen} -> {fx} {amount}\n"))
+            }
+            "solo" | "unsolo" => {
+                let name = arg(0, "GENERATOR")?;
+                self.patch_generator(name.clone(), GeneratorPatch { solo: Some(cmd == "solo"), ..Default::default() })?;
+                Ok(format!("{name} {cmd}ed\n"))
             }
             "duck" => {
                 let name = arg(0, "NAME")?;

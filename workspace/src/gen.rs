@@ -429,6 +429,9 @@ pub struct Slot {
     pub spec: Spec,
     pub gain_db: f64,
     pub muted: bool,
+    /// Generators: soloed. While any generator is soloed, the others are
+    /// silent (direct out and sends). Independent of `muted`.
+    pub solo: bool,
     /// Blocks mixed as silence because the chunk was late or skipped.
     pub late: u64,
     pub restarts: u64,
@@ -487,6 +490,7 @@ impl Slot {
             spec,
             gain_db: 0.0,
             muted: false,
+            solo: false,
             late: 0,
             restarts: 0,
             last_error: None,

@@ -333,6 +333,7 @@ impl Mixer {
             master_db: self.master_db,
             master_peak: self.master_peak,
             duck: self.audible_duck(),
+            soloing: self.gens.iter().any(|g| g.solo),
             ahead_ms: self.ahead_frames as f64 * 1000.0 / self.sample_rate as f64,
             latency_ms: self.lead_frames() as f64 * 1000.0 / self.sample_rate as f64,
             latency_beats: self.lead_frames() as f64 / self.samples_per_beat(),
@@ -527,8 +528,12 @@ impl Mixer {
         self.mix.clear();
         self.mix.resize(n * ch, 0.0);
         let mut send_in: Vec<Option<Vec<f32>>> = self.fx.iter().map(|f| f.owner.is_none().then(|| silence.clone())).collect();
+        // Solo: while any generator is soloed, the others are silent, sends
+        // included. Send-effect returns stay audible (solo-safe), and ducking
+        // is untouched, so a soloed channel sounds as it does in the mix.
+        let soloing = self.gens.iter().any(|g| g.solo);
         for ((g, buf), level) in self.gens.iter_mut().zip(chans.iter_mut()).zip(&levels) {
-            let gain = g.gain();
+            let gain = if soloing && !g.solo { 0.0 } else { g.gain() };
             if gain == 0.0 {
                 continue;
             }

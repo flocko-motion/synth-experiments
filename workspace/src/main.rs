@@ -47,6 +47,8 @@ commands (sent to the running daemon):
   restart NAME               restart it now, e.g. after rebuilding
   gain NAME|master|click DB  set a level, e.g. ws gain bass -3
   mute NAME / unmute NAME
+  solo NAME / unsolo NAME    while any generator is soloed, only soloed ones
+                             are heard (send-effect returns stay on)
   effect [--name NAME] [--insert GENERATOR] COMMAND [ARGS..]
                              add an effect: a send effect (its own bus) or,
                              with --insert, into a generator's chain
