@@ -17,6 +17,7 @@ class WsApp extends LitElement {
     connected: { state: true },
     toasts: { state: true },
     catalog: { state: true },
+    localOrder: { state: true }, // { generator: [names], return: [names] } until the API keeps order
   };
 
   static styles = css`
@@ -54,6 +55,68 @@ class WsApp extends LitElement {
     this.connected = false;
     this.toasts = [];
     this.catalog = [];
+    try { this.localOrder = JSON.parse(localStorage.getItem('ws-strip-order') || '{}'); } catch { this.localOrder = {}; }
+  }
+
+  /** Applies a browser-kept order (if any) on top of the daemon's order. */
+  ordered(list, kind) {
+    const order = this.localOrder?.[kind];
+    if (!order?.length) return list;
+    const rank = (n) => { const i = order.indexOf(n); return i < 0 ? Infinity : i; };
+    return [...list].sort((a, b) => rank(a.name) - rank(b.name));
+  }
+
+  // Drag and drop of strips: channels among channels, returns among returns.
+  stripAt(e) {
+    return e.composedPath().find((el) => el.tagName === 'WS-CHANNEL');
+  }
+
+  clearDrop() {
+    this.dropTarget?.removeAttribute('drop');
+    this.dropTarget = null;
+  }
+
+  dragOver(e) {
+    const d = this.drag;
+    const strip = this.stripAt(e);
+    if (!d || !strip || strip.kind !== d.kind || strip.gen?.name === d.name) return this.clearDrop();
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const r = strip.getBoundingClientRect();
+    const side = e.clientX < r.left + r.width / 2 ? 'before' : 'after';
+    if (this.dropTarget !== strip) this.clearDrop();
+    this.dropTarget = strip;
+    strip.setAttribute('drop', side);
+  }
+
+  async drop(e) {
+    const d = this.drag;
+    const strip = this.dropTarget;
+    const side = strip?.getAttribute('drop');
+    this.clearDrop();
+    if (!d || !strip) return;
+    e.preventDefault();
+    const list = d.kind === 'return' ? this.returnsNow : this.gensNow;
+    const names = list.map((g) => g.name).filter((n) => n !== d.name);
+    let i = names.indexOf(strip.gen.name) + (side === 'after' ? 1 : 0);
+    names.splice(i, 0, d.name);
+    // Show it right away; the daemon's order replaces this once it keeps order.
+    this.setLocalOrder(d.kind, names);
+    try {
+      if (d.kind === 'return') await api.patchEffect(d.name, { position: i });
+      else await api.patch(d.name, { position: i });
+      this.setLocalOrder(d.kind, null); // the daemon has it
+    } catch (err) {
+      if (err.status !== 400) this.toast(`${d.name}: ${err.message}`);
+      // 400: the daemon doesn't keep order yet; keep it in this browser.
+    }
+  }
+
+  setLocalOrder(kind, names) {
+    const next = { ...this.localOrder };
+    if (names) next[kind] = names; else delete next[kind];
+    this.localOrder = next;
+    try { localStorage.setItem('ws-strip-order', JSON.stringify(next)); } catch {}
   }
 
   connectedCallback() {
@@ -64,6 +127,7 @@ class WsApp extends LitElement {
     });
     // Components report failed requests by bubbling `ws-error`.
     this.addEventListener('ws-error', (e) => this.toast(e.detail));
+    this.addEventListener('strip-drag', (e) => { this.drag = e.detail; if (!e.detail) this.clearDrop(); });
   }
 
   disconnectedCallback() {
@@ -105,10 +169,12 @@ class WsApp extends LitElement {
 
   render() {
     const s = this.state;
-    const gens = s?.generators ?? [];
+    const gens = this.ordered(s?.generators ?? [], 'generator');
+    this.gensNow = gens;
     const effects = s?.effects ?? [];
     const byName = new Map(effects.map((fx) => [fx.name, fx]));
-    const returns = effects.filter((fx) => fx.role === 'send');
+    const returns = this.ordered(effects.filter((fx) => fx.role === 'send'), 'return');
+    this.returnsNow = returns;
 
     const sendTo = returns;
     const fxCatalog = this.catalog.filter((c) => c.kind === 'effect');
@@ -118,7 +184,7 @@ class WsApp extends LitElement {
       <div class="body">
         <ws-catalog @add=${this.add} @add-send=${this.addSend} @catalog=${(e) => (this.catalog = e.detail)}></ws-catalog>
         <div class="board">
-          <div class="strips"><div class="row">
+          <div class="strips"><div class="row" @dragover=${this.dragOver} @drop=${this.drop}>
             ${repeat(gens, (g) => g.name, (g) => html`
               <ws-channel kind="generator" .gen=${g} .sendTo=${sendTo} .inserts=${insertsOf(g)} .fxCatalog=${fxCatalog}></ws-channel>`)}
             ${returns.length

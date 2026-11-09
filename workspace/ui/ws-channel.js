@@ -82,6 +82,11 @@ class WsChannel extends LitElement {
     }
     button.b:hover { border-color: var(--dim); }
     button.mute.on { background: var(--mute); border-color: var(--mute); color: #1f1300; }
+    .name { cursor: grab; }
+    :host([dragging]) { opacity: .4; }
+    /* Where a dragged strip will land. */
+    :host([drop=before]) { box-shadow: -5px 0 0 -1px var(--accent); }
+    :host([drop=after]) { box-shadow: 5px 0 0 -1px var(--accent); }
     button.solo.on { background: var(--led-cycle); border-color: var(--led-cycle); color: #06142b; }
 
     .name {
@@ -148,6 +153,19 @@ class WsChannel extends LitElement {
     return this.run(() => this.ops.remove(this.gen.name));
   }
 
+  // Dragging the name label reorders strips; ws-app handles the drop.
+  dragStart(e) {
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', this.gen.name);
+    this.toggleAttribute('dragging', true);
+    this.dispatchEvent(new CustomEvent('strip-drag', { detail: { name: this.gen.name, kind: this.kind }, bubbles: true, composed: true }));
+  }
+
+  dragEnd() {
+    this.toggleAttribute('dragging', false);
+    this.dispatchEvent(new CustomEvent('strip-drag', { detail: null, bubbles: true, composed: true }));
+  }
+
   dot(state) {
     if (state === 'ok') return '';
     if (state === 'entering') return 'enter';
@@ -204,7 +222,8 @@ class WsChannel extends LitElement {
               @click=${() => this.patch({ cue: !g.cue })}>S</button>`
           : nothing}
       </div>
-      <div class="name" title=${(g.description ? g.description + '\n' : '') + g.command.join(' ')}>${g.name}</div>
+      <div class="name" draggable="true" @dragstart=${this.dragStart} @dragend=${this.dragEnd}
+        title=${(g.description ? g.description + '\n' : '') + g.command.join(' ') + '\ndrag to reorder'}>${g.name}</div>
     `;
   }
 }
