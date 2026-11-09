@@ -244,6 +244,16 @@ paths:
         actually used. Values are kept across restarts. While the generator
         is restarting, ids can't be checked and are stored as given.
         Changes apply from the next block; generators smooth them.
+
+        With `glide_bars`, each value slides from where it is now to the
+        new one over that many bars of the mixer's clock (tempo-synced;
+        paused while the transport is stopped). Continuous params move
+        linearly, `log` params evenly in ratio; integer, toggle and choice
+        params switch at the end. `value` in the response and in the state
+        follows the slide, so knobs can animate. A change without
+        `glide_bars` jumps and stops any slide on that param.
+      parameters:
+        - $ref: "#/components/parameters/GlideBars"
       requestBody:
         required: true
         content:
@@ -367,7 +377,9 @@ paths:
     patch:
       operationId: setEffectParams
       summary: Set an effect's parameters
-      description: Same rules as setParams.
+      description: Same rules as setParams, including `glide_bars`.
+      parameters:
+        - $ref: "#/components/parameters/GlideBars"
       requestBody:
         required: true
         content:
@@ -452,6 +464,12 @@ paths:
 
 components:
   parameters:
+    GlideBars:
+      name: glide_bars
+      in: query
+      required: false
+      description: Slide to the new values over this many bars instead of jumping.
+      schema: { type: number, exclusiveMinimum: 0, maximum: 64, examples: [1] }
     Name:
       name: name
       in: path
@@ -667,7 +685,7 @@ components:
           type: array
           items: { type: string }
           description: Only for `choice`.
-        value: { type: number, description: The value in use (clamped). }
+        value: { type: number, description: "The value in use now (clamped); mid-slide, where the slide currently is." }
 
     NewGenerator:
       type: object

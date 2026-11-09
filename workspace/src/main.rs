@@ -56,7 +56,9 @@ commands (sent to the running daemon):
                              down, 0..1 (send effects: the whole return;
                              inserts: only what they add)
   params NAME                list a generator's or effect's parameters
-  set NAME PARAM VALUE       set one, e.g. ws set acid cutoff 0.5
+  set NAME PARAM VALUE [--glide BARS]
+                             set one, e.g. ws set acid cutoff 0.5; with
+                             --glide it slides there over that many bars
   bpm N                      change tempo
   ahead MS                   render-ahead buffer: how far in the future
                              changes land (smaller = sooner, less margin)

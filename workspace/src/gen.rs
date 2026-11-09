@@ -258,6 +258,36 @@ pub struct DuckMeter {
     pub level: f32,
 }
 
+/// A parameter sliding from one value to another over some bars of the
+/// mixer's clock.
+#[derive(Clone, Debug)]
+pub struct Glide {
+    pub from: f64,
+    pub to: f64,
+    pub bars: f64,
+    /// Beat where it started; set by the first block that sends it.
+    pub start: Option<f64>,
+}
+
+impl Glide {
+    /// The value at `beat`, and whether the slide is over. Continuous params
+    /// move linearly (log params evenly in ratio, like pitch); integer,
+    /// toggle and choice params switch at the end.
+    fn at(&mut self, d: &ParamDesc, beat: f64, beats_per_bar: f64) -> (f64, bool) {
+        let start = *self.start.get_or_insert(beat);
+        let t = ((beat - start) / (self.bars * beats_per_bar).max(1e-9)).clamp(0.0, 1.0);
+        let done = t >= 1.0;
+        let v = if d.kind != "continuous" {
+            if done { self.to } else { self.from }
+        } else if d.log && self.from > 0.0 && self.to > 0.0 {
+            (self.from.ln() + (self.to.ln() - self.from.ln()) * t).exp()
+        } else {
+            self.from + (self.to - self.from) * t
+        };
+        (d.clamp(v), done)
+    }
+}
+
 /// The handshake's result.
 struct Ready {
     channels: usize,
@@ -425,6 +455,10 @@ pub struct Slot {
     /// Parameter values set by the user, by id; kept across restarts.
     /// Unset params use the generator's default.
     pub values: BTreeMap<String, f64>,
+    /// Params sliding towards their entry in `values`, by id.
+    pub glides: BTreeMap<String, Glide>,
+    /// Where each sliding param is now (last value sent).
+    glide_now: BTreeMap<String, f64>,
     /// Output level after gain, falling back slowly; for meters.
     pub peak: f32,
     /// Duck events from the chunk `collect` returned last.
@@ -464,6 +498,8 @@ impl Slot {
             entry_override: None,
             entering: None,
             values: BTreeMap::new(),
+            glides: BTreeMap::new(),
+            glide_now: BTreeMap::new(),
             peak: 0.0,
             ducks: Vec::new(),
             duck: DuckMeter::default(),
@@ -536,9 +572,34 @@ impl Slot {
         }
     }
 
-    /// The value sent for a param: the user's, clamped, or the default.
+    /// The value a param has now: mid-slide, the slide's current value;
+    /// else the user's, clamped, or the default.
     pub fn value_of(&self, d: &ParamDesc) -> f64 {
-        self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v))
+        self.glide_now.get(&d.id).copied().unwrap_or_else(|| self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v)))
+    }
+
+    /// Sets params by id. With `glide_bars`, each slides from where it is
+    /// now to the new value over that many bars; without, it jumps (and any
+    /// slide on it stops).
+    pub fn set_values(&mut self, values: BTreeMap<String, f64>, glide_bars: Option<f64>) {
+        for (id, to) in values {
+            match glide_bars {
+                Some(bars) => {
+                    let from = match self.params().and_then(|ps| ps.iter().find(|d| d.id == id)) {
+                        Some(d) => self.value_of(d),
+                        None => self.values.get(&id).copied().unwrap_or(to),
+                    };
+                    self.glides.insert(id.clone(), Glide { from, to, bars, start: None });
+                    // Until the next block renders, it's still where it was.
+                    self.glide_now.insert(id.clone(), from);
+                }
+                None => {
+                    self.glides.remove(&id);
+                    self.glide_now.remove(&id);
+                }
+            }
+            self.values.insert(id, to);
+        }
     }
 
     pub fn channels(&self) -> Option<usize> {
@@ -579,7 +640,24 @@ impl Slot {
             self.late += 1;
             return self.check_hang();
         }
-        let params = p.desc.params.iter().map(|d| self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v))).collect();
+        let (beat, bpb) = (req.transport.beat, req.transport.beats_per_bar as f64);
+        let mut params = Vec::with_capacity(p.desc.params.len());
+        for d in &p.desc.params {
+            let v = match self.glides.get_mut(&d.id) {
+                Some(g) => {
+                    let (v, done) = g.at(d, beat, bpb);
+                    if done {
+                        self.glides.remove(&d.id);
+                        self.glide_now.remove(&d.id);
+                    } else {
+                        self.glide_now.insert(d.id.clone(), v);
+                    }
+                    v
+                }
+                None => self.values.get(&d.id).map_or(d.default, |&v| d.clamp(v)),
+            };
+            params.push(v);
+        }
         let input = if p.inputs == 0 || input.is_empty() { Vec::new() } else { adapt_channels(input, input_channels, p.inputs) };
         let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params, input }).is_ok());
         if !sent {

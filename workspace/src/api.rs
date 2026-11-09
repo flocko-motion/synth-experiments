@@ -430,7 +430,7 @@ fn taken(m: &Mixer, name: &str) -> bool {
 
 /// Checks param ids against the running proc (if it is running) and stores
 /// the values.
-fn apply_params(g: &mut Slot, values: BTreeMap<String, f64>) -> Result<()> {
+fn apply_params(g: &mut Slot, values: BTreeMap<String, f64>, glide_bars: Option<f64>) -> Result<()> {
     if let Some((id, _)) = values.iter().find(|(_, v)| !v.is_finite()) {
         return Err(bad(format!("{id}: not a number")));
     }
@@ -440,8 +440,18 @@ fn apply_params(g: &mut Slot, values: BTreeMap<String, f64>) -> Result<()> {
             return Err(ApiError::NotFound(format!("{} has no parameter {id}; it has: {}", g.name, known.join(", "))));
         }
     }
-    g.values.extend(values);
+    g.set_values(values, glide_bars);
     Ok(())
+}
+
+/// Longest slide accepted, in bars.
+pub const MAX_GLIDE_BARS: f64 = 64.0;
+
+fn check_glide(bars: Option<f64>) -> Result<Option<f64>> {
+    match bars {
+        Some(b) if !(b > 0.0 && b <= MAX_GLIDE_BARS) => Err(bad(format!("glide_bars is 0 < bars <= {MAX_GLIDE_BARS}"))),
+        b => Ok(b),
+    }
 }
 
 /// Removes effect slots and every reference to them.
@@ -630,7 +640,7 @@ impl Ctl {
             return Err(ApiError::Unprocessable(format!("{} is a generator, not an effect (it takes no input)", slot.name)));
         }
         if let Some(values) = e.params {
-            apply_params(&mut slot, values)?;
+            apply_params(&mut slot, values, None)?;
         }
         slot.gain_db = gain_db.unwrap_or(0.0);
         slot.muted = e.muted.unwrap_or(false);
@@ -686,13 +696,14 @@ impl Ctl {
         })?
     }
 
-    pub fn set_effect_params(&self, name: String, values: BTreeMap<String, f64>) -> Result<Effect> {
+    pub fn set_effect_params(&self, name: String, values: BTreeMap<String, f64>, glide_bars: Option<f64>) -> Result<Effect> {
         if values.is_empty() {
             return Err(bad("no parameters given"));
         }
+        let glide = check_glide(glide_bars)?;
         self.on_mixer(move |m| {
             let f = find_fx(m, &name)?;
-            apply_params(f, values)?;
+            apply_params(f, values, glide)?;
             Ok(Effect::of(f))
         })?
     }
@@ -752,13 +763,16 @@ impl Ctl {
     /// Sets parameters by id. Values are clamped to each param's range.
     /// While the generator is restarting the ids can't be checked; values
     /// are kept and apply once it's back.
-    pub fn set_params(&self, name: String, values: BTreeMap<String, f64>) -> Result<Generator> {
+    /// Sets parameters by id; with `glide_bars` they slide there over that
+    /// many bars instead of jumping.
+    pub fn set_params(&self, name: String, values: BTreeMap<String, f64>, glide_bars: Option<f64>) -> Result<Generator> {
         if values.is_empty() {
             return Err(bad("no parameters given"));
         }
+        let glide = check_glide(glide_bars)?;
         self.on_mixer(move |m| {
             let g = find(m, &name)?;
-            apply_params(g, values)?;
+            apply_params(g, values, glide)?;
             Ok(Generator::of(g))
         })?
     }
@@ -950,12 +964,20 @@ impl Ctl {
                     .collect())
             }
             "set" => {
+                // ws set NAME PARAM VALUE [--glide BARS]
                 let (name, id) = (arg(0, "NAME")?, arg(1, "PARAM")?);
                 let value = num(arg(2, "VALUE")?, "a number")?;
+                let glide = match (rest.get(3).map(String::as_str), rest.get(4)) {
+                    (Some("--glide"), Some(b)) => Some(num(b.clone(), "a number of bars")?),
+                    (None, _) => None,
+                    _ => return Err(bad("usage: ws set NAME PARAM VALUE [--glide BARS]")),
+                };
                 let values = BTreeMap::from([(id.clone(), value)]);
-                let params = if self.is_effect(&name)? { self.set_effect_params(name.clone(), values)?.params } else { self.set_params(name.clone(), values)?.params };
-                let actual = params.iter().find(|p| p.desc.id == id).map_or(value, |p| p.value);
-                Ok(format!("{name} {id} = {actual}\n"))
+                if self.is_effect(&name)? { self.set_effect_params(name.clone(), values, glide)?; } else { self.set_params(name.clone(), values, glide)?; }
+                Ok(match glide {
+                    Some(b) => format!("{name} {id} -> {value} over {b} bars\n"),
+                    None => format!("{name} {id} = {value}\n"),
+                })
             }
             "quit" => self.quit().map(|_| "workspace stopping\n".into()),
             other => Err(bad(format!("unknown command {other}; see ws help"))),

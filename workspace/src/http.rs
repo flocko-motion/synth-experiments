@@ -226,7 +226,10 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Ok(()) => Response::empty(204),
             Err(e) => Response::error(&e),
         },
-        ("PATCH", ["api", "generators", name, "params"]) => reply(200, ctl.set_params(name.to_string(), body!())),
+        ("PATCH", ["api", "generators", name, "params"]) => match glide_of(req) {
+            Ok(g) => reply(200, ctl.set_params(name.to_string(), body!(), g)),
+            Err(r) => r,
+        },
         ("POST", ["api", "generators", name, "inserts"]) => reply(201, ctl.add_effect(body!(), Some(name.to_string()), cwd)),
         ("GET", ["api", "effects"]) => reply(200, ctl.effects()),
         ("POST", ["api", "effects"]) => reply(201, ctl.add_effect(body!(), None, cwd)),
@@ -235,7 +238,10 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Ok(()) => Response::empty(204),
             Err(e) => Response::error(&e),
         },
-        ("PATCH", ["api", "effects", name, "params"]) => reply(200, ctl.set_effect_params(name.to_string(), body!())),
+        ("PATCH", ["api", "effects", name, "params"]) => match glide_of(req) {
+            Ok(g) => reply(200, ctl.set_effect_params(name.to_string(), body!(), g)),
+            Err(r) => r,
+        },
         ("POST", ["api", "effects", name, "restart"]) => reply(202, ctl.restart_effect(name.to_string())),
         ("POST", ["api", "generators", name, "restart"]) => reply(202, ctl.restart(name.to_string())),
         ("GET", ["api", "catalog"]) => Response::json(200, &ctl.catalog.list()),
@@ -247,6 +253,14 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Response::json(405, &serde_json::json!({ "error": format!("{m} not allowed on {}", req.path) }))
         }
         _ => Response::json(404, &serde_json::json!({ "error": format!("no such endpoint {}", req.path) })),
+    }
+}
+
+/// The optional `?glide_bars=N` on param changes.
+fn glide_of(req: &Request) -> Result<Option<f64>, Response> {
+    match req.query.get("glide_bars") {
+        None => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(|_| Response::error(&ApiError::BadRequest(format!("glide_bars={v}: not a number")))),
     }
 }
 
