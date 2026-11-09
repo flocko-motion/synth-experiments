@@ -109,7 +109,7 @@ paths:
   /api/transport:
     patch:
       operationId: patchTransport
-      summary: Change tempo, key, play/stop, click or master level
+      summary: Change tempo, key, play/stop, click, master level or the render-ahead buffer
       description: Only the fields given change. All are validated before any is applied.
       requestBody:
         required: true
@@ -544,7 +544,7 @@ components:
         master_db: { $ref: "#/components/schemas/Decibels" }
         master_peak: { $ref: "#/components/schemas/Peak" }
         duck: { type: number, minimum: 0, maximum: 1, description: "The global duck level as heard now (its peak in the playing block): every source combined. Effects are ducked by this." }
-        ahead_ms: { type: number, description: "Target size of the render-ahead buffer (--ahead)." }
+        ahead_ms: { type: number, description: "Target size of the render-ahead buffer; set it with patchTransport." }
         latency_ms: { type: number, minimum: 0, description: "How far in the future a change lands right now: from what's playing to where the mixer renders next. Varies around ahead_ms; the audio device's own few ms come on top." }
         latency_beats: { type: number, minimum: 0, description: "latency_ms in beats at the current tempo." }
         underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
@@ -568,6 +568,11 @@ components:
         click: { type: boolean }
         click_db: { $ref: "#/components/schemas/Decibels" }
         master_db: { $ref: "#/components/schemas/Decibels" }
+        ahead_ms:
+          type: number
+          minimum: 20
+          maximum: 2000
+          description: "Render-ahead buffer target: how far in the future changes land. Smaller is more responsive but leaves less margin before dropouts (watch underruns). Shrinking takes effect as the buffer drains; nothing is cut. The maximum is 2000 ms, or the daemon's --ahead if that was larger."
 
     GeneratorState:
       type: string

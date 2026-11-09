@@ -63,7 +63,8 @@ curl -s -N $A/api/events                                 # live state + log (SSE
 ## How it runs
 
 - **Mixer thread** owns all state and keeps a ring buffer `--ahead` ms full
-  (default 200). For each 512-frame block it sends a request to every
+  (default 200; change it while running with `ws ahead MS` or `ahead_ms`
+  in the API, 20-2000). For each 512-frame block it sends a request to every
   generator, then collects the chunks, so generators render in parallel.
   Then it mixes them (mono goes to every channel), adds the click, soft-clips
   (`tanh`) and pushes the block into the ring.
@@ -77,8 +78,8 @@ curl -s -N $A/api/events                                 # live state + log (SSE
   a few ms per block until it catches up.
 - **Clock**: `beat = anchor_beat + (frame - anchor_frame) / samples_per_beat`,
   re-anchored on tempo, transport and seek changes, so position never
-  drifts. Changes apply at the render head, so you hear them `--ahead` ms
-  later.
+  drifts. Changes apply at the render head, so you hear them about that
+  much later; `latency_ms` and `latency_beats` in the API measure it.
 - **Click**: off by default (`ws daemon --click` to start with it on). A beep per beat. Pitch and level rise for bar, cycle and epoch
   starts. `ws click on|off`, `ws gain click DB`.
 - **Sample rate** is the device's (44.1 kHz on the built-in output), passed

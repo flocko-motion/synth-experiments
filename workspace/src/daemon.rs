@@ -37,6 +37,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The render-ahead buffer can be set up to this while running (more if
+/// the daemon started with more).
+pub const MAX_AHEAD_MS: f64 = 2000.0;
+pub const MIN_AHEAD_MS: f64 = 20.0;
+
 /// Frames per block sent to generators.
 pub const BLOCK: usize = 512;
 
@@ -192,6 +197,8 @@ pub struct Mixer {
     played: Arc<AtomicU64>,
     underruns: Arc<AtomicU64>,
     ahead_frames: usize,
+    /// The ring's room: the largest `ahead` it can hold.
+    max_ahead_frames: usize,
 
     /// Next frame to render.
     frame: u64,
@@ -269,6 +276,18 @@ impl Mixer {
         self.anchor_frame = self.frame;
         self.anchor_beat = (bar * self.beats_per_bar as u64) as f64;
         self.click.reset();
+    }
+
+    /// Changes the render-ahead target. Shrinking stops refilling until the
+    /// device has drained to the new size (nothing is cut); growing renders
+    /// ahead right away.
+    pub fn set_ahead_ms(&mut self, ms: f64) -> Result<(), String> {
+        let max_ms = self.max_ahead_frames as f64 * 1000.0 / self.sample_rate as f64;
+        if !(MIN_AHEAD_MS..=max_ms.round()).contains(&ms) {
+            return Err(format!("ahead_ms is {MIN_AHEAD_MS:.0}-{max_ms:.0}"));
+        }
+        self.ahead_frames = ((ms / 1000.0 * self.sample_rate as f64) as usize).min(self.max_ahead_frames);
+        Ok(())
     }
 
     pub fn audible_beat(&self) -> f64 {
@@ -604,9 +623,12 @@ pub fn run(opts: Opts) -> Result<(), String> {
     let sample_rate = config.sample_rate.0;
     let channels = config.channels as usize;
     let ahead_frames = (opts.ahead_ms / 1000.0 * sample_rate as f64) as usize;
+    // Room for the largest `ahead` it may be set to while running, so a
+    // change never reallocates.
+    let max_ahead_frames = (opts.ahead_ms.max(MAX_AHEAD_MS) / 1000.0 * sample_rate as f64) as usize;
 
     // Room for the target fill plus one block, so a full block always fits.
-    let ring = Ring::new((ahead_frames + 2 * BLOCK) * channels);
+    let ring = Ring::new((max_ahead_frames + 2 * BLOCK) * channels);
     let played = Arc::new(AtomicU64::new(0));
     let underruns = Arc::new(AtomicU64::new(0));
 
@@ -666,6 +688,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
         played,
         underruns,
         ahead_frames,
+        max_ahead_frames,
         frame: 0,
         seq: 0,
         anchor_frame: 0,

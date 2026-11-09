@@ -255,6 +255,9 @@ pub struct TransportPatch {
     pub click: Option<bool>,
     pub click_db: Option<f64>,
     pub master_db: Option<f64>,
+    /// Render-ahead target: smaller means changes land sooner, with less
+    /// margin against dropouts.
+    pub ahead_ms: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -473,6 +476,11 @@ impl Ctl {
         let click_db = p.click_db.map(check_db).transpose()?;
         let master_db = p.master_db.map(check_db).transpose()?;
         self.on_mixer(move |m| {
+            // The one field checked on the mixer (its limit depends on the
+            // buffer); checked first so a bad value changes nothing.
+            if let Some(ms) = p.ahead_ms {
+                m.set_ahead_ms(ms).map_err(ApiError::BadRequest)?;
+            }
             if let Some(bpm) = bpm {
                 m.set_bpm(bpm);
             }
@@ -494,8 +502,8 @@ impl Ctl {
             if let Some(db) = master_db {
                 m.master_db = db;
             }
-            m.state()
-        })
+            Ok(m.state())
+        })?
     }
 
     pub fn seek(&self, s: Seek) -> Result<State> {
@@ -861,6 +869,11 @@ impl Ctl {
                     self.patch_generator(name.clone(), GeneratorPatch { muted: Some(muted), ..Default::default() })?;
                 }
                 Ok(format!("{name} {cmd}d\n"))
+            }
+            "ahead" => {
+                let ms = num(arg(0, "MS")?.trim_end_matches("ms").to_string(), "a number of ms")?;
+                let s = self.patch_transport(TransportPatch { ahead_ms: Some(ms), ..Default::default() })?;
+                Ok(format!("ahead {ms} ms ({:.2} beats at {} bpm)\n", ms / 1000.0 * s.bpm / 60.0, s.bpm))
             }
             "bpm" => {
                 let bpm = num(arg(0, "BPM")?, "a number")?;

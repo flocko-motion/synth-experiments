@@ -57,6 +57,8 @@ commands (sent to the running daemon):
   params NAME                list a generator's or effect's parameters
   set NAME PARAM VALUE       set one, e.g. ws set acid cutoff 0.5
   bpm N                      change tempo
+  ahead MS                   render-ahead buffer: how far in the future
+                             changes land (smaller = sooner, less margin)
   key ROOT [SCALE]           change key, e.g. ws key F# phrygian
   click on|off
   play / stop                start or stop the transport (stop lets voices ring)
