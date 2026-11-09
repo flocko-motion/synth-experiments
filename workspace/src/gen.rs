@@ -399,8 +399,8 @@ pub struct Slot {
     pub owner: Option<String>,
     /// Insert effects: pass input straight through.
     pub bypass: bool,
-    /// Effects: duck sensitivity set in the mixer, replacing the plugin's
-    /// declared one.
+    /// Duck sensitivity set in the mixer, replacing the plugin's declared
+    /// one; kept across restarts.
     pub duck_override: Option<f64>,
     /// Generators: the entry asked for when adding, replacing the plugin's
     /// declared one.

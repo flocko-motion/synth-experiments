@@ -38,13 +38,14 @@ info:
     full ducking. Each plugin declares a default `duck_sensitivity` (0..1)
     and is turned down by `sensitivity × level`:
     - generators: by every *other* source combined (`duck_level`), never by
-      their own; post-fader, before their sends (fixed for now);
+      their own; post-fader, before their sends;
     - send effects: the whole return;
     - insert effects: only what they add, `in + (out - in) × (1 - s × env)`,
       so a reverb insert ducks its tail and leaves the dry signal alone.
     Effects are ducked by the global level (`duck` in the state), which
-    combines every source. Every effect's sensitivity is a mixer setting
-    (`patchEffect`), starting at the plugin's declared value. All duck
+    combines every source. Every generator's and effect's sensitivity is a
+    mixer setting (`patchGenerator`, `patchEffect`), starting at the plugin's
+    declared value and kept across restarts. All duck
     readings in the API are as heard, not `ahead_ms` early.
 
     **Entry.** A generator declares how it wants to come into a mix that's
@@ -588,7 +589,7 @@ components:
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -623,6 +624,11 @@ components:
                 message: { type: string, examples: ["hung (no output for 1s)", "exited", "garbled output (something printed to stdout?)"] }
                 seconds_ago: { type: number }
         duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
+        declared_duck_sensitivity:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: The generator's own default. Null while not running.
         duck_source: { type: number, minimum: 0, maximum: 1, description: "How much this generator is ducking the others right now (its own duck events' envelope, as heard)." }
         duck_level: { type: number, minimum: 0, maximum: 1, description: "How much the other generators are ducking it right now, before its sensitivity. The gain reduction is duck_sensitivity × duck_level." }
         entry:
@@ -676,6 +682,7 @@ components:
         entry:
           $ref: "#/components/schemas/Entry"
           description: Replaces the generator's declared entry for this add.
+        duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "Replaces the generator's declared value." }
       oneOf:
         - required: [generator]
         - required: [command]
@@ -687,6 +694,7 @@ components:
       properties:
         gain_db: { $ref: "#/components/schemas/Decibels" }
         muted: { type: boolean }
+        duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "How much the others' ducking turns this channel down; replaces the generator's declared value." }
         sends:
           type: object
           description: Send amounts to set, by send-effect name; 0 or null removes. Others are unchanged.
@@ -714,7 +722,7 @@ components:
       type: [number, "null"]
       minimum: 0
       maximum: 1
-      description: How much the duck envelope turns this down, as the plugin declares it (read-only; the kick is 0, pads high). Null while not running.
+      description: "In use: the mixer's setting if one was made, else the plugin's declared value (the kick is 0, pads high). Null while not running and not set."
 
     Sends:
       type: object

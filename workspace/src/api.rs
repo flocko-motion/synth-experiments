@@ -122,9 +122,11 @@ pub struct Generator {
     pub restarts: u64,
     pub peak: f32,
     pub last_error: Option<LastError>,
-    /// How much the duck envelope turns this channel down, 0..1, as the
-    /// generator declares it; null while not running.
+    /// How much the others' ducking turns this channel down, 0..1: the
+    /// mixer's setting if one was made, else the generator's declared value.
     pub duck_sensitivity: Option<f64>,
+    /// What the generator itself declares; null while not running.
+    pub declared_duck_sensitivity: Option<f64>,
     /// How much this generator is ducking the others right now (its own
     /// duck events' envelope, as heard), 0..1.
     pub duck_source: f32,
@@ -234,6 +236,7 @@ impl Generator {
             peak: g.peak,
             last_error: last_error_of(g),
             duck_sensitivity: g.duck_sensitivity(),
+            declared_duck_sensitivity: g.declared_duck_sensitivity(),
             duck_source: g.duck.source,
             duck_level: g.duck.level,
             entry: g.entry(),
@@ -284,6 +287,8 @@ pub struct NewGenerator {
     pub muted: Option<bool>,
     /// Replaces the generator's declared entry, e.g. `{"mode": "now"}`.
     pub entry: Option<Entry>,
+    /// Replaces the generator's declared duck sensitivity, 0..1.
+    pub duck_sensitivity: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -291,6 +296,8 @@ pub struct NewGenerator {
 pub struct GeneratorPatch {
     pub gain_db: Option<f64>,
     pub muted: Option<bool>,
+    /// 0..1, replacing the generator's declared value.
+    pub duck_sensitivity: Option<f64>,
     /// Send amounts by send-effect name, linear 0..1; 0 or null removes.
     pub sends: Option<BTreeMap<String, Option<f64>>>,
 }
@@ -526,6 +533,7 @@ impl Ctl {
     /// later crashes are restarted.
     pub fn add(&self, g: NewGenerator, cwd: &Path) -> Result<Generator> {
         let gain_db = g.gain_db.map(check_db).transpose()?;
+        let duck = g.duck_sensitivity.map(check_sensitivity).transpose()?;
         let entry = match g.entry {
             Some(e) if !e.is_valid() => return Err(bad(format!("a fade is 0 < bars <= {MAX_FADE_BARS}"))),
             e => e,
@@ -540,6 +548,7 @@ impl Ctl {
         slot.gain_db = gain_db.unwrap_or(0.0);
         slot.muted = g.muted.unwrap_or(false);
         slot.entry_override = entry;
+        slot.duck_override = duck;
         self.on_mixer(move |m| {
             if taken(m, &slot.name) {
                 if explicit {
@@ -700,6 +709,7 @@ impl Ctl {
 
     pub fn patch_generator(&self, name: String, p: GeneratorPatch) -> Result<Generator> {
         let gain_db = p.gain_db.map(check_db).transpose()?;
+        let duck = p.duck_sensitivity.map(check_sensitivity).transpose()?;
         if let Some((fx, _)) = p.sends.iter().flatten().find(|(_, a)| a.is_some_and(|a| !(0.0..=1.0).contains(&a))) {
             return Err(bad(format!("send to {fx}: amounts are 0..1")));
         }
@@ -714,6 +724,9 @@ impl Ctl {
                 }
             }
             let g = find(m, &name)?;
+            if duck.is_some() {
+                g.duck_override = duck;
+            }
             for (fx, amount) in p.sends.into_iter().flatten() {
                 match amount {
                     Some(a) if a > 0.0 => g.sends.insert(fx, a),
@@ -836,9 +849,14 @@ impl Ctl {
                 Ok(format!("{gen} -> {fx} {amount}\n"))
             }
             "duck" => {
+                let name = arg(0, "NAME")?;
                 let s = num(arg(1, "SENSITIVITY (0..1)")?, "a number")?;
-                let e = self.patch_effect(arg(0, "EFFECT")?, EffectPatch { duck_sensitivity: Some(s), ..Default::default() })?;
-                Ok(format!("{} duck sensitivity {}\n", e.name, e.duck_sensitivity.unwrap_or(s)))
+                if self.is_effect(&name)? {
+                    self.patch_effect(name.clone(), EffectPatch { duck_sensitivity: Some(s), ..Default::default() })?;
+                } else {
+                    self.patch_generator(name.clone(), GeneratorPatch { duck_sensitivity: Some(s), ..Default::default() })?;
+                }
+                Ok(format!("{name} duck sensitivity {s}\n"))
             }
             "bypass" => {
                 let on = match arg(1, "on|off")?.as_str() {
