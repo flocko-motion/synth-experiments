@@ -31,17 +31,21 @@ const RESONANCE: usize = 1;
 const DELAY_MIX: usize = 2;
 const FEEDBACK: usize = 3;
 const DRIVE: usize = 4;
+const OCTAVE: usize = 5;
 
 /// Offsets on top of the generator's own tweak, plus the built-in delay
 /// and drive. Randomized, the cutoff sweeps over 4 bars like a hand on the
 /// knob; the rest follow over 1-2 bars.
-const PARAMS: [Param; 5] = [
+const PARAMS: [Param; 6] = [
     Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct").glide(4.0),
     Param::continuous("resonance", "Resonance offset", -0.4, 0.3, 0.0).glide(2.0),
     Param::continuous("delay", "Delay mix", 0.0, 1.0, 0.4).glide(2.0),
     Param::continuous("feedback", "Delay feedback", 0.0, 0.85, 0.42).glide(1.0),
     // Multiplies the seed's own drive amount.
     Param::continuous("drive", "Drive", 0.25, 4.0, 1.0).unit("x").glide(2.0),
+    // Octaves up or down from the seed's own register; applies from the
+    // next note.
+    Param::integer("octave", "Octave", -2, 2, 0).unit("oct").glide(0.0),
 ];
 
 /// Scale degrees and their weights: root, octave, 2nd (the phrygian b2),
@@ -389,8 +393,11 @@ impl Acid {
             return;
         }
         let t = &ctx.tonality;
-        // Bass register root is D1..C#2; the acid sits one or two octaves up.
-        let root = 26 + (t.root as i32 + 10) % 12 + 12 * self.character.octave;
+        // Bass register root is D1..C#2; the acid sits one or two octaves up,
+        // moved by the octave knob (kept between the bass register and
+        // four octaves above it).
+        let octave = (self.character.octave + ctx.param(OCTAVE) as i32).clamp(0, 4);
+        let root = 26 + (t.root as i32 + 10) % 12 + 12 * octave;
         let freq = midi_hz((root + t.degree(st.degree)) as f64);
         let six = ctx.transport.samples_per_beat(self.sr) / 4.0;
         let gate = if st.slide { None } else { Some((six * 0.55) as usize) };
