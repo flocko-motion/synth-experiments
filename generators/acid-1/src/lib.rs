@@ -33,14 +33,15 @@ const FEEDBACK: usize = 3;
 const DRIVE: usize = 4;
 
 /// Offsets on top of the generator's own tweak, plus the built-in delay
-/// and drive.
+/// and drive. Randomized, the cutoff sweeps over 4 bars like a hand on the
+/// knob; the rest follow over 1-2 bars.
 const PARAMS: [Param; 5] = [
-    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct"),
-    Param::continuous("resonance", "Resonance offset", -0.4, 0.3, 0.0),
-    Param::continuous("delay", "Delay mix", 0.0, 1.0, 0.4),
-    Param::continuous("feedback", "Delay feedback", 0.0, 0.85, 0.42),
+    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct").glide(4.0),
+    Param::continuous("resonance", "Resonance offset", -0.4, 0.3, 0.0).glide(2.0),
+    Param::continuous("delay", "Delay mix", 0.0, 1.0, 0.4).glide(2.0),
+    Param::continuous("feedback", "Delay feedback", 0.0, 0.85, 0.42).glide(1.0),
     // Multiplies the seed's own drive amount.
-    Param::continuous("drive", "Drive", 0.25, 4.0, 1.0).unit("x"),
+    Param::continuous("drive", "Drive", 0.25, 4.0, 1.0).unit("x").glide(2.0),
 ];
 
 /// Scale degrees and their weights: root, octave, 2nd (the phrygian b2),

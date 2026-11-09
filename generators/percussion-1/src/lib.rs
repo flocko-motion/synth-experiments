@@ -17,7 +17,7 @@ const CYCLES_PER_EPOCH: u64 = 4;
 const DRIVE: usize = 0;
 
 /// The built-in output saturation, exposed.
-const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.0)];
+const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.0).glide(2.0)];
 const CEILING: f64 = 0.891;
 
 /// Closed-hat velocity per 16th within a beat; slot 2 belongs to the open hat.

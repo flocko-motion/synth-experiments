@@ -18,7 +18,9 @@ const PHRASE_SLOTS: usize = PHRASE_BARS as usize * 16;
 const DRIVE: usize = 0;
 
 /// The built-in output saturation, exposed.
-const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.25)];
+/// Drive moves slowly when randomized: a sudden jump in kick and bass
+/// saturation is a level jump.
+const PARAMS: [Param; 1] = [Param::continuous("drive", "Drive", 0.5, 4.0, 1.25).glide(2.0)];
 const CEILING: f64 = 0.891;
 
 /// Which of the three off-kick 16ths in a beat carry a bass note.

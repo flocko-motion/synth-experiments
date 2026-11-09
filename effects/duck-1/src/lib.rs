@@ -11,10 +11,10 @@ const CURVE: usize = 2;
 const RATE: usize = 3;
 
 const PARAMS: [Param; 4] = [
-    Param::continuous("depth", "Depth", 0.0, 1.0, 0.7),
-    Param::continuous("release", "Release", 0.1, 1.0, 0.6).unit("of a step"),
-    Param::continuous("curve", "Curve", 0.5, 4.0, 1.6),
-    Param::choice("rate", "Rate", &["1/4", "1/8", "1/2"], 0),
+    Param::continuous("depth", "Depth", 0.0, 1.0, 0.7).glide(1.0),
+    Param::continuous("release", "Release", 0.1, 1.0, 0.6).unit("of a step").glide(0.25),
+    Param::continuous("curve", "Curve", 0.5, 4.0, 1.6).glide(0.25),
+    Param::choice("rate", "Rate", &["1/4", "1/8", "1/2"], 0).glide(0.0),
 ];
 
 /// Beats per dip for each `rate` choice.
