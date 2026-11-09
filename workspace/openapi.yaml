@@ -33,9 +33,15 @@ info:
     **Ducking.** Ducking is native to the mixer. Generators emit duck events
     (psybass on every kick), which drive one shared envelope: it jumps to
     the event's strength and recovers over about 0.6 of a beat. Each
-    generator and send effect declares a fixed `duck_sensitivity` (0..1) and
-    is turned down by `sensitivity × envelope`, post-fader and before its
-    sends. `duck` in the state is the envelope as heard now.
+    plugin declares a default `duck_sensitivity` (0..1) and is turned down by
+    `sensitivity × envelope`:
+    - generators: post-fader, before their sends (fixed for now);
+    - send effects: the whole return;
+    - insert effects: only what they add, `in + (out - in) × (1 - s × env)`,
+      so a reverb insert ducks its tail and leaves the dry signal alone.
+    Every effect's sensitivity is a mixer setting (`patchEffect`), starting
+    at the plugin's declared value. `duck` in the state is the envelope as
+    heard now.
 
     **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
     that long after the response.
@@ -318,8 +324,8 @@ paths:
       - $ref: "#/components/parameters/Name"
     patch:
       operationId: patchEffect
-      summary: Return level, mute, bypass or chain position
-      description: "`gain_db` and `muted` apply to send effects (their return); `bypass` and `position` to inserts."
+      summary: Return level, mute, bypass, chain position or duck sensitivity
+      description: "`gain_db` and `muted` apply to send effects (their return); `bypass` and `position` to inserts; `duck_sensitivity` to both."
       requestBody:
         required: true
         content:
@@ -672,7 +678,7 @@ components:
 
     Effect:
       type: object
-      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity]
+      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command: { type: array, items: { type: string } }
@@ -692,7 +698,16 @@ components:
           $ref: "#/components/schemas/Decibels"
         muted: { type: boolean }
         bypass: { type: boolean, description: Inserts only. }
-        duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
+        duck_sensitivity:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: In use. The mixer's setting if one was made, else the plugin's declared value. Sends duck their whole return; inserts only what they add.
+        declared_duck_sensitivity:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+          description: The plugin's own default. Null while not running.
         state: { $ref: "#/components/schemas/GeneratorState" }
         late: { type: integer, minimum: 0 }
         restarts: { type: integer, minimum: 0 }
@@ -722,6 +737,7 @@ components:
         gain_db: { $ref: "#/components/schemas/Decibels" }
         muted: { type: boolean }
         position: { type: integer, minimum: 0, description: "Inserts: index in the chain, 0 = first; default last." }
+        duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "Replaces the plugin's declared value." }
       oneOf:
         - required: [effect]
         - required: [command]
@@ -735,6 +751,7 @@ components:
         muted: { type: boolean }
         bypass: { type: boolean, description: Inserts only. }
         position: { type: integer, minimum: 0, description: "Inserts only: move to this index." }
+        duck_sensitivity: { type: number, minimum: 0, maximum: 1, description: "How much the kick ducks this effect; replaces the plugin's declared value." }
 
     CatalogEntry:
       type: object

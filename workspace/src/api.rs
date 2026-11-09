@@ -146,8 +146,12 @@ pub struct Effect {
     pub restarts: u64,
     pub peak: f32,
     pub last_error: Option<LastError>,
-    /// Send effects: how much the duck envelope turns the return down.
+    /// How much the duck envelope turns this down, 0..1: send effects'
+    /// whole return, inserts only what they add. The mixer's setting if
+    /// one was made, else the plugin's declared value.
     pub duck_sensitivity: Option<f64>,
+    /// What the plugin itself declares.
+    pub declared_duck_sensitivity: Option<f64>,
 }
 
 fn params_of(g: &Slot) -> Vec<Param> {
@@ -178,6 +182,7 @@ impl Effect {
             peak: f.peak,
             last_error: last_error_of(f),
             duck_sensitivity: f.duck_sensitivity(),
+            declared_duck_sensitivity: f.declared_duck_sensitivity(),
         }
     }
 }
@@ -281,6 +286,8 @@ pub struct NewEffect {
     pub muted: Option<bool>,
     /// Inserts: index in the chain, 0 = first; default last.
     pub position: Option<usize>,
+    /// Replaces the plugin's declared duck sensitivity, 0..1.
+    pub duck_sensitivity: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -292,6 +299,16 @@ pub struct EffectPatch {
     pub bypass: Option<bool>,
     /// Inserts only: move to this index in the chain.
     pub position: Option<usize>,
+    /// 0..1, replacing the plugin's declared value.
+    pub duck_sensitivity: Option<f64>,
+}
+
+fn check_sensitivity(s: f64) -> Result<f64> {
+    if (0.0..=1.0).contains(&s) {
+        Ok(s)
+    } else {
+        Err(bad("duck_sensitivity is 0..1"))
+    }
 }
 
 // ---------------------------------------------------------------- validation
@@ -553,6 +570,7 @@ impl Ctl {
     /// insert in that generator's chain.
     pub fn add_effect(&self, e: NewEffect, owner: Option<String>, cwd: &Path) -> Result<Effect> {
         let gain_db = e.gain_db.map(check_db).transpose()?;
+        let duck = e.duck_sensitivity.map(check_sensitivity).transpose()?;
         if let Some(o) = owner.clone() {
             self.on_mixer(move |m| find(m, &o).map(|_| ()))??;
         }
@@ -566,6 +584,7 @@ impl Ctl {
         slot.gain_db = gain_db.unwrap_or(0.0);
         slot.muted = e.muted.unwrap_or(false);
         slot.owner = owner;
+        slot.duck_override = duck;
         self.on_mixer(move |m| {
             if taken(m, &slot.name) {
                 if explicit {
@@ -586,6 +605,7 @@ impl Ctl {
 
     pub fn patch_effect(&self, name: String, p: EffectPatch) -> Result<Effect> {
         let gain_db = p.gain_db.map(check_db).transpose()?;
+        let duck = p.duck_sensitivity.map(check_sensitivity).transpose()?;
         self.on_mixer(move |m| {
             let f = find_fx(m, &name)?;
             let owner = f.owner.clone();
@@ -600,6 +620,9 @@ impl Ctl {
             }
             if let Some(b) = p.bypass {
                 f.bypass = b;
+            }
+            if duck.is_some() {
+                f.duck_override = duck;
             }
             let view_name = f.name.clone();
             if let (Some(pos), Some(o)) = (p.position, owner) {
@@ -775,6 +798,11 @@ impl Ctl {
                 let amount = num(arg(2, "AMOUNT (0..1)")?, "a number")?;
                 self.patch_generator(gen.clone(), GeneratorPatch { sends: Some(BTreeMap::from([(fx.clone(), Some(amount))])), ..Default::default() })?;
                 Ok(format!("{gen} -> {fx} {amount}\n"))
+            }
+            "duck" => {
+                let s = num(arg(1, "SENSITIVITY (0..1)")?, "a number")?;
+                let e = self.patch_effect(arg(0, "EFFECT")?, EffectPatch { duck_sensitivity: Some(s), ..Default::default() })?;
+                Ok(format!("{} duck sensitivity {}\n", e.name, e.duck_sensitivity.unwrap_or(s)))
             }
             "bypass" => {
                 let on = match arg(1, "on|off")?.as_str() {

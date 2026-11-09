@@ -51,6 +51,8 @@ commands (sent to the running daemon):
                              with --insert, into a generator's chain
   send GENERATOR EFFECT AMOUNT   send level 0..1 to a send effect (0 removes)
   bypass EFFECT on|off       bypass an insert effect
+  duck EFFECT SENSITIVITY    how much the kick ducks an effect, 0..1 (sends:
+                             the whole return; inserts: only what they add)
   params NAME                list a generator's or effect's parameters
   set NAME PARAM VALUE       set one, e.g. ws set acid cutoff 0.5
   bpm N                      change tempo

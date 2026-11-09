@@ -90,7 +90,11 @@ struct Stage {
 /// so on, so effects add no latency and stay sample-aligned with the grid.
 /// An effect that is bypassed, restarting, late or broken passes its input
 /// through unchanged, so a channel never goes silent because of an effect.
-fn run_chains(fx: &mut [Slot], chains: &[Vec<String>], bufs: &mut [Vec<f32>], st: &Stage) {
+///
+/// An insert with a duck sensitivity has only what it adds ducked:
+/// `in + (out - in) * (1 - sensitivity * env)`. A reverb or delay used as an
+/// insert ducks its tail while the dry signal passes untouched.
+fn run_chains(fx: &mut [Slot], chains: &[Vec<String>], bufs: &mut [Vec<f32>], st: &Stage, env: &[f32]) {
     let depth = chains.iter().map(Vec::len).max().unwrap_or(0);
     for d in 0..depth {
         let mut asked = Vec::new();
@@ -110,7 +114,16 @@ fn run_chains(fx: &mut [Slot], chains: &[Vec<String>], bufs: &mut [Vec<f32>], st
             let Some(mut chunk) = slot.collect(st.seq, st.deadline, short) else { continue };
             slot.sanitize(&mut chunk);
             let Some(och) = slot.channels() else { continue };
-            let out = adapt_channels(&chunk, och, st.channels);
+            let mut out = adapt_channels(&chunk, och, st.channels);
+            let sens = slot.duck_sensitivity().unwrap_or(0.0) as f32;
+            if sens > 0.0 && env.iter().any(|&e| e > 1e-4) {
+                for ((o, i), e) in out.chunks_exact_mut(st.channels).zip(bufs[c].chunks_exact(st.channels)).zip(env) {
+                    let k = 1.0 - sens * e;
+                    for (o, i) in o.iter_mut().zip(i) {
+                        *o = i + (*o - i) * k;
+                    }
+                }
+            }
             slot.peak = out.iter().fold(slot.peak, |p, s| p.max(s.abs()));
             bufs[c] = out;
         }
@@ -391,12 +404,9 @@ impl Mixer {
             chans.push(buf);
         }
 
-        // 2. generator insert chains
-        let chains: Vec<Vec<String>> = self.gens.iter().map(|g| g.inserts.clone()).collect();
-        run_chains(&mut self.fx, &chains, &mut chans, &st);
-
-        // 3. the duck envelope, from every generator's and insert's events
-        let mut events: Vec<(u32, f32)> = self.gens.iter().chain(self.fx.iter().filter(|f| f.owner.is_some())).flat_map(|s| s.ducks.iter().copied()).collect();
+        // 2. the duck envelope, from the generators' events (it's needed
+        //    before the inserts run, so effects' own events don't count)
+        let mut events: Vec<(u32, f32)> = self.gens.iter().flat_map(|s| s.ducks.iter().copied()).collect();
         let env = self.duck_envelope(n, &mut events);
         let ducking = env.iter().any(|&e| e > 1e-4);
         // The block's peak, so a meter sees the dip even between polls.
@@ -405,6 +415,10 @@ impl Mixer {
         while self.duck_history.len() > 1024 {
             self.duck_history.pop_front();
         }
+
+        // 3. generator insert chains
+        let chains: Vec<Vec<String>> = self.gens.iter().map(|g| g.inserts.clone()).collect();
+        run_chains(&mut self.fx, &chains, &mut chans, &st, &env);
 
         // 4. faders into the mix, ducked post-fader by each channel's
         //    sensitivity (so its sends are ducked too); sends (linear

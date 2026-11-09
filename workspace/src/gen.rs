@@ -288,6 +288,9 @@ pub struct Slot {
     pub owner: Option<String>,
     /// Insert effects: pass input straight through.
     pub bypass: bool,
+    /// Effects: duck sensitivity set in the mixer, replacing the plugin's
+    /// declared one.
+    pub duck_override: Option<f64>,
     /// Parameter values set by the user, by id; kept across restarts.
     /// Unset params use the generator's default.
     pub values: BTreeMap<String, f64>,
@@ -325,6 +328,7 @@ impl Slot {
             sends: BTreeMap::new(),
             owner: None,
             bypass: false,
+            duck_override: None,
             values: BTreeMap::new(),
             peak: 0.0,
             ducks: Vec::new(),
@@ -356,8 +360,14 @@ impl Slot {
         }
     }
 
-    /// The running plugin's declared duck sensitivity, 0..1.
+    /// The duck sensitivity in use, 0..1: the mixer's setting if there is
+    /// one, else what the running plugin declares.
     pub fn duck_sensitivity(&self) -> Option<f64> {
+        self.duck_override.or_else(|| self.declared_duck_sensitivity())
+    }
+
+    /// What the running plugin declares, 0..1.
+    pub fn declared_duck_sensitivity(&self) -> Option<f64> {
         match &self.state {
             State::Running(p) => Some(p.desc.duck_sensitivity.clamp(0.0, 1.0)),
             _ => None,
