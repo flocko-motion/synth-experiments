@@ -139,6 +139,39 @@ pub fn square(phase: f64, dt: f64) -> f64 {
     naive + poly_blep(phase, dt) - poly_blep((phase + 0.5).fract(), dt)
 }
 
+// ---------------------------------------------------------------- delay line
+
+/// A delay line with fractional (linearly interpolated) reads, so delay
+/// times can glide. Allocated in [`DelayLine::new`].
+#[derive(Clone, Debug)]
+pub struct DelayLine {
+    buf: Vec<f64>,
+    w: usize,
+}
+
+impl DelayLine {
+    /// Room for delays up to `max` samples.
+    pub fn new(max: usize) -> DelayLine {
+        DelayLine { buf: vec![0.0; max + 2], w: 0 }
+    }
+
+    /// The sample written `delay` samples ago, clamped to 1..max. Read
+    /// before [`DelayLine::write`] for the current sample.
+    pub fn read(&self, delay: f64) -> f64 {
+        let n = self.buf.len();
+        let delay = delay.clamp(1.0, n as f64 - 2.0);
+        let pos = self.w as f64 + n as f64 - delay;
+        let i0 = pos.floor() as usize % n;
+        let frac = pos.fract();
+        self.buf[i0] * (1.0 - frac) + self.buf[(i0 + 1) % n] * frac
+    }
+
+    pub fn write(&mut self, x: f64) {
+        self.buf[self.w] = x;
+        self.w = (self.w + 1) % self.buf.len();
+    }
+}
+
 // ---------------------------------------------------------------- reverb
 
 /// Schroeder allpass: smears transients without colouring the spectrum.
@@ -237,6 +270,17 @@ pub fn decay_coef(tau: f64, sr: f64) -> f64 {
 pub fn pan_gains(pan: f64) -> (f64, f64) {
     let a = (pan.clamp(-1.0, 1.0) + 1.0) * PI / 4.0;
     (a.cos(), a.sin())
+}
+
+/// Linear up to 0.8, then bends smoothly towards ±1: keeps output in range
+/// without colouring normal levels.
+pub fn soft_limit(x: f64) -> f64 {
+    let a = x.abs();
+    if a <= 0.8 {
+        x
+    } else {
+        x.signum() * (0.8 + 0.2 * ((a - 0.8) / 0.2).tanh())
+    }
 }
 
 /// Frequency of a MIDI note number.

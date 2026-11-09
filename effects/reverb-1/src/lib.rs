@@ -8,7 +8,7 @@
 //! It never sees duck events: it declares a duck sensitivity and the mixer
 //! ducks it like any other plugin.
 
-use dsp::{Reverb, Svf};
+use dsp::{soft_limit, DelayLine, Reverb, Svf};
 use gen_api::{Config, Context, Generator, Info, Param};
 
 const MIX: usize = 0;
@@ -32,22 +32,11 @@ const MAX_PREDELAY_MS: f64 = 260.0;
 /// Wet level, so a send at unity comes back at about the input's loudness.
 const WET_GAIN: f64 = 2.2;
 
-/// Linear below 0.8, then bends smoothly towards 1.
-fn soft_limit(x: f64) -> f64 {
-    let a = x.abs();
-    if a <= 0.8 {
-        x
-    } else {
-        x.signum() * (0.8 + 0.2 * ((a - 0.8) / 0.2).tanh())
-    }
-}
-
 pub struct ReverbFx {
     sr: f64,
     reverb: Reverb,
     lowcut: [Svf; 2],
-    pre: [Vec<f64>; 2],
-    w: usize,
+    pre: [DelayLine; 2],
     /// Settings the reverb was last set to, so it's only recomputed on change.
     set_to: (f64, f64),
     predelay: f64, // samples, smoothed
@@ -56,20 +45,10 @@ pub struct ReverbFx {
     smooth: f64,
 }
 
-impl ReverbFx {
-    fn read(buf: &[f64], w: usize, delay: f64) -> f64 {
-        let n = buf.len();
-        let pos = w as f64 + n as f64 - delay;
-        let i0 = pos.floor() as usize % n;
-        let frac = pos.fract();
-        buf[i0] * (1.0 - frac) + buf[(i0 + 1) % n] * frac
-    }
-}
-
 impl Generator for ReverbFx {
     fn new(config: &Config) -> Self {
         let sr = config.sample_rate;
-        let n = (MAX_PREDELAY_MS * sr / 1000.0) as usize + 2;
+        let n = (MAX_PREDELAY_MS * sr / 1000.0) as usize;
         let mut reverb = Reverb::new(sr);
         let set_to = (PARAMS[DECAY].default, PARAMS[DAMP].default);
         reverb.set(set_to.0, set_to.1, sr);
@@ -77,8 +56,7 @@ impl Generator for ReverbFx {
             sr,
             reverb,
             lowcut: [Svf::default(); 2],
-            pre: [vec![0.0; n], vec![0.0; n]],
-            w: 0,
+            pre: [DelayLine::new(n), DelayLine::new(n)],
             set_to,
             predelay: PARAMS[PREDELAY].default * sr / 1000.0,
             mix: PARAMS[MIX].default,
@@ -116,7 +94,6 @@ impl Generator for ReverbFx {
             f.set(ctx.param(LOWCUT), 0.0, sr);
         }
         let predelay_target = ctx.param(PREDELAY) * sr / 1000.0;
-        let n = self.pre[0].len();
 
         for (o, x) in out.chunks_exact_mut(2).zip(ctx.input.chunks_exact(2)) {
             self.mix += (ctx.param(MIX) - self.mix) * self.smooth;
@@ -126,10 +103,10 @@ impl Generator for ReverbFx {
             let dry = [x[0] as f64, x[1] as f64];
             let mut send = [0.0; 2];
             for k in 0..2 {
-                self.pre[k][self.w] = self.lowcut[k].tick(dry[k]).2;
-                send[k] = ReverbFx::read(&self.pre[k], self.w, self.predelay.clamp(0.0, n as f64 - 2.0));
+                // Read first: at 0 ms predelay the send is one sample late.
+                send[k] = self.pre[k].read(self.predelay);
+                self.pre[k].write(self.lowcut[k].tick(dry[k]).2);
             }
-            self.w = (self.w + 1) % n;
 
             let (l, r) = self.reverb.tick(send[0], send[1]);
             let (mid, side) = ((l + r) * 0.5, (l - r) * 0.5 * self.width);
