@@ -14,7 +14,7 @@ import { pluginColor, setCatalog } from './colors.js';
 const REFRESH_MS = 5000;
 
 // Press and hold an entry to pick its starting volume before it's added.
-const HOLD_MS = 300;
+const HOLD_MS = 180;
 const VOL_MIN = -60; // the far left means -96 dB (silent)
 const VOL_MAX = 6;
 
