@@ -132,6 +132,21 @@ impl ParamDesc {
     }
 }
 
+/// A generator's part in ducking: its own envelope, driven by its duck
+/// events, and readings as heard.
+#[derive(Default)]
+pub struct DuckMeter {
+    pub env: f32,
+    /// Attack target; 0 while releasing.
+    pub target: f32,
+    /// (block start frame, own peak, ducked-by peak), for audible readings.
+    pub hist: std::collections::VecDeque<(u64, f32, f32)>,
+    /// As heard now: how much it ducks the others, and how much the others
+    /// duck it (before its sensitivity).
+    pub source: f32,
+    pub level: f32,
+}
+
 /// The handshake's result.
 struct Ready {
     channels: usize,
@@ -298,6 +313,7 @@ pub struct Slot {
     pub peak: f32,
     /// Duck events from the chunk `collect` returned last.
     pub ducks: Vec<(u32, f32)>,
+    pub duck: DuckMeter,
     pub state: State,
     /// Bumped on every (re)start, so a stale spawn result is ignored.
     pub generation: u64,
@@ -332,6 +348,7 @@ impl Slot {
             values: BTreeMap::new(),
             peak: 0.0,
             ducks: Vec::new(),
+            duck: DuckMeter::default(),
             state: State::Running(proc),
             generation: 0,
             backoff: 0,

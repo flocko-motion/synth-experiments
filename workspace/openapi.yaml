@@ -30,18 +30,22 @@ info:
     effects. An insert that is bypassed, restarting or late passes its input
     through unchanged. A send effect in that state returns silence.
 
-    **Ducking.** Ducking is native to the mixer. Generators emit duck events
-    (psybass on every kick), which drive one shared envelope: it jumps to
-    the event's strength and recovers over about 0.6 of a beat. Each
-    plugin declares a default `duck_sensitivity` (0..1) and is turned down by
-    `sensitivity × envelope`:
-    - generators: post-fader, before their sends (fixed for now);
+    **Ducking.** Ducking is native to the mixer. Any generator that wants
+    the others to duck emits duck events (psybass on every kick). Each
+    source's events drive its own envelope: it jumps to the event's strength
+    and recovers over about 0.6 of a beat. Sources add up softly,
+    `1 - (1-a)(1-b)…`: they saturate below 1, and one at full strength is
+    full ducking. Each plugin declares a default `duck_sensitivity` (0..1)
+    and is turned down by `sensitivity × level`:
+    - generators: by every *other* source combined (`duck_level`), never by
+      their own; post-fader, before their sends (fixed for now);
     - send effects: the whole return;
     - insert effects: only what they add, `in + (out - in) × (1 - s × env)`,
       so a reverb insert ducks its tail and leaves the dry signal alone.
-    Every effect's sensitivity is a mixer setting (`patchEffect`), starting
-    at the plugin's declared value. `duck` in the state is the envelope as
-    heard now.
+    Effects are ducked by the global level (`duck` in the state), which
+    combines every source. Every effect's sensitivity is a mixer setting
+    (`patchEffect`), starting at the plugin's declared value. All duck
+    readings in the API are as heard, not `ahead_ms` early.
 
     **Latency.** The mixer renders ahead (`ahead_ms`), so a change is heard
     that long after the response.
@@ -531,7 +535,7 @@ components:
         click_db: { $ref: "#/components/schemas/Decibels" }
         master_db: { $ref: "#/components/schemas/Decibels" }
         master_peak: { $ref: "#/components/schemas/Peak" }
-        duck: { type: number, minimum: 0, maximum: 1, description: "The shared duck envelope as heard now (its peak in the playing block)." }
+        duck: { type: number, minimum: 0, maximum: 1, description: "The global duck level as heard now (its peak in the playing block): every source combined. Effects are ducked by this." }
         ahead_ms: { type: number, description: How far ahead the mixer renders. }
         underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
         sample_rate: { type: integer }
@@ -568,7 +572,7 @@ components:
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, inserts, sends]
+      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, duck_source, duck_level, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -603,6 +607,8 @@ components:
                 message: { type: string, examples: ["hung (no output for 1s)", "exited", "garbled output (something printed to stdout?)"] }
                 seconds_ago: { type: number }
         duck_sensitivity: { $ref: "#/components/schemas/DuckSensitivity" }
+        duck_source: { type: number, minimum: 0, maximum: 1, description: "How much this generator is ducking the others right now (its own duck events' envelope, as heard)." }
+        duck_level: { type: number, minimum: 0, maximum: 1, description: "How much the other generators are ducking it right now, before its sensitivity. The gain reduction is duck_sensitivity × duck_level." }
         inserts:
           type: array
           items: { $ref: "#/components/schemas/GeneratorName" }

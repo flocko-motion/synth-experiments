@@ -63,6 +63,53 @@ const PEAK_FALLOFF: f32 = 0.93;
 const DUCK_ATTACK_SECS: f64 = 0.002;
 const DUCK_RELEASE_BEATS: f64 = 0.6;
 
+/// Advances one duck envelope over `n` frames with its events (frame,
+/// strength). An event raises it to its strength (never lowers it) over a
+/// short attack; then it recovers exponentially.
+fn advance_envelope(env: &mut f32, target: &mut f32, events: &mut [(u32, f32)], n: usize, attack_step: f32, coef: f32) -> Vec<f32> {
+    events.sort_by_key(|e| e.0);
+    let mut out = Vec::with_capacity(n);
+    let mut k = 0;
+    for i in 0..n {
+        while k < events.len() && events[k].0 as usize <= i {
+            let s = events[k].1;
+            if s > *env && s > *target {
+                *target = s;
+            }
+            k += 1;
+        }
+        if *target > 0.0 {
+            *env += attack_step;
+            if *env >= *target {
+                *env = *target;
+                *target = 0.0;
+            }
+        } else {
+            *env *= coef;
+        }
+        out.push(*env);
+    }
+    out
+}
+
+/// Combines duck sources: `1 - (1-a)(1-b)…`. Sources add up but saturate
+/// smoothly below 1, and one source at full strength is full ducking.
+/// `skip` leaves one source out (a generator isn't ducked by itself).
+fn combine_ducks(sources: &[Option<Vec<f32>>], n: usize, skip: Option<usize>) -> Vec<f32> {
+    let mut keep = vec![1.0f32; n];
+    for (j, src) in sources.iter().enumerate() {
+        if Some(j) == skip {
+            continue;
+        }
+        if let Some(e) = src {
+            for (k, e) in keep.iter_mut().zip(e) {
+                *k *= 1.0 - e;
+            }
+        }
+    }
+    keep.iter().map(|k| 1.0 - k).collect()
+}
+
 /// Scales each frame of interleaved `buf` by `1 - sensitivity * env[frame]`.
 fn apply_duck(buf: &mut [f32], channels: usize, env: &[f32], sensitivity: f32) {
     if sensitivity <= 0.0 {
@@ -171,11 +218,7 @@ pub struct Mixer {
     pub click_db: f64,
     pub master_db: f64,
     pub master_peak: f32,
-    /// The shared duck envelope, 0..1, and its attack target (0 when
-    /// releasing).
-    duck_env: f32,
-    duck_target: f32,
-    /// (frame, envelope) at each block's start, so the API can report the
+    /// (frame, global duck level) at each block's start, so the API can report the
     /// envelope at the audible position rather than the render position.
     duck_history: std::collections::VecDeque<(u64, f32)>,
     pub quit: bool,
@@ -329,38 +372,22 @@ impl Mixer {
             .collect()
     }
 
-    /// The duck envelope for the next `n` frames, from this block's duck
-    /// events (frame, strength). An event raises the envelope to its
-    /// strength (never lowers it); then it recovers exponentially.
-    fn duck_envelope(&mut self, n: usize, events: &mut [(u32, f32)]) -> Vec<f32> {
-        events.sort_by_key(|e| e.0);
-        let sr = self.sample_rate as f64;
-        let attack_step = (1.0 / (DUCK_ATTACK_SECS * sr)) as f32;
+    /// Attack step per frame and release coefficient for duck envelopes.
+    fn duck_coefs(&self) -> (f32, f32) {
+        let attack_step = (1.0 / (DUCK_ATTACK_SECS * self.sample_rate as f64)) as f32;
         // Time constant a quarter of the release: about 2% left at the end.
         let tau = DUCK_RELEASE_BEATS * self.samples_per_beat() / 4.0;
-        let coef = (-1.0 / tau).exp() as f32;
-        let mut env = Vec::with_capacity(n);
-        let mut k = 0;
-        for i in 0..n {
-            while k < events.len() && events[k].0 as usize <= i {
-                let s = events[k].1;
-                if s > self.duck_env && s > self.duck_target {
-                    self.duck_target = s;
-                }
-                k += 1;
-            }
-            if self.duck_target > 0.0 {
-                self.duck_env += attack_step;
-                if self.duck_env >= self.duck_target {
-                    self.duck_env = self.duck_target;
-                    self.duck_target = 0.0;
-                }
-            } else {
-                self.duck_env *= coef;
-            }
-            env.push(self.duck_env);
+        (attack_step, (-1.0 / tau).exp() as f32)
+    }
+
+    /// Updates each generator's duck readings to what's audible now.
+    fn update_duck_meters(&mut self) {
+        let played = self.played.load(Ordering::Relaxed);
+        for g in &mut self.gens {
+            let (s, l) = g.duck.hist.iter().rev().find(|(f, _, _)| *f <= played).map_or((0.0, 0.0), |&(_, s, l)| (s, l));
+            g.duck.source = s;
+            g.duck.level = l;
         }
-        env
     }
 
     fn render_block(&mut self) {
@@ -404,16 +431,38 @@ impl Mixer {
             chans.push(buf);
         }
 
-        // 2. the duck envelope, from the generators' events (it's needed
-        //    before the inserts run, so effects' own events don't count)
-        let mut events: Vec<(u32, f32)> = self.gens.iter().flat_map(|s| s.ducks.iter().copied()).collect();
-        let env = self.duck_envelope(n, &mut events);
+        // 2. ducking: each generator's events drive its own envelope; the
+        //    global level combines them all, and each generator is ducked by
+        //    all the others. Needed before the inserts run, so effects' own
+        //    events don't count.
+        let (attack, coef) = self.duck_coefs();
+        let sources: Vec<Option<Vec<f32>>> = self
+            .gens
+            .iter_mut()
+            .map(|g| {
+                let d = &mut g.duck;
+                if g.ducks.is_empty() && d.target == 0.0 && d.env < 1e-5 {
+                    d.env = 0.0;
+                    return None;
+                }
+                let mut events = g.ducks.clone();
+                Some(advance_envelope(&mut d.env, &mut d.target, &mut events, n, attack, coef))
+            })
+            .collect();
+        let env = combine_ducks(&sources, n, None);
         let ducking = env.iter().any(|&e| e > 1e-4);
-        // The block's peak, so a meter sees the dip even between polls.
-        let top = env.iter().copied().fold(0.0, f32::max);
-        self.duck_history.push_back((self.frame, top));
+        let levels: Vec<Vec<f32>> = (0..self.gens.len()).map(|i| if ducking { combine_ducks(&sources, n, Some(i)) } else { Vec::new() }).collect();
+        // Block peaks, so meters see the dip even between polls.
+        let peak = |v: &[f32]| v.iter().copied().fold(0.0, f32::max);
+        self.duck_history.push_back((self.frame, peak(&env)));
         while self.duck_history.len() > 1024 {
             self.duck_history.pop_front();
+        }
+        for ((g, src), level) in self.gens.iter_mut().zip(&sources).zip(&levels) {
+            g.duck.hist.push_back((self.frame, src.as_deref().map_or(0.0, peak), peak(level)));
+            while g.duck.hist.len() > 1024 {
+                g.duck.hist.pop_front();
+            }
         }
 
         // 3. generator insert chains
@@ -426,13 +475,13 @@ impl Mixer {
         self.mix.clear();
         self.mix.resize(n * ch, 0.0);
         let mut send_in: Vec<Option<Vec<f32>>> = self.fx.iter().map(|f| f.owner.is_none().then(|| silence.clone())).collect();
-        for (g, buf) in self.gens.iter_mut().zip(chans.iter_mut()) {
+        for ((g, buf), level) in self.gens.iter_mut().zip(chans.iter_mut()).zip(&levels) {
             let gain = g.gain();
             if gain == 0.0 {
                 continue;
             }
             if ducking {
-                apply_duck(buf, ch, &env, g.duck_sensitivity().unwrap_or(0.0) as f32);
+                apply_duck(buf, ch, level, g.duck_sensitivity().unwrap_or(0.0) as f32);
             }
             g.peak = buf.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
             add_scaled(&mut self.mix, buf, gain);
@@ -600,8 +649,6 @@ pub fn run(opts: Opts) -> Result<(), String> {
         click_db: -12.0,
         master_db: 0.0,
         master_peak: 0.0,
-        duck_env: 0.0,
-        duck_target: 0.0,
         duck_history: std::collections::VecDeque::new(),
         quit: false,
         mix: Vec::new(),
@@ -665,6 +712,7 @@ fn mix_loop(m: &mut Mixer, jobs: Receiver<Job>, spawned: Receiver<Spawned>) {
             g.maybe_restart(&m.spawned_tx);
         }
         fill(m);
+        m.update_duck_meters();
         // Sleep until a command arrives or about a block's worth of audio has
         // played.
         match jobs.recv_timeout(Duration::from_millis(2)) {
@@ -706,5 +754,21 @@ fn control(listener: UnixListener, ctl: Ctl) {
             };
             let _ = conn.write_all(reply.as_bytes());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combine_ducks;
+
+    #[test]
+    fn duck_sources_add_up_softly_and_skip_self() {
+        let s = vec![Some(vec![0.8]), Some(vec![0.5]), None];
+        assert!((combine_ducks(&s, 1, None)[0] - 0.9).abs() < 1e-6);
+        // a source isn't ducked by itself
+        assert!((combine_ducks(&s, 1, Some(0))[0] - 0.5).abs() < 1e-6);
+        assert!((combine_ducks(&s, 1, Some(2))[0] - 0.9).abs() < 1e-6);
+        assert_eq!(combine_ducks(&[Some(vec![1.0]), Some(vec![0.3])], 1, None)[0], 1.0);
+        assert_eq!(combine_ducks(&[None], 1, None)[0], 0.0);
     }
 }

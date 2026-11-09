@@ -74,8 +74,9 @@ pub struct State {
     pub click_db: f64,
     pub master_db: f64,
     pub master_peak: f32,
-    /// The shared duck envelope as heard now (its peak within the playing
-    /// block), 0..1.
+    /// The global duck level as heard now (its peak within the playing
+    /// block), 0..1: every generator's ducking combined. Effects are ducked
+    /// by this.
     pub duck: f32,
     pub ahead_ms: f64,
     pub underruns: u64,
@@ -117,6 +118,12 @@ pub struct Generator {
     /// How much the duck envelope turns this channel down, 0..1, as the
     /// generator declares it; null while not running.
     pub duck_sensitivity: Option<f64>,
+    /// How much this generator is ducking the others right now (its own
+    /// duck events' envelope, as heard), 0..1.
+    pub duck_source: f32,
+    /// How much the others are ducking it right now, 0..1, before its
+    /// sensitivity; the gain reduction is `duck_sensitivity × duck_level`.
+    pub duck_level: f32,
     /// Insert effects, by name, in signal order.
     pub inserts: Vec<String>,
     /// Post-fader send amounts (linear 0..1) to send effects, by name.
@@ -217,6 +224,8 @@ impl Generator {
             peak: g.peak,
             last_error: last_error_of(g),
             duck_sensitivity: g.duck_sensitivity(),
+            duck_source: g.duck.source,
+            duck_level: g.duck.level,
             inserts: g.inserts.clone(),
             sends: g.sends.clone(),
         }
