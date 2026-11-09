@@ -228,9 +228,39 @@ pub struct ParamDesc {
     pub unit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
+    /// Optional: how many bars this param slides over when randomized; 0
+    /// jumps. Unset means [`DEFAULT_RANDOM_GLIDE_BARS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random_glide_bars: Option<f64>,
 }
 
+/// Slide length for randomized params whose plugin doesn't say.
+pub const DEFAULT_RANDOM_GLIDE_BARS: f64 = 1.0;
+
 impl ParamDesc {
+    /// A random value in range: uniform for continuous params, even in
+    /// ratio for log params, a whole number for integer and choice params,
+    /// 50/50 for toggles.
+    pub fn random(&self, rng: &mut gen_api::Rng) -> f64 {
+        let v = match self.kind.as_str() {
+            "toggle" => {
+                if rng.chance(0.5) {
+                    self.max
+                } else {
+                    self.min
+                }
+            }
+            "integer" | "choice" => (self.min.round() + (rng.f() * (self.max.round() - self.min.round() + 1.0)).floor()).min(self.max.round()),
+            _ if self.log && self.min > 0.0 => (self.min.ln() + rng.f() * (self.max.ln() - self.min.ln())).exp(),
+            _ => rng.range(self.min, self.max),
+        };
+        self.clamp(v)
+    }
+
+    /// Slide length when randomized, in bars (0 = jump).
+    pub fn random_glide(&self) -> f64 {
+        self.random_glide_bars.filter(|b| b.is_finite() && *b >= 0.0).unwrap_or(DEFAULT_RANDOM_GLIDE_BARS)
+    }
     /// Clamps to the range; integer, toggle and choice params snap to
     /// whole numbers.
     pub fn clamp(&self, v: f64) -> f64 {
@@ -587,23 +617,40 @@ impl Slot {
     /// slide on it stops).
     pub fn set_values(&mut self, values: BTreeMap<String, f64>, glide_bars: Option<f64>) {
         for (id, to) in values {
-            match glide_bars {
-                Some(bars) => {
-                    let from = match self.params().and_then(|ps| ps.iter().find(|d| d.id == id)) {
-                        Some(d) => self.value_of(d),
-                        None => self.values.get(&id).copied().unwrap_or(to),
-                    };
-                    self.glides.insert(id.clone(), Glide { from, to, bars, start: None });
-                    // Until the next block renders, it's still where it was.
-                    self.glide_now.insert(id.clone(), from);
-                }
-                None => {
-                    self.glides.remove(&id);
-                    self.glide_now.remove(&id);
-                }
-            }
-            self.values.insert(id, to);
+            self.set_value(id, to, glide_bars);
         }
+    }
+
+    /// Randomizes every param of the running plugin: each slides to a new
+    /// random value over its own `random_glide_bars`. Returns false if the
+    /// plugin isn't running (its params are unknown).
+    pub fn randomize(&mut self, rng: &mut gen_api::Rng) -> bool {
+        let Some(params) = self.params().map(<[ParamDesc]>::to_vec) else { return false };
+        for d in params {
+            let bars = d.random_glide();
+            let to = d.random(rng);
+            self.set_value(d.id.clone(), to, (bars > 0.0).then_some(bars));
+        }
+        true
+    }
+
+    fn set_value(&mut self, id: String, to: f64, glide_bars: Option<f64>) {
+        match glide_bars {
+            Some(bars) => {
+                let from = match self.params().and_then(|ps| ps.iter().find(|d| d.id == id)) {
+                    Some(d) => self.value_of(d),
+                    None => self.values.get(&id).copied().unwrap_or(to),
+                };
+                self.glides.insert(id.clone(), Glide { from, to, bars, start: None });
+                // Until the next block renders, it's still where it was.
+                self.glide_now.insert(id.clone(), from);
+            }
+            None => {
+                self.glides.remove(&id);
+                self.glide_now.remove(&id);
+            }
+        }
+        self.values.insert(id, to);
     }
 
     pub fn channels(&self) -> Option<usize> {
@@ -954,6 +1001,31 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::{adapt_channels, Description, Entering, Entry};
+
+    #[test]
+    fn random_values_stay_in_range_and_respect_kinds() {
+        use super::ParamDesc;
+        let p = |kind: &str, min: f64, max: f64, log: bool| ParamDesc {
+            id: "p".into(), name: "p".into(), min, max, default: min, kind: kind.into(), log,
+            unit: String::new(), labels: None, random_glide_bars: None,
+        };
+        let mut rng = gen_api::Rng::new(7);
+        for _ in 0..500 {
+            let c = p("continuous", -2.0, 2.0, false).random(&mut rng);
+            assert!((-2.0..=2.0).contains(&c));
+            let f = p("continuous", 20.0, 20000.0, true).random(&mut rng);
+            assert!((20.0..=20000.0).contains(&f));
+            let i = p("integer", 1.0, 4.0, false).random(&mut rng);
+            assert!([1.0, 2.0, 3.0, 4.0].contains(&i));
+            let t = p("toggle", 0.0, 1.0, false).random(&mut rng);
+            assert!(t == 0.0 || t == 1.0);
+        }
+        // log params spread evenly in ratio: about half land below the
+        // geometric middle (~632 Hz), not in the top half of the Hz range
+        let below = (0..2000).filter(|_| p("continuous", 20.0, 20000.0, true).random(&mut rng) < 632.0).count();
+        assert!((800..1200).contains(&below), "{below}");
+        assert_eq!(p("continuous", 0.0, 1.0, false).random_glide(), 1.0);
+    }
 
     #[test]
     fn adapts_channel_counts() {

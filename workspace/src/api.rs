@@ -450,6 +450,11 @@ fn apply_params(g: &mut Slot, values: BTreeMap<String, f64>, glide_bars: Option<
     Ok(())
 }
 
+fn fresh_rng() -> gen_api::Rng {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+    gen_api::Rng::new(nanos)
+}
+
 /// Longest slide accepted, in bars.
 pub const MAX_GLIDE_BARS: f64 = 64.0;
 
@@ -722,6 +727,17 @@ impl Ctl {
         })?
     }
 
+    pub fn randomize_effect(&self, name: String) -> Result<Effect> {
+        let mut rng = fresh_rng();
+        self.on_mixer(move |m| {
+            let f = find_fx(m, &name)?;
+            if !f.randomize(&mut rng) {
+                return Err(ApiError::Conflict(format!("{name} isn't running; its parameters are unknown until it's back")));
+            }
+            Ok(Effect::of(f))
+        })?
+    }
+
     pub fn restart_effect(&self, name: String) -> Result<Effect> {
         self.on_mixer(move |m| {
             let f = find_fx(m, &name)?;
@@ -799,6 +815,19 @@ impl Ctl {
     fn is_effect(&self, name: &str) -> Result<bool> {
         let n = name.to_owned();
         self.on_mixer(move |m| m.fx.iter().any(|f| f.name == n))
+    }
+
+    /// Sets every parameter to a random value in its range; each slides
+    /// there over its own `random_glide_bars` (default 1 bar, 0 jumps).
+    pub fn randomize(&self, name: String) -> Result<Generator> {
+        let mut rng = fresh_rng();
+        self.on_mixer(move |m| {
+            let g = find(m, &name)?;
+            if !g.randomize(&mut rng) {
+                return Err(ApiError::Conflict(format!("{name} isn't running; its parameters are unknown until it's back")));
+            }
+            Ok(Generator::of(g))
+        })?
     }
 
     pub fn restart(&self, name: String) -> Result<Generator> {
@@ -881,6 +910,12 @@ impl Ctl {
                 let name = arg(0, "GENERATOR")?;
                 self.patch_generator(name.clone(), GeneratorPatch { solo: Some(cmd == "solo"), ..Default::default() })?;
                 Ok(format!("{name} {cmd}ed\n"))
+            }
+            "randomize" | "random" => {
+                let name = arg(0, "NAME")?;
+                let params = if self.is_effect(&name)? { self.randomize_effect(name.clone())?.params } else { self.randomize(name.clone())?.params };
+                let targets: Vec<String> = params.iter().map(|p| p.desc.id.clone()).collect();
+                Ok(format!("{name}: randomizing {}\n", targets.join(", ")))
             }
             "duck" => {
                 let name = arg(0, "NAME")?;

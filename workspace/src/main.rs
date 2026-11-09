@@ -58,6 +58,9 @@ commands (sent to the running daemon):
                              down, 0..1 (send effects: the whole return;
                              inserts: only what they add)
   params NAME                list a generator's or effect's parameters
+  randomize NAME             random values for all its params; each slides
+                             there over the time its plugin asks (default
+                             1 bar)
   set NAME PARAM VALUE [--glide BARS]
                              set one, e.g. ws set acid cutoff 0.5; with
                              --glide it slides there over that many bars

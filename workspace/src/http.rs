@@ -242,6 +242,8 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Ok(g) => reply(200, ctl.set_effect_params(name.to_string(), body!(), g)),
             Err(r) => r,
         },
+        ("POST", ["api", "generators", name, "randomize"]) => reply(200, ctl.randomize(name.to_string())),
+        ("POST", ["api", "effects", name, "randomize"]) => reply(200, ctl.randomize_effect(name.to_string())),
         ("POST", ["api", "effects", name, "restart"]) => reply(202, ctl.restart_effect(name.to_string())),
         ("POST", ["api", "generators", name, "restart"]) => reply(202, ctl.restart(name.to_string())),
         ("GET", ["api", "catalog"]) => Response::json(200, &ctl.catalog.list()),

@@ -398,6 +398,29 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "415": { $ref: "#/components/responses/UnsupportedMediaType" }
 
+  /api/effects/{name}/randomize:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      operationId: randomizeEffect
+      summary: Random values for all parameters, sliding there
+      description: |
+        The mixer picks a random value for every parameter: uniform in range
+        for continuous ones, even in ratio for `log` ones, a whole number for
+        integer and choice params, 50/50 for toggles. Each slides there over
+        its own `random_glide_bars` (declared by the plugin; default 1 bar,
+        0 jumps). Values follow the slide in the state, like setParams with
+        glide_bars. 409 while the plugin is restarting (its parameters are
+        unknown then).
+      responses:
+        "200":
+          description: Slides started; params show their current values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Effect" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
   /api/effects/{name}/restart:
     parameters:
       - $ref: "#/components/parameters/Name"
@@ -411,6 +434,29 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Effect" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/generators/{name}/randomize:
+    parameters:
+      - $ref: "#/components/parameters/Name"
+    post:
+      operationId: randomizeGenerator
+      summary: Random values for all parameters, sliding there
+      description: |
+        The mixer picks a random value for every parameter: uniform in range
+        for continuous ones, even in ratio for `log` ones, a whole number for
+        integer and choice params, 50/50 for toggles. Each slides there over
+        its own `random_glide_bars` (declared by the plugin; default 1 bar,
+        0 jumps). Values follow the slide in the state, like setParams with
+        glide_bars. 409 while the plugin is restarting (its parameters are
+        unknown then).
+      responses:
+        "200":
+          description: Slides started; params show their current values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generator" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /api/generators/{name}/restart:
     parameters:
@@ -689,6 +735,10 @@ components:
           type: array
           items: { type: string }
           description: Only for `choice`.
+        random_glide_bars:
+          type: number
+          minimum: 0
+          description: "Optional, declared by the plugin: bars this param slides over when randomized (0 jumps). Absent means 1."
         value: { type: number, description: "The value in use now (clamped); mid-slide, where the slide currently is." }
 
     NewGenerator:
