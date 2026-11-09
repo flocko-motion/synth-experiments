@@ -275,11 +275,16 @@ pub struct Param {
     /// Hint for UIs: map knob travel logarithmically (frequencies, times).
     pub log: bool,
     pub unit: &'static str,
+    /// How long the host slides this param to a new value when it
+    /// randomizes, in bars; 0 jumps. None leaves it to the host (the
+    /// workspace: 1 bar). Integer, toggle and choice params switch at the
+    /// end of the slide, so give them 0 to switch at once.
+    pub random_glide_bars: Option<f64>,
 }
 
 impl Param {
     pub const fn continuous(id: &'static str, name: &'static str, min: f64, max: f64, default: f64) -> Param {
-        Param { id, name, min, max, default, kind: ParamKind::Continuous, log: false, unit: "" }
+        Param { id, name, min, max, default, kind: ParamKind::Continuous, log: false, unit: "", random_glide_bars: None }
     }
 
     pub const fn integer(id: &'static str, name: &'static str, min: i64, max: i64, default: i64) -> Param {
@@ -301,6 +306,12 @@ impl Param {
 
     pub const fn unit(self, unit: &'static str) -> Param {
         Param { unit, ..self }
+    }
+
+    /// Slide time when the host randomizes, in bars; 0 jumps. See
+    /// [`Param::random_glide_bars`].
+    pub const fn glide(self, bars: f64) -> Param {
+        Param { random_glide_bars: Some(bars), ..self }
     }
 
     /// Clamp a value into range and round it as the kind requires.
@@ -439,8 +450,12 @@ pub fn describe_json(g: &dyn Generator) -> String {
                 }
                 _ => String::new(),
             };
+            let glide = match p.random_glide_bars {
+                Some(b) if b.is_finite() && b >= 0.0 => format!(",\"random_glide_bars\":{}", json_num(b)),
+                _ => String::new(),
+            };
             format!(
-                "{{\"id\":{},\"name\":{},\"min\":{},\"max\":{},\"default\":{},\"kind\":\"{}\",\"log\":{},\"unit\":{}{}}}",
+                "{{\"id\":{},\"name\":{},\"min\":{},\"max\":{},\"default\":{},\"kind\":\"{}\",\"log\":{},\"unit\":{}{}{}}}",
                 json_str(p.id),
                 json_str(p.name),
                 json_num(p.min),
@@ -449,7 +464,8 @@ pub fn describe_json(g: &dyn Generator) -> String {
                 p.kind_name(),
                 p.log,
                 json_str(p.unit),
-                labels
+                labels,
+                glide
             )
         })
         .collect();

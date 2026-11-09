@@ -249,6 +249,7 @@ fn params(&self) -> &'static [Param] { &PARAMS }
 | `min`, `max`, `default` | Plain units. |
 | `kind` | `Continuous`, `Integer`, `Toggle` (0/1) or `Choice(labels)` (index). |
 | `log` | UI hint: map knob travel logarithmically. |
+| `random_glide_bars` | Optional, set with `.glide(bars)`: how long the host slides to a new value when it randomizes, in bars; 0 jumps. Left out, the host decides (the workspace: 1 bar). Integer, toggle and choice params switch at the end of the slide, so give them 0. In the description JSON only when set. |
 
 Rules:
 
