@@ -17,7 +17,7 @@ class WsApp extends LitElement {
     connected: { state: true },
     toasts: { state: true },
     catalog: { state: true },
-    localOrder: { state: true }, // { generator: [names], return: [names] } until the API keeps order
+    localOrder: { state: true }, // a just-dropped order, shown until the daemon confirms it
   };
 
   static styles = css`
@@ -55,10 +55,11 @@ class WsApp extends LitElement {
     this.connected = false;
     this.toasts = [];
     this.catalog = [];
-    try { this.localOrder = JSON.parse(localStorage.getItem('ws-strip-order') || '{}'); } catch { this.localOrder = {}; }
+    this.localOrder = {};
+    try { localStorage.removeItem('ws-strip-order'); } catch {} // the old browser-kept order
   }
 
-  /** Applies a browser-kept order (if any) on top of the daemon's order. */
+  /** Applies a just-dropped order (if any) on top of the daemon's order. */
   ordered(list, kind) {
     const order = this.localOrder?.[kind];
     if (!order?.length) return list;
@@ -100,23 +101,21 @@ class WsApp extends LitElement {
     const names = list.map((g) => g.name).filter((n) => n !== d.name);
     let i = names.indexOf(strip.gen.name) + (side === 'after' ? 1 : 0);
     names.splice(i, 0, d.name);
-    // Show it right away; the daemon's order replaces this once it keeps order.
+    // Show it right away, until the daemon's order (in the state) has it.
     this.setLocalOrder(d.kind, names);
     try {
       if (d.kind === 'return') await api.patchEffect(d.name, { position: i });
       else await api.patch(d.name, { position: i });
-      this.setLocalOrder(d.kind, null); // the daemon has it
     } catch (err) {
-      if (err.status !== 400) this.toast(`${d.name}: ${err.message}`);
-      // 400: the daemon doesn't keep order yet; keep it in this browser.
+      this.toast(`${d.name}: ${err.message}`);
     }
+    this.setLocalOrder(d.kind, null);
   }
 
   setLocalOrder(kind, names) {
     const next = { ...this.localOrder };
     if (names) next[kind] = names; else delete next[kind];
     this.localOrder = next;
-    try { localStorage.setItem('ws-strip-order', JSON.stringify(next)); } catch {}
   }
 
   connectedCallback() {
