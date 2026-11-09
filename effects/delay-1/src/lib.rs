@@ -30,13 +30,13 @@ const TIME_BEATS: [f64; 7] = [0.25, 1.0 / 3.0, 0.5, 0.75, 1.0, 1.5, 2.0];
 const MODES: &[&str] = &["ping-pong", "stereo"];
 
 const PARAMS: [Param; 8] = [
-    Param::choice("time", "Time", TIMES, 3), // dotted 8th, the psy default
-    Param::choice("mode", "Mode", MODES, 0),
+    Param::choice("time", "Time", TIMES, 3).glide(0.0), // dotted 8th, the psy default
+    Param::choice("mode", "Mode", MODES, 0).glide(0.0),
     Param::continuous("feedback", "Feedback", 0.0, 0.95, 0.45),
     Param::continuous("mix", "Mix", 0.0, 1.0, 1.0),
-    Param::continuous("lowcut", "Low cut", 20.0, 2000.0, 300.0).log().unit("Hz"),
-    Param::continuous("highcut", "High cut", 1000.0, 16000.0, 4500.0).log().unit("Hz"),
-    Param::continuous("width", "Width", 0.0, 1.0, 1.0),
+    Param::continuous("lowcut", "Low cut", 20.0, 2000.0, 300.0).log().unit("Hz").glide(2.0),
+    Param::continuous("highcut", "High cut", 1000.0, 16000.0, 4500.0).log().unit("Hz").glide(2.0),
+    Param::continuous("width", "Width", 0.0, 1.0, 1.0).glide(2.0),
     Param::continuous("drive", "Drive", 0.5, 4.0, 1.0).unit("x"),
 ];
 

@@ -20,11 +20,11 @@ const WIDTH: usize = 5;
 
 const PARAMS: [Param; 6] = [
     Param::continuous("mix", "Mix", 0.0, 1.0, 1.0),
-    Param::continuous("decay", "Decay", 0.3, 12.0, 2.5).log().unit("s"),
-    Param::continuous("damp", "Damping", 1000.0, 16000.0, 6000.0).log().unit("Hz"),
+    Param::continuous("decay", "Decay", 0.3, 12.0, 2.5).log().unit("s").glide(2.0),
+    Param::continuous("damp", "Damping", 1000.0, 16000.0, 6000.0).log().unit("Hz").glide(2.0),
     Param::continuous("lowcut", "Low cut", 20.0, 1000.0, 200.0).log().unit("Hz"),
-    Param::continuous("predelay", "Predelay", 0.0, 250.0, 20.0).unit("ms"),
-    Param::continuous("width", "Width", 0.0, 1.0, 1.0),
+    Param::continuous("predelay", "Predelay", 0.0, 250.0, 20.0).unit("ms").glide(0.0),
+    Param::continuous("width", "Width", 0.0, 1.0, 1.0).glide(2.0),
 ];
 
 const MAX_PREDELAY_MS: f64 = 260.0;

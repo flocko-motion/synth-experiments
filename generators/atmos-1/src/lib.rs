@@ -34,12 +34,12 @@ const SPACE: usize = 4;
 const DRIVE: usize = 5;
 
 const PARAMS: [Param; 6] = [
-    Param::continuous("brightness", "Brightness", -2.0, 2.0, 0.0).unit("oct"),
+    Param::continuous("brightness", "Brightness", -2.0, 2.0, 0.0).unit("oct").glide(4.0),
     // How far the filter swell and LFO move.
-    Param::continuous("motion", "Motion", 0.0, 1.0, 0.5),
-    Param::continuous("width", "Width", 0.0, 1.0, 0.7),
-    Param::continuous("air", "Air", 0.0, 1.0, 0.3),
-    Param::continuous("space", "Reverb mix", 0.0, 1.0, 0.35),
+    Param::continuous("motion", "Motion", 0.0, 1.0, 0.5).glide(2.0),
+    Param::continuous("width", "Width", 0.0, 1.0, 0.7).glide(2.0),
+    Param::continuous("air", "Air", 0.0, 1.0, 0.3).glide(4.0),
+    Param::continuous("space", "Reverb mix", 0.0, 1.0, 0.35).glide(2.0),
     Param::continuous("drive", "Drive", 0.5, 4.0, 1.0).unit("x"),
 ];
 

@@ -24,7 +24,7 @@ const FILLS: usize = 6;
 
 const PARAMS: [Param; 7] = [
     // Semitones away from the key's root.
-    Param::integer("tune", "Tune", -12, 12, 0).unit("st"),
+    Param::integer("tune", "Tune", -12, 12, 0).unit("st").glide(0.0),
     // Depth of the body's pitch drop.
     Param::continuous("punch", "Punch", 0.0, 1.0, 0.5),
     Param::continuous("sweep", "Sweep", 5.0, 60.0, 18.0).log().unit("ms"),
@@ -32,7 +32,7 @@ const PARAMS: [Param; 7] = [
     Param::continuous("length", "Length", 0.5, 3.0, 1.05).unit("16th"),
     Param::continuous("click", "Click", 0.0, 1.0, 0.35),
     Param::continuous("drive", "Drive", 0.5, 4.0, 1.25).unit("x"),
-    Param::toggle("fills", "Fills", true),
+    Param::toggle("fills", "Fills", true).glide(0.0),
 ];
 
 /// Soft clip, then a -1 dBFS ceiling.

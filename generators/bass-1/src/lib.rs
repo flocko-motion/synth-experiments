@@ -33,8 +33,8 @@ const FILLS: usize = 7;
 const PATTERN_NAMES: &[&str] = &["auto", "rolling", "gallop", "skip", "triplet", "offbeat"];
 
 const PARAMS: [Param; 8] = [
-    Param::choice("pattern", "Pattern", PATTERN_NAMES, 0),
-    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct"),
+    Param::choice("pattern", "Pattern", PATTERN_NAMES, 0).glide(0.0),
+    Param::continuous("cutoff", "Cutoff offset", -2.0, 2.0, 0.0).unit("oct").glide(2.0),
     Param::continuous("resonance", "Resonance offset", -0.3, 0.35, 0.0),
     // Filter envelope depth, times the phrase's own.
     Param::continuous("env", "Envelope", 0.0, 2.0, 1.0).unit("x"),
@@ -43,7 +43,7 @@ const PARAMS: [Param; 8] = [
     // How often the motif leaves the root, times the phrase's own.
     Param::continuous("spice", "Spice", 0.0, 3.0, 1.0).unit("x"),
     Param::continuous("drive", "Drive", 0.5, 4.0, 1.25).unit("x"),
-    Param::toggle("fills", "Fills", true),
+    Param::toggle("fills", "Fills", true).glide(0.0),
 ];
 
 /// Which of the three off-beat 16ths carry a note, and how often "auto"
