@@ -1,0 +1,8 @@
+[package]
+name = "laserhat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dsp = { path = "../../crates/dsp" }
+gen-api = { path = "../../crates/gen-api" }

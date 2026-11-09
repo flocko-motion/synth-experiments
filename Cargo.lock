@@ -418,6 +418,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "laserhat"
+version = "0.1.0"
+dependencies = [
+ "dsp",
+ "gen-api",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
