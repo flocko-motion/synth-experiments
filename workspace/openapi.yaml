@@ -589,7 +589,7 @@ components:
 
     Generator:
       type: object
-      required: [name, command, description, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
+      required: [name, command, description, category, channels, inputs, params, gain_db, muted, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -599,6 +599,11 @@ components:
         description:
           type: string
           description: From the generator itself; empty while not running.
+        category:
+          description: From the generator; null while not running.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Category"
         channels:
           type: [integer, "null"]
           description: 1 (mono) or 2 (stereo); null while not running.
@@ -703,6 +708,16 @@ components:
               - type: "null"
               - { type: number, minimum: 0, maximum: 1 }
 
+    Category:
+      type: string
+      description: |
+        What kind of plugin, declared by the plugin, for grouping and sorting.
+        A short lowercase word; `other` if the plugin doesn't say. Known ones,
+        in display order: generators `drums`, `bass`, `lead`, `pad`, `fx`;
+        effects `dynamics`, `filter`, `distortion`, `modulation`, `delay`,
+        `reverb`; then `other`. Sort unknown ones after the known ones.
+      examples: [drums, bass, pad, reverb]
+
     Entry:
       type: object
       additionalProperties: false
@@ -731,11 +746,16 @@ components:
 
     Effect:
       type: object
-      required: [name, command, description, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity]
+      required: [name, command, description, category, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command: { type: array, items: { type: string } }
         description: { type: string }
+        category:
+          description: From the effect; null while not running.
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Category"
         role:
           type: string
           enum: [send, insert]
@@ -808,11 +828,12 @@ components:
 
     CatalogEntry:
       type: object
-      required: [name, kind, description, channels, inputs, params, duck_sensitivity, entry, path]
+      required: [name, kind, description, category, channels, inputs, params, duck_sensitivity, entry, path]
       properties:
         name: { type: string, description: "Pass as `generator` to addGenerator, or as `effect` to addSendEffect/addInsert." }
         kind: { type: string, enum: [generator, effect] }
         description: { type: string }
+        category: { $ref: "#/components/schemas/Category" }
         channels: { type: integer }
         inputs: { type: integer, description: Non-zero for effects. }
         duck_sensitivity: { type: number, minimum: 0, maximum: 1 }

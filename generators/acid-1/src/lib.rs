@@ -437,6 +437,10 @@ impl Generator for Acid {
         0.6
     }
 
+    fn category(&self) -> &'static str {
+        "lead"
+    }
+
     /// The line starts on the downbeat.
     fn entry(&self) -> Entry {
         Entry::Bar

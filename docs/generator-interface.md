@@ -40,7 +40,10 @@ pub trait Generator {
 ### Discovery: `Info`
 
 Besides `Info`, a plugin can override `params()` (see
-[Parameters](#parameters)) and `inputs()` (see [Effects](#effects)).
+[Parameters](#parameters)), `inputs()` (see [Effects](#effects)),
+`category()` (see [Category](#category)), `duck_sensitivity()` (see
+[Events and ducking](#events-and-ducking)) and `entry()` (see
+[Entry](#entry)).
 
 | Field | Meaning |
 |---|---|
@@ -291,6 +294,34 @@ whose release and curve are mix settings:
 The mixer gets every chunk of a block before mixing, so a duck can apply in
 the same block, sample-accurate. Adjustable sensitivity per channel is
 captured in [ideas.md](ideas.md).
+
+## Category
+
+Every plugin, generator or effect, names its category with
+`Generator::category` (in the description JSON as `category`), so a host
+can group and sort them: a mixer's channel strips, a catalog to add from.
+It's a short lowercase word. `gen_api::CATEGORIES` lists the known ones in
+display order:
+
+| Kind | Categories |
+|---|---|
+| Generators | `drums`, `bass`, `lead`, `pad`, `fx` |
+| Effects | `dynamics`, `filter`, `distortion`, `modulation`, `delay`, `reverb` |
+| Either | `other` (the default) |
+
+| Plugin | Category |
+|---|---|
+| percussion | drums |
+| psybass | bass (it plays the kick too) |
+| acid | lead |
+| atmos | pad |
+| duck | dynamics |
+| delay | delay |
+| reverb | reverb |
+
+Pick a known category when one fits; a new word is allowed and sorts after
+the known ones. Hosts treat a missing or empty category as `other`, so the
+field needed no new protocol version.
 
 ## Entry
 

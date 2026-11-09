@@ -306,6 +306,10 @@ impl Generator for Atmos {
         0.9
     }
 
+    fn category(&self) -> &'static str {
+        "pad"
+    }
+
     /// A pad swells in rather than appearing.
     fn entry(&self) -> Entry {
         Entry::Fade { bars: 4.0 }

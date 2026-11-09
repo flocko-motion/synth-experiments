@@ -433,6 +433,10 @@ impl Generator for Percussion {
         0.2
     }
 
+    fn category(&self) -> &'static str {
+        "drums"
+    }
+
     /// Patterns start on the downbeat.
     fn entry(&self) -> Entry {
         Entry::Bar

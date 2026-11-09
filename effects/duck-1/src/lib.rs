@@ -51,6 +51,10 @@ impl Generator for Duck {
         0.0
     }
 
+    fn category(&self) -> &'static str {
+        "dynamics"
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let tr = &ctx.transport;
         let spb = tr.samples_per_beat(ctx.sample_rate);

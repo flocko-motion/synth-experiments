@@ -95,6 +95,10 @@ impl Generator for Delay {
         0.5
     }
 
+    fn category(&self) -> &'static str {
+        "delay"
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let sr = self.sr;
         let target = TIME_BEATS[ctx.param(TIME) as usize] * ctx.transport.samples_per_beat(sr);

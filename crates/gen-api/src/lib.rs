@@ -362,6 +362,11 @@ pub enum EventKind {
     Duck { strength: f32 },
 }
 
+/// The categories hosts know, in the order a UI lists them: generators
+/// first, then effects. Anything else sorts after these, as does `other`.
+pub const CATEGORIES: &[&str] =
+    &["drums", "bass", "lead", "pad", "fx", "dynamics", "filter", "distortion", "modulation", "delay", "reverb", "other"];
+
 /// How a generator wants to come in when it's added to a mix that's already
 /// playing. The host applies it; the generator just plays as usual.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -398,6 +403,12 @@ pub trait Generator {
     /// plugin.
     fn duck_sensitivity(&self) -> f64 {
         0.0
+    }
+
+    /// What kind of plugin this is, so hosts can group and sort them. A
+    /// short lowercase word; use one of [`CATEGORIES`] when one fits.
+    fn category(&self) -> &'static str {
+        "other"
     }
 
     /// How the host brings this generator into a running mix. Effects
@@ -443,11 +454,12 @@ pub fn describe_json(g: &dyn Generator) -> String {
         })
         .collect();
     format!(
-        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"duck_sensitivity\":{},\"entry\":{},\"params\":[{}]}}",
+        "{{\"name\":{},\"description\":{},\"channels\":{},\"inputs\":{},\"category\":{},\"duck_sensitivity\":{},\"entry\":{},\"params\":[{}]}}",
         json_str(info.name),
         json_str(info.description),
         info.channels,
         g.inputs(),
+        json_str(g.category()),
         json_num(g.duck_sensitivity().clamp(0.0, 1.0)),
         match g.entry() {
             Entry::Now => "{\"mode\":\"now\"}".to_owned(),

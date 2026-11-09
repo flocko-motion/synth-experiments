@@ -3,7 +3,7 @@
 //! way `gen-api`'s CLI does. A freshly built generator shows up without restarting the
 //! daemon. Answers are cached per binary until it's rebuilt.
 
-use crate::gen::{lenient_entry, Entry as EntryMode, ParamDesc};
+use crate::gen::{lenient_category, lenient_entry, other, Entry as EntryMode, ParamDesc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +22,7 @@ pub struct Entry {
     /// "generator" or "effect" (has inputs).
     pub kind: &'static str,
     pub description: String,
+    pub category: String,
     pub channels: u16,
     pub inputs: u16,
     pub params: Vec<ParamDesc>,
@@ -33,6 +34,8 @@ pub struct Entry {
 #[derive(Deserialize)]
 struct Info {
     description: String,
+    #[serde(default = "other", deserialize_with = "lenient_category")]
+    category: String,
     channels: u16,
     #[serde(default)]
     inputs: u16,
@@ -124,6 +127,7 @@ fn ask_info(path: &Path, file: &str) -> Option<Entry> {
         name: file.to_owned(),
         kind: if info.inputs > 0 { "effect" } else { "generator" },
         description: info.description,
+        category: info.category,
         channels: info.channels,
         inputs: info.inputs,
         params: info.params,

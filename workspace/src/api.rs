@@ -109,6 +109,8 @@ pub struct Generator {
     pub command: Vec<String>,
     /// From the generator's handshake; empty while it isn't running.
     pub description: String,
+    /// From the plugin, for grouping and sorting; null while not running.
+    pub category: Option<String>,
     pub channels: Option<usize>,
     /// Input channels (effects); null while not running.
     pub inputs: Option<usize>,
@@ -148,6 +150,8 @@ pub struct Effect {
     pub name: String,
     pub command: Vec<String>,
     pub description: String,
+    /// From the plugin, for grouping and sorting; null while not running.
+    pub category: Option<String>,
     /// "send": its own bus, fed by every generator's send to it and
     /// returned through its fader. "insert": in `owner`'s chain.
     pub role: &'static str,
@@ -187,6 +191,7 @@ impl Effect {
             name: f.name.clone(),
             command: f.spec.argv.clone(),
             description: f.description().unwrap_or_default().to_owned(),
+            category: f.category().map(str::to_owned),
             role: if f.owner.is_some() { "insert" } else { "send" },
             owner: f.owner.clone(),
             channels: f.channels(),
@@ -225,6 +230,7 @@ impl Generator {
             name: g.name.clone(),
             command: g.spec.argv.clone(),
             description: g.description().unwrap_or_default().to_owned(),
+            category: g.category().map(str::to_owned),
             channels: g.channels(),
             inputs: g.inputs(),
             params: params_of(g),

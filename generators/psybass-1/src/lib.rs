@@ -320,6 +320,11 @@ impl Generator for Psybass {
         0.0
     }
 
+    /// Kick and rolling bass; sorted with the bass.
+    fn category(&self) -> &'static str {
+        "bass"
+    }
+
     /// Kick and bass come in on the downbeat.
     fn entry(&self) -> Entry {
         Entry::Bar

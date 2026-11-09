@@ -100,9 +100,24 @@ pub struct Description {
     /// How much the mixer's duck envelope turns this plugin down, 0..1.
     #[serde(default)]
     pub duck_sensitivity: f64,
+    /// What kind of plugin, for grouping and sorting; `other` if it
+    /// doesn't say.
+    #[serde(default = "other", deserialize_with = "lenient_category")]
+    pub category: String,
     /// How the generator wants to come into a running mix.
     #[serde(default, deserialize_with = "lenient_entry")]
     pub entry: Entry,
+}
+
+pub fn other() -> String {
+    "other".into()
+}
+
+/// A plugin's category, trimmed and lowercased; missing, empty or not a
+/// string counts as `other`.
+pub fn lenient_category<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).unwrap_or_else(other))
 }
 
 /// How a generator comes into the mix when it's added (`entry` in the
@@ -469,6 +484,13 @@ impl Slot {
     pub fn params(&self) -> Option<&[ParamDesc]> {
         match &self.state {
             State::Running(p) => Some(&p.desc.params),
+            _ => None,
+        }
+    }
+
+    pub fn category(&self) -> Option<&str> {
+        match &self.state {
+            State::Running(p) => Some(&p.desc.category),
             _ => None,
         }
     }
@@ -903,5 +925,14 @@ mod tests {
         let second = e.block(5.0, 0.25, true, 4, 8).unwrap();
         assert!(second[0] > first[7] && second[7] < 1.0);
         assert_eq!(e.block(7.0, 0.25, true, 4, 8), None);
+    }
+
+    #[test]
+    fn parses_category_leniently() {
+        let d = |e: &str| serde_json::from_str::<Description>(&format!(r#"{{"name":"x"{e}}}"#)).unwrap().category;
+        assert_eq!(d(""), "other");
+        assert_eq!(d(r#","category":"Drums ""#), "drums");
+        assert_eq!(d(r#","category":"""#), "other");
+        assert_eq!(d(r#","category":3"#), "other");
     }
 }

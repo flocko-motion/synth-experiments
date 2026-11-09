@@ -83,6 +83,10 @@ impl Generator for ReverbFx {
         0.6
     }
 
+    fn category(&self) -> &'static str {
+        "reverb"
+    }
+
     fn process(&mut self, ctx: &Context, out: &mut [f32]) {
         let sr = self.sr;
         let settings = (ctx.param(DECAY), ctx.param(DAMP));
