@@ -79,7 +79,7 @@ curl -s -N $A/api/events                                 # live state + log (SSE
   re-anchored on tempo, transport and seek changes, so position never
   drifts. Changes apply at the render head, so you hear them `--ahead` ms
   later.
-- **Click**: a beep per beat. Pitch and level rise for bar, cycle and epoch
+- **Click**: off by default (`ws daemon --click` to start with it on). A beep per beat. Pitch and level rise for bar, cycle and epoch
   starts. `ws click on|off`, `ws gain click DB`.
 - **Sample rate** is the device's (44.1 kHz on the built-in output), passed
   to generators in the hello.

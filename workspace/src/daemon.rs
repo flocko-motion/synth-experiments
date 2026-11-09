@@ -275,6 +275,12 @@ impl Mixer {
         self.beat_at(self.played.load(Ordering::Relaxed))
     }
 
+    /// Frames between what's playing and the next frame to render: how far
+    /// ahead a change takes effect.
+    fn lead_frames(&self) -> u64 {
+        self.frame.saturating_sub(self.played.load(Ordering::Relaxed))
+    }
+
     /// The duck envelope as heard now (the block that is playing).
     fn audible_duck(&self) -> f32 {
         let played = self.played.load(Ordering::Relaxed);
@@ -309,6 +315,8 @@ impl Mixer {
             master_peak: self.master_peak,
             duck: self.audible_duck(),
             ahead_ms: self.ahead_frames as f64 * 1000.0 / self.sample_rate as f64,
+            latency_ms: self.lead_frames() as f64 * 1000.0 / self.sample_rate as f64,
+            latency_beats: self.lead_frames() as f64 / self.samples_per_beat(),
             underruns: self.underruns.load(Ordering::Relaxed),
             sample_rate: self.sample_rate,
             generators: self.gens.iter().map(api::Generator::of).collect(),
@@ -318,7 +326,7 @@ impl Mixer {
 
     pub fn status(&self) -> String {
         let mut s = format!(
-            "{} {}   {} bpm   {} {}   click {}   master {:+.1} dB   ahead {:.0} ms   underruns {}\n",
+            "{} {}   {} bpm   {} {}   click {}   master {:+.1} dB   ahead {:.0} ms ({:.2} beats)   underruns {}\n",
             if self.playing { "▶" } else { "■" },
             self.audible_position(),
             fmt_num(self.bpm),
@@ -326,7 +334,8 @@ impl Mixer {
             self.tonality.scale.name(),
             if self.click_on { format!("{:+.1} dB", self.click_db) } else { "off".into() },
             self.master_db,
-            self.ahead_frames as f64 * 1000.0 / self.sample_rate as f64,
+            self.lead_frames() as f64 * 1000.0 / self.sample_rate as f64,
+            self.lead_frames() as f64 / self.samples_per_beat(),
             self.underruns.load(Ordering::Relaxed),
         );
         if self.gens.is_empty() {

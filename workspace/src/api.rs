@@ -78,7 +78,14 @@ pub struct State {
     /// block), 0..1: every generator's ducking combined. Effects are ducked
     /// by this.
     pub duck: f32,
+    /// Target size of the render-ahead buffer.
     pub ahead_ms: f64,
+    /// How far in the future a change lands right now: from what's playing
+    /// to where the mixer renders next. Varies around `ahead_ms`; the audio
+    /// device's own small buffer comes on top.
+    pub latency_ms: f64,
+    /// The same in beats at the current tempo.
+    pub latency_beats: f64,
     pub underruns: u64,
     pub sample_rate: u32,
     pub generators: Vec<Generator>,

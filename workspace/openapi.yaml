@@ -531,7 +531,7 @@ components:
 
     State:
       type: object
-      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, duck, ahead_ms, underruns, sample_rate, generators, effects]
+      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, duck, ahead_ms, latency_ms, latency_beats, underruns, sample_rate, generators, effects]
       properties:
         playing: { type: boolean }
         position: { $ref: "#/components/schemas/Position" }
@@ -544,7 +544,9 @@ components:
         master_db: { $ref: "#/components/schemas/Decibels" }
         master_peak: { $ref: "#/components/schemas/Peak" }
         duck: { type: number, minimum: 0, maximum: 1, description: "The global duck level as heard now (its peak in the playing block): every source combined. Effects are ducked by this." }
-        ahead_ms: { type: number, description: How far ahead the mixer renders. }
+        ahead_ms: { type: number, description: "Target size of the render-ahead buffer (--ahead)." }
+        latency_ms: { type: number, minimum: 0, description: "How far in the future a change lands right now: from what's playing to where the mixer renders next. Varies around ahead_ms; the audio device's own few ms come on top." }
+        latency_beats: { type: number, minimum: 0, description: "latency_ms in beats at the current tempo." }
         underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
         sample_rate: { type: integer }
         generators:

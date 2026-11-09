@@ -25,11 +25,12 @@ use std::path::PathBuf;
 fn usage() -> String {
     format!(
         "\
-usage: ws daemon [--bpm N] [--key ROOT] [--scale NAME] [--ahead MS] [--no-click]
+usage: ws daemon [--bpm N] [--key ROOT] [--scale NAME] [--ahead MS] [--click]
                  [--http ADDR | --no-http] [--catalog DIR] [--ui DIR]
        ws COMMAND [ARGS...]
 
 daemon options:
+  --click         start with the metronome on (off by default; ws click on)
   --http ADDR     serve the HTTP API here (default {DEFAULT_HTTP}, loopback only)
   --catalog DIR   where to look for generator binaries (default target/release)
   --ui DIR        serve the web UI from this directory at / (default workspace/ui)
@@ -102,7 +103,7 @@ fn run_daemon(args: &[String]) {
         bpm: 148.0,
         tonality: Tonality { root: 2, scale: Scale::Phrygian },
         ahead_ms: 200.0,
-        click: true,
+        click: false,
         http: Some(DEFAULT_HTTP.parse().unwrap()),
         catalog: PathBuf::from("target/release"),
         ui: PathBuf::from("workspace/ui"),
@@ -115,7 +116,8 @@ fn run_daemon(args: &[String]) {
             "--key" => opts.tonality.root = Tonality::parse_root(&val()).unwrap_or_else(|| fail("--key takes a note name like F# or Bb")),
             "--scale" => opts.tonality.scale = Scale::parse(&val()).unwrap_or_else(|| fail(&format!("--scale takes one of {}", api::scale_names()))),
             "--ahead" => opts.ahead_ms = val().parse().ok().filter(|ms| (20.0..=5000.0).contains(ms)).unwrap_or_else(|| fail("--ahead takes 20-5000 ms")),
-            "--no-click" => opts.click = false,
+            "--click" => opts.click = true,
+            "--no-click" => opts.click = false, // the default; kept for old scripts
             "--http" => opts.http = Some(val().parse().unwrap_or_else(|_| fail("--http takes an address like 127.0.0.1:7700"))),
             "--no-http" => opts.http = None,
             "--catalog" => opts.catalog = PathBuf::from(val()),
