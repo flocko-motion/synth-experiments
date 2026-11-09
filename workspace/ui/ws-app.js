@@ -1,5 +1,5 @@
-// The page: transport on top, the catalog on the left, the channel strips
-// and master on the right. Owns the live state from the event stream and
+// The page: transport on top, the catalog on the left, then the channel
+// strips, the send effects' return strips and the master. Owns the live state from the event stream and
 // hands it down; components send changes straight to the API and the next
 // state event confirms them.
 
@@ -16,21 +16,22 @@ class WsApp extends LitElement {
     state: { state: true },
     connected: { state: true },
     toasts: { state: true },
+    catalog: { state: true },
   };
 
   static styles = css`
     :host { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
-    .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
+    .body { display: grid; grid-template-columns: 210px 1fr; min-height: 0; }
     ws-catalog { border-right: 1px solid var(--edge); min-height: 0; }
     .board { display: flex; min-width: 0; min-height: 0; }
     .strips {
       flex: 1; display: flex; gap: 8px; padding: 12px;
-      overflow-x: auto; overflow-y: hidden; align-items: stretch;
+      overflow: auto; align-items: flex-start;
     }
-    ws-master { border-left: 1px solid var(--edge); padding: 12px; }
-    .empty {
-      margin: auto; color: var(--dim); text-align: center; max-width: 280px;
+    .row {
+      display: flex; gap: 8px; align-items: stretch; flex: 1 0 auto;
     }
+    .returns { display: flex; gap: 8px; padding-left: 12px; border-left: 1px dashed var(--edge); }
     .offline {
       position: fixed; inset: auto 0 0 0; padding: 8px 16px; text-align: center;
       background: #3a1515; color: #fecaca; font-size: 13px;
@@ -44,7 +45,6 @@ class WsApp extends LitElement {
       .body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
       ws-catalog { border-right: 0; border-bottom: 1px solid var(--edge); max-height: 35vh; }
       .board { flex-direction: column; }
-      ws-master { border-left: 0; border-top: 1px solid var(--edge); }
     }
   `;
 
@@ -53,6 +53,7 @@ class WsApp extends LitElement {
     this.state = null;
     this.connected = false;
     this.toasts = [];
+    this.catalog = [];
   }
 
   connectedCallback() {
@@ -91,20 +92,41 @@ class WsApp extends LitElement {
     }
   }
 
+  async addSend(e) {
+    const { effect, done } = e.detail;
+    try {
+      await api.addSend({ effect });
+    } catch (err) {
+      this.toast(`${effect}: ${err.message}`);
+    } finally {
+      done?.();
+    }
+  }
+
   render() {
     const s = this.state;
     const gens = s?.generators ?? [];
+    const effects = s?.effects ?? [];
+    const byName = new Map(effects.map((fx) => [fx.name, fx]));
+    const returns = effects.filter((fx) => fx.role === 'send');
+    const sendTo = returns;
+    const fxCatalog = this.catalog.filter((c) => c.kind === 'effect');
+    const insertsOf = (g) => (g.inserts ?? []).map((n) => byName.get(n)).filter(Boolean);
     return html`
       <ws-transport .state=${s}></ws-transport>
       <div class="body">
-        <ws-catalog @add=${this.add}></ws-catalog>
+        <ws-catalog @add=${this.add} @add-send=${this.addSend} @catalog=${(e) => (this.catalog = e.detail)}></ws-catalog>
         <div class="board">
-          <div class="strips">
-            ${gens.length === 0
-              ? html`<p class="empty">No channels yet. Add a generator from the list; the same one can be added more than once.</p>`
-              : repeat(gens, (g) => g.name, (g) => html`<ws-channel .gen=${g}></ws-channel>`)}
-          </div>
-          <ws-master .state=${s}></ws-master>
+          <div class="strips"><div class="row">
+            ${repeat(gens, (g) => g.name, (g) => html`
+              <ws-channel kind="generator" .gen=${g} .sendTo=${sendTo} .inserts=${insertsOf(g)} .fxCatalog=${fxCatalog}></ws-channel>`)}
+            ${returns.length
+              ? html`<div class="returns">
+                  ${repeat(returns, (fx) => fx.name, (fx) => html`<ws-channel kind="return" .gen=${fx} .duck=${s.duck}></ws-channel>`)}
+                </div>`
+              : ''}
+            <ws-master .state=${s}></ws-master>
+          </div></div>
         </div>
       </div>
       ${this.connected ? '' : html`<div class="offline">Not connected to the workspace daemon; retrying…</div>`}

@@ -32,6 +32,7 @@ async function call(method, path, body) {
 }
 
 const gen = (name) => `/api/generators/${encodeURIComponent(name)}`;
+const fx = (name) => `/api/effects/${encodeURIComponent(name)}`;
 
 export const api = {
   state: () => call('GET', '/api/state'),
@@ -40,8 +41,19 @@ export const api = {
   seek: (bar) => call('POST', '/api/transport/seek', { bar }),
   add: (spec) => call('POST', '/api/generators', spec),
   patch: (name, patch) => call('PATCH', gen(name), patch),
+  params: (name, values) => call('PATCH', gen(name) + '/params', values),
   remove: (name) => call('DELETE', gen(name)),
   restart: (name) => call('POST', gen(name) + '/restart'),
+
+  // Effects: send effects are buses every generator can send to (set with
+  // `patch(gen, { sends: { [effect]: amount } })`); inserts sit in one
+  // generator's chain.
+  addSend: (spec) => call('POST', '/api/effects', spec),
+  addInsert: (generator, spec) => call('POST', gen(generator) + '/inserts', spec),
+  patchEffect: (name, patch) => call('PATCH', fx(name), patch),
+  effectParams: (name, values) => call('PATCH', fx(name) + '/params', values),
+  removeEffect: (name) => call('DELETE', fx(name)),
+  restartEffect: (name) => call('POST', fx(name) + '/restart'),
 };
 
 /**

@@ -1,39 +1,82 @@
-// One channel strip: a generator in the mix, with its state, volume fader,
-// meter, mute, restart and remove.
+// One channel strip. Either a generator channel (parameters, insert chain,
+// send boxes, fader, mute, restart, remove) or a send effect's return
+// (parameters, return fader, mute, restart, remove), in the effect's colour.
 
 import { LitElement, html, css, nothing } from './vendor/lit-all.min.js';
 import { api } from './api.js';
 import './ws-fader.js';
+import './ws-params.js';
+import './ws-inserts.js';
+import './ws-send.js';
+import { colorOf } from './colors.js';
+import { duckParam, DUCK_ID, paramColor } from './ws-knob.js';
+
+/** The endpoints for each kind of strip. */
+const OPS = {
+  generator: { patch: api.patch, params: api.params, restart: api.restart, remove: api.remove },
+  return: { patch: api.patchEffect, params: api.effectParams, restart: api.restartEffect, remove: api.removeEffect },
+};
 
 class WsChannel extends LitElement {
   static properties = {
-    gen: { attribute: false },
-    confirming: { state: true },
+    gen: { attribute: false }, // a Generator, or an Effect with role "send"
+    kind: { type: String }, // "generator" or "return"
+    sendTo: { attribute: false }, // send Effects (generator strips)
+    inserts: { attribute: false }, // this generator's insert Effects, in order
+    fxCatalog: { attribute: false }, // catalog entries with kind "effect"
+    duck: { type: Number }, // the global duck level (return strips are ducked by it)
+    armed: { state: true }, // the ✕ was clicked once; a second click removes
   };
 
   static styles = css`
     :host {
-      flex: 0 0 96px; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 8px;
+      flex: 0 0 108px; display: flex; flex-direction: column; gap: 8px;
       background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 8px 6px;
       min-height: 0;
     }
     :host([muted]) { background: color-mix(in srgb, var(--panel) 85%, var(--mute) 5%); }
+    /* Effect returns: a cooler, darker base with faint hatching, so they
+       read as a different kind of strip than the channels. */
+    :host([kind=return]) {
+      background:
+        repeating-linear-gradient(135deg, transparent 0 6px, rgb(255 255 255 / 2.5%) 6px 7px),
+        var(--fx-bg);
+      border-color: var(--fx-edge);
+      border-top-color: var(--plugin, var(--fx-edge));
+    }
+    .tag {
+      font: 700 8px/1 var(--sans); letter-spacing: 1px; text-transform: uppercase; text-align: center;
+      color: var(--fx-tag); margin: -2px 0 -4px;
+    }
+    /* The plugin's colour: a band across the top and the name label. */
+    :host { border-top: 3px solid var(--plugin, var(--edge)); }
     .top { display: flex; justify-content: space-between; align-items: center; gap: 4px; }
     .state { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--dim); overflow: hidden; }
     .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--led-beat); }
     .dot.warn { background: var(--warn); }
     .dot.bad { background: var(--danger); }
     .dot.idle { background: var(--dim); }
+    .dot.enter { background: var(--led-cycle); animation: pulse 0.8s ease-in-out infinite alternate; }
+    @keyframes pulse { from { opacity: .35; } to { opacity: 1; } }
     .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .x {
       font: inherit; background: none; border: 0; color: var(--dim); cursor: pointer; padding: 0 2px; font-size: 14px;
     }
     .x:hover { color: var(--danger); }
+    .x.armed { color: #fff; background: var(--danger); border-radius: 3px; }
     .err {
       font-size: 10px; color: var(--danger); line-height: 1.2;
       display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
     }
     .stats { font: 10px var(--mono); color: var(--dim); text-align: center; }
+    ws-fader { margin-top: auto; }
+    /* Long parameter lists scroll; a thin visible scrollbar shows there's more. */
+    .params { max-height: 50vh; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--edge) transparent; }
+    .inserts { max-height: 30vh; overflow-y: auto; overflow-x: hidden; }
+    .source { display: flex; align-items: center; gap: 4px; font-size: 9px; color: var(--dim); }
+    .source .bar { flex: 1; height: 4px; background: var(--led-off); border-radius: 2px; overflow: hidden; }
+    .source .fill { height: 100%; background: var(--c); box-shadow: 0 0 4px var(--c); transition: width 50ms linear; }
+    .sends { display: grid; gap: 3px; max-height: 20vh; overflow-y: auto; }
     .buttons { display: flex; gap: 4px; justify-content: center; }
     button.b {
       font: 600 11px var(--sans); color: var(--text); background: var(--panel-2); border: 1px solid var(--edge);
@@ -46,38 +89,68 @@ class WsChannel extends LitElement {
       background: var(--panel-2); border-radius: 4px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .confirm { display: grid; gap: 4px; font-size: 11px; text-align: center; }
-    .confirm .yes { background: var(--danger); border-color: var(--danger); }
+    .name {
+      color: var(--plugin, var(--text));
+      background: color-mix(in srgb, var(--plugin, var(--panel-2)) 14%, var(--panel-2));
+    }
   `;
 
   constructor() {
     super();
-    this.confirming = false;
+    this.kind = 'generator';
+    this.sendTo = [];
+    this.inserts = [];
+    this.fxCatalog = [];
+    this.armed = false;
+  }
+
+  get ops() {
+    return OPS[this.kind] ?? OPS.generator;
   }
 
   updated() {
     this.toggleAttribute('muted', !!this.gen?.muted);
+    this.setAttribute('kind', this.kind);
+    if (this.gen) this.style.setProperty('--plugin', colorOf(this.gen));
   }
 
   fail(e) {
     this.dispatchEvent(new CustomEvent('ws-error', { detail: `${this.gen.name}: ${e.message}`, bubbles: true, composed: true }));
   }
 
-  async patch(p) {
-    try { await api.patch(this.gen.name, p); } catch (e) { this.fail(e); }
+  async run(fn) {
+    try { await fn(); } catch (e) { this.fail(e); }
   }
 
-  async restart() {
-    try { await api.restart(this.gen.name); } catch (e) { this.fail(e); }
+  patch(p) { return this.run(() => this.ops.patch(this.gen.name, p)); }
+  setParams(values) {
+    // The duck knob is a mixer setting, not a plugin param: it goes to the
+    // effect or generator itself.
+    const { [DUCK_ID]: duck, ...rest } = values;
+    if (duck !== undefined) this.run(() => this.ops.patch(this.gen.name, { duck_sensitivity: duck }));
+    if (Object.keys(rest).length) this.run(() => this.ops.params(this.gen.name, rest));
+  }
+  restart() { return this.run(() => this.ops.restart(this.gen.name)); }
+
+  setSend(effect, amount) {
+    return this.patch({ sends: { [effect]: amount } });
   }
 
-  async removeChannel() {
-    this.confirming = false;
-    try { await api.remove(this.gen.name); } catch (e) { this.fail(e); }
+  /** First click turns the ✕ red, a second click (within 3 s) removes. */
+  clickRemove() {
+    clearTimeout(this.disarm);
+    if (!this.armed) {
+      this.armed = true;
+      this.disarm = setTimeout(() => (this.armed = false), 3000);
+      return;
+    }
+    this.armed = false;
+    return this.run(() => this.ops.remove(this.gen.name));
   }
 
   dot(state) {
     if (state === 'ok') return '';
+    if (state === 'entering') return 'enter';
     if (state === 'muted' || state === 'starting') return 'idle';
     if (state === 'late' || state.startsWith('retry')) return 'warn';
     return 'bad';
@@ -87,27 +160,53 @@ class WsChannel extends LitElement {
     const g = this.gen;
     if (!g) return nothing;
     const err = g.last_error;
+    const isReturn = this.kind === 'return';
+    const ch = g.channels === 2 ? 'st' : g.channels === 1 ? 'mono' : '–';
+    const empty = html`<span></span>`;
+    // Returns always have a duck knob; channels once the API lets their
+    // sensitivity be set (it then reports declared_duck_sensitivity).
+    const duck = isReturn || g.declared_duck_sensitivity !== undefined ? duckParam(g) : null;
+    const params = duck ? [...(g.params ?? []), duck] : (g.params ?? []);
+    // Ducking: what turns this strip down right now, and (generators) how much
+    // it ducks the others. The source bar appears once it has ducked anything.
+    const gr = isReturn ? (this.duck ?? 0) * (g.duck_sensitivity ?? 0) : (g.duck_level ?? 0) * (g.duck_sensitivity ?? 0);
+    if (!isReturn && (g.duck_source ?? 0) > 0.01) this.ducker = true;
+    const duckNote = !duck && g.duck_sensitivity != null ? ` · duck sensitivity ${g.duck_sensitivity}` : '';
     return html`
+      ${isReturn ? html`<div class="tag">fx return</div>` : nothing}
       <div class="top">
-        <span class="state" title=${g.state}><span class="dot ${this.dot(g.state)}"></span><span class="label">${g.state}</span></span>
-        <button class="x" title="Remove channel" @click=${() => (this.confirming = true)}>✕</button>
+        <span class="state" title=${g.state === 'entering' ? `entering: ${g.entry?.mode === 'fade' ? `fading in over ${g.entry.bars} bars` : 'waiting for the next bar'}` : g.state}><span class="dot ${this.dot(g.state)}"></span><span class="label">${g.state}</span></span>
+        <button class="x ${this.armed ? 'armed' : ''}"
+          title=${this.armed ? 'Click again to remove' : isReturn ? 'Remove this send effect (drops every send to it); click twice' : 'Remove channel (and its inserts); click twice'}
+          @click=${this.clickRemove}>✕</button>
       </div>
       ${err && err.seconds_ago < 60
         ? html`<div class="err" title=${err.message}>${err.message}</div>`
-        : html`<div class="stats" title="channels · late blocks · restarts">${g.channels === 2 ? 'st' : g.channels === 1 ? 'mono' : '–'} · L${g.late} · R${g.restarts}</div>`}
-      <ws-fader .db=${g.gain_db} .peak=${g.peak} ?dimmed=${g.muted}
+        : html`<div class="stats" title="channels · late blocks · restarts${duckNote}">${ch} · L${g.late} · R${g.restarts}</div>`}
+      ${this.ducker
+        ? html`<div class="source" style="--c:${paramColor('duck')}" title="how much ${g.name} is ducking the others right now">
+            <span>ducks</span><span class="bar"><span class="fill" style="display:block; width:${Math.round((g.duck_source ?? 0) * 100)}%"></span></span>
+          </div>`
+        : nothing}
+      ${params.length
+        ? html`<ws-params class="params" .params=${params} @change=${(e) => this.setParams(e.detail)}></ws-params>`
+        : empty}
+      ${isReturn
+        ? empty
+        : html`<ws-inserts class="inserts" .owner=${g.name} .inserts=${this.inserts} .catalog=${this.fxCatalog}></ws-inserts>`}
+      ${!isReturn && this.sendTo.length
+        ? html`<div class="sends">${this.sendTo.map((fx) => html`
+            <ws-send .effect=${fx.name} .color=${colorOf(fx)} .amount=${g.sends?.[fx.name] ?? 0}
+              @change=${(e) => this.setSend(fx.name, e.detail)}></ws-send>`)}
+          </div>`
+        : empty}
+      <ws-fader .db=${g.gain_db} .peak=${g.peak} .gr=${gr} ?dimmed=${g.muted}
         @change=${(e) => this.patch({ gain_db: e.detail })}></ws-fader>
-      ${this.confirming
-        ? html`<div class="confirm">Remove?
-            <div class="buttons">
-              <button class="b yes" @click=${this.removeChannel}>Yes</button>
-              <button class="b" @click=${() => (this.confirming = false)}>No</button>
-            </div></div>`
-        : html`<div class="buttons">
-            <button class="b mute ${g.muted ? 'on' : ''}" title="Mute" @click=${() => this.patch({ muted: !g.muted })}>M</button>
-            <button class="b" title="Restart, e.g. after rebuilding" @click=${this.restart}>↻</button>
-          </div>`}
-      <div class="name" title=${g.command.join(' ')}>${g.name}</div>
+      <div class="buttons">
+        <button class="b mute ${g.muted ? 'on' : ''}" title="Mute" @click=${() => this.patch({ muted: !g.muted })}>M</button>
+        <button class="b" title="Restart, e.g. after rebuilding" @click=${this.restart}>↻</button>
+      </div>
+      <div class="name" title=${(g.description ? g.description + '\n' : '') + g.command.join(' ')}>${g.name}</div>
     `;
   }
 }
