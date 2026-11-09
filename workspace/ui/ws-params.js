@@ -3,7 +3,8 @@
 // `detail` = `{ [id]: value, ... }`. Used in channel strips and insert
 // panels.
 //
-// A random button sets every parameter to a random value in its range
+// A random button slides every parameter to a random value in its range
+// over one bar (the mixer does the slide; knobs follow the state)
 // (log-uniform for `log` params, a random label for choices, 50/50 for
 // toggles); Shift-click only nudges each one around where it is. The undo
 // button restores the values from before the last roll. Mixer settings shown
@@ -15,6 +16,7 @@ import { DUCK_ID } from './ws-knob.js';
 import './ws-knob.js';
 
 const NUDGE = 0.15; // Shift-click: at most this much of the travel either way
+const GLIDE_BARS = 1; // random and undo slide over this long
 
 /** Position 0..1 along the control's travel, for nudging. */
 function toNorm(p, v) {
@@ -72,8 +74,11 @@ class WsParams extends LitElement {
     this.previous = null;
   }
 
-  send(values) {
-    this.dispatchEvent(new CustomEvent('change', { detail: values }));
+  /** `glideBars` makes the mixer slide there instead of jumping. */
+  send(values, glideBars) {
+    const ev = new CustomEvent('change', { detail: values });
+    ev.glideBars = glideBars;
+    this.dispatchEvent(ev);
   }
 
   /** Every plugin parameter, not mixer settings shown alongside. */
@@ -85,12 +90,12 @@ class WsParams extends LitElement {
     const params = this.pluginParams;
     if (!params.length) return;
     this.previous = Object.fromEntries(params.map((p) => [p.id, p.value]));
-    this.send(Object.fromEntries(params.map((p) => [p.id, roll(p, e.shiftKey)])));
+    this.send(Object.fromEntries(params.map((p) => [p.id, roll(p, e.shiftKey)])), GLIDE_BARS);
   }
 
   undo() {
     if (!this.previous) return;
-    this.send(this.previous);
+    this.send(this.previous, GLIDE_BARS);
     this.previous = null;
   }
 

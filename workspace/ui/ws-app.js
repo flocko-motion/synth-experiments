@@ -82,9 +82,9 @@ class WsApp extends LitElement {
   }
 
   async add(e) {
-    const { generator, done } = e.detail;
+    const { generator, gain_db, done } = e.detail;
     try {
-      await api.add({ generator });
+      await api.add(gain_db === undefined ? { generator } : { generator, gain_db });
     } catch (err) {
       this.toast(`${generator}: ${err.message}`);
     } finally {
@@ -93,9 +93,9 @@ class WsApp extends LitElement {
   }
 
   async addSend(e) {
-    const { effect, done } = e.detail;
+    const { effect, gain_db, done } = e.detail;
     try {
-      await api.addSend({ effect });
+      await api.addSend(gain_db === undefined ? { effect } : { effect, gain_db });
     } catch (err) {
       this.toast(`${effect}: ${err.message}`);
     } finally {
@@ -109,6 +109,7 @@ class WsApp extends LitElement {
     const effects = s?.effects ?? [];
     const byName = new Map(effects.map((fx) => [fx.name, fx]));
     const returns = effects.filter((fx) => fx.role === 'send');
+
     const sendTo = returns;
     const fxCatalog = this.catalog.filter((c) => c.kind === 'effect');
     const insertsOf = (g) => (g.inserts ?? []).map((n) => byName.get(n)).filter(Boolean);

@@ -1,6 +1,7 @@
 // A vertical fader in dB with a peak meter beside it, shared by channel
-// strips and the master. `gr` (0..1) adds a ducking meter hanging from the
-// top: how much the strip is being turned down right now.
+// strips and the master. `gr` (0..1) adds a ducking column: filling down
+// from the top, how much this strip is being ducked; `src` (0..1) fills it up
+// from the bottom, how much this strip is ducking the others.
 //
 // Drag the cap to move it (relative, so it never jumps; Shift for fine).
 // Clicking the track glides the cap there, and you can keep dragging from
@@ -16,12 +17,14 @@ const MIN = -60; // the bottom of the fader means -96 dB (the API's floor)
 const MAX = 12;
 const FLOOR_DB = -96;
 const GLIDE_MS = 140;
+const pct01 = (v) => Math.round(Math.min(1, Math.max(0, v ?? 0)) * 100);
 
 class WsFader extends LitElement {
   static properties = {
     db: { type: Number },
     peak: { type: Number },
-    gr: { type: Number }, // gain reduction from ducking, 0..1; undefined hides the meter
+    gr: { type: Number }, // gain reduction from ducking, 0..1; undefined hides the column
+    src: { type: Number }, // how much this strip ducks the others, 0..1 (fills from the bottom)
     dimmed: { type: Boolean },
     local: { state: true },
   };
@@ -39,7 +42,9 @@ class WsFader extends LitElement {
     }
     :host([dimmed]) .meter .fill { opacity: .35; }
     .gr { width: 4px; background: var(--led-off); border-radius: 2px; position: relative; overflow: hidden; }
-    .gr .fill { position: absolute; inset: 0 0 auto 0; background: var(--c); box-shadow: 0 0 4px var(--c); transition: height 50ms linear; }
+    .gr .fill { position: absolute; left: 0; right: 0; background: var(--c); box-shadow: 0 0 4px var(--c); transition: height 50ms linear; }
+    .gr .fill.in { top: 0; }
+    .gr .fill.out { bottom: 0; filter: brightness(1.25); }
     .fader {
       position: relative; width: 34px; height: 100%; cursor: pointer; touch-action: none; outline: none;
     }
@@ -192,8 +197,10 @@ class WsFader extends LitElement {
       <div class="body">
         <div class="meter" title="peak"><div class="fill" style="height:${Math.max(0, pct)}%"></div></div>
         ${this.gr === undefined ? '' : html`
-          <div class="gr" style="--c:${paramColor('duck')}" title="ducked by ${Math.round(this.gr * 100)}% right now">
-            <div class="fill" style="height:${Math.round(Math.min(1, Math.max(0, this.gr)) * 100)}%"></div>
+          <div class="gr" style="--c:${paramColor('duck')}"
+            title="ducking: from the top, how much this is ducked by others (${Math.round(this.gr * 100)}% now); from the bottom, how much it ducks the others (${Math.round((this.src ?? 0) * 100)}% now)">
+            <div class="fill in" style="height:${pct01(this.gr)}%"></div>
+            ${this.src ? html`<div class="fill out" style="height:${pct01(this.src)}%"></div>` : ''}
           </div>`}
         <div class="fader" tabindex="0" role="slider" aria-label="volume in dB"
           aria-valuemin=${FLOOR_DB} aria-valuemax=${MAX} aria-valuenow=${shown}

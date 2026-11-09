@@ -95,11 +95,11 @@ class WsInserts extends LitElement {
     return duck ? [...fx.params, duck] : fx.params;
   }
 
-  setParams(fx, values) {
+  setParams(fx, values, glideBars) {
     // Duck sensitivity is a mixer setting; inserts duck only what they add.
     const { [DUCK_ID]: duck, ...rest } = values;
     if (duck !== undefined) this.run(fx.name, () => api.patchEffect(fx.name, { duck_sensitivity: duck }));
-    if (Object.keys(rest).length) this.run(fx.name, () => api.effectParams(fx.name, rest));
+    if (Object.keys(rest).length) this.run(fx.name, () => api.effectParams(fx.name, rest, glideBars));
   }
 
   slot(fx, i) {
@@ -118,7 +118,7 @@ class WsInserts extends LitElement {
       </div>
       ${open ? html`
         <div class="detail" style="--c:${colorOf(fx)}">
-          <ws-params .params=${this.paramsOf(fx)} @change=${(e) => this.setParams(fx, e.detail)}></ws-params>
+          <ws-params .params=${this.paramsOf(fx)} @change=${(e) => this.setParams(fx, e.detail, e.glideBars)}></ws-params>
           <div class="order">
             <button title="Earlier in the chain" ?disabled=${i === 0}
               @click=${() => this.run(fx.name, () => api.patchEffect(fx.name, { position: i - 1 }))}>▲</button>

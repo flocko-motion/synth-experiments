@@ -13,6 +13,11 @@ import { pluginColor, setCatalog } from './colors.js';
 
 const REFRESH_MS = 5000;
 
+// Press and hold an entry to pick its starting volume before it's added.
+const HOLD_MS = 300;
+const VOL_MIN = -60; // the far left means -96 dB (silent)
+const VOL_MAX = 6;
+
 /** Plugin categories in display order (gen_api::CATEGORIES); unknown ones sort after. */
 const CATEGORIES = ['drums', 'bass', 'lead', 'pad', 'fx', 'dynamics', 'filter', 'distortion', 'modulation', 'delay', 'reverb', 'other'];
 const rank = (c) => { const i = CATEGORIES.indexOf(c ?? 'other'); return i < 0 ? CATEGORIES.length : i; };
@@ -32,6 +37,7 @@ class WsCatalog extends LitElement {
     loading: { state: true },
     error: { state: true },
     adding: { state: true }, // name -> count of adds in flight
+    picking: { state: true }, // { name, db } while choosing a starting volume
     open: { state: true }, // the one open category group, "kind:category"
   };
 
@@ -52,6 +58,7 @@ class WsCatalog extends LitElement {
     @keyframes spin { to { transform: rotate(360deg); } }
     ul { list-style: none; margin: 0; padding: 4px; overflow-y: auto; flex: 1; }
     li.entry {
+      position: relative; overflow: hidden; touch-action: none;
       display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 6px; align-items: center;
       padding: 3px 6px; border-radius: 4px; cursor: pointer; user-select: none; outline: none;
       border-left: 3px solid var(--c); margin-bottom: 2px;
@@ -64,11 +71,14 @@ class WsCatalog extends LitElement {
     .ch { font-size: 9px; color: var(--dim); margin-left: 4px; }
     .cat { font-size: 9px; color: var(--c); opacity: .75; margin-left: 4px; }
     .desc { grid-column: 1; font-size: 10px; line-height: 1.3; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .add {
-      grid-row: 1 / span 2; grid-column: 2; font-size: 13px; line-height: 1; padding: 2px 6px;
-      color: var(--dim); border: 1px solid var(--edge); border-radius: 4px;
-    }
-    li.entry:hover .add { color: var(--c); border-color: var(--c); }
+    .busy-mark { grid-row: 1 / span 2; grid-column: 2; font-size: 12px; color: var(--c); }
+    /* Hold to choose the starting volume: the entry turns into a level bar. */
+    li.entry.picking { cursor: ew-resize; background: var(--panel-2); }
+    li.entry > .top, li.entry > .desc, li.entry > .busy-mark { position: relative; z-index: 1; }
+    .vol { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
+    .vol .fill { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--c) 45%, transparent); }
+    .vol .zero { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text); opacity: .25; }
+
     li.group {
       display: flex; align-items: center; gap: 6px; padding: 5px 6px; margin: 1px 0;
       border-radius: 4px; cursor: pointer; user-select: none; outline: none;
@@ -121,7 +131,7 @@ class WsCatalog extends LitElement {
           ${open ? '' : html`<span class="dots">${items.map((e) => html`<span style="background:${pluginColor(e.name)}" title=${e.name}></span>`)}</span>`}
           <span class="count">${items.length}</span>
         </li>
-        ${open ? items.map((e) => this.item(e, verb, () => onAdd(e))) : ''}`;
+        ${open ? items.map((e) => this.item(e, verb, (db) => onAdd(e, db))) : ''}`;
     });
   }
 
@@ -152,7 +162,7 @@ class WsCatalog extends LitElement {
     }
   }
 
-  add(name, event = 'add', key = 'generator') {
+  add(name, event = 'add', key = 'generator', gain_db) {
     // Several adds of the same generator may be in flight; each becomes its
     // own channel (psybass, psybass-2, …).
     this.adding = { ...this.adding, [name]: (this.adding[name] || 0) + 1 };
@@ -160,18 +170,73 @@ class WsCatalog extends LitElement {
       const n = (this.adding[name] || 1) - 1;
       this.adding = { ...this.adding, [name]: n };
     };
-    this.dispatchEvent(new CustomEvent(event, { detail: { [key]: name, done }, bubbles: true, composed: true }));
+    this.dispatchEvent(new CustomEvent(event, { detail: { [key]: name, gain_db, done }, bubbles: true, composed: true }));
+  }
+
+  // Click: add at 0 dB. Press and hold: the entry becomes a level bar; move
+  // left/right to choose the starting volume, release to add, Esc cancels.
+  down(ev, e, onAdd) {
+    if (ev.button !== 0) return;
+    const el = ev.currentTarget;
+    try { el.setPointerCapture(ev.pointerId); } catch {}
+    this.press = { name: e.name, onAdd, el, x: ev.clientX, cancelled: false };
+    clearTimeout(this.holdTimer);
+    this.holdTimer = setTimeout(() => {
+      if (this.press?.name === e.name) this.picking = { name: e.name, db: this.dbAt(this.press) };
+    }, HOLD_MS);
+  }
+
+  /** The level under the pointer: the bar's edge follows the mouse across the entry. */
+  dbAt(p) {
+    const r = p.el.getBoundingClientRect();
+    const t = Math.min(1, Math.max(0, (p.x - r.left) / r.width));
+    return Math.round((VOL_MIN + t * (VOL_MAX - VOL_MIN)) * 2) / 2;
+  }
+
+  move(ev) {
+    const p = this.press;
+    if (!p) return;
+    p.x = ev.clientX;
+    if (this.picking) this.picking = { name: p.name, db: this.dbAt(p) };
+  }
+
+  up() {
+    clearTimeout(this.holdTimer);
+    const p = this.press;
+    const picking = this.picking;
+    this.press = null;
+    this.picking = null;
+    if (!p || p.cancelled) return;
+    if (!picking) return p.onAdd(undefined);
+    p.onAdd(picking.db <= VOL_MIN ? -96 : picking.db);
+  }
+
+  cancel() {
+    clearTimeout(this.holdTimer);
+    if (this.press) this.press.cancelled = true;
+    this.picking = null;
   }
 
   item(e, verb, onAdd) {
-    // The whole entry is the button: click (or Enter/Space) adds it.
-    const key = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onAdd(); } };
+    const key = (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onAdd(undefined); }
+      else if (ev.key === 'Escape') this.cancel();
+    };
+    const pick = this.picking?.name === e.name ? this.picking : null;
+    const pos = (db) => ((db - VOL_MIN) / (VOL_MAX - VOL_MIN)) * 100;
     return html`
-      <li class="entry ${this.adding[e.name] ? 'busy' : ''}" style="--c:${pluginColor(e.name)}"
-        role="button" tabindex="0" title="${verb} ${e.name}${e.kind === 'effect' ? '' : ' (' + entryText(e.entry) + ')'}\n${e.description}\n${e.path}" @click=${onAdd} @keydown=${key}>
+      <li class="entry ${this.adding[e.name] ? 'busy' : ''} ${pick ? 'picking' : ''}" style="--c:${pluginColor(e.name)}"
+        role="button" tabindex="0"
+        title="${verb} ${e.name}${e.kind === 'effect' ? '' : ' (' + entryText(e.entry) + ')'}: click to add, or hold and move left/right to pick its volume (0 dB at the faint line)\n${e.description}\n${e.path}"
+        @pointerdown=${(ev) => this.down(ev, e, onAdd)} @pointermove=${this.move} @pointerup=${this.up}
+        @pointercancel=${this.cancel} @keydown=${key}>
         <span class="top"><span class="name">${e.name}</span><span class="ch">${e.channels === 2 ? 'stereo' : 'mono'}</span></span>
         <span class="desc">${e.description}</span>
-        <span class="add" aria-hidden="true">${this.adding[e.name] ? '…' : '+'}</span>
+        ${this.adding[e.name] ? html`<span class="busy-mark" aria-hidden="true">…</span>` : ''}
+        ${pick ? html`<div class="vol">
+          <div class="fill" style="width:${pos(pick.db)}%"></div>
+          <div class="zero" style="left:${pos(0)}%"></div>
+        </div>` : ''}
       </li>`;
   }
 
@@ -191,9 +256,9 @@ class WsCatalog extends LitElement {
         : ''}
       <ul>
         ${gens.length ? html`<li class="section">Generators</li>` : ''}
-        ${this.groups(gens, 'generator', 'Add a channel with', (e) => this.add(e.name))}
+        ${this.groups(gens, 'generator', 'Add a channel with', (e, db) => this.add(e.name, 'add', 'generator', db))}
         ${fxs.length ? html`<li class="section">Effects</li>` : ''}
-        ${this.groups(fxs, 'effect', 'Add a send effect (bus) with', (e) => this.add(e.name, 'add-send', 'effect'))}
+        ${this.groups(fxs, 'effect', 'Add a send effect (bus) with', (e, db) => this.add(e.name, 'add-send', 'effect', db))}
       </ul>
     `;
   }

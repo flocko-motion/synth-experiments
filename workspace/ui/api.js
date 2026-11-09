@@ -33,6 +33,7 @@ async function call(method, path, body) {
 
 const gen = (name) => `/api/generators/${encodeURIComponent(name)}`;
 const fx = (name) => `/api/effects/${encodeURIComponent(name)}`;
+const glide = (bars) => (bars ? `?glide_bars=${bars}` : '');
 
 export const api = {
   state: () => call('GET', '/api/state'),
@@ -41,7 +42,9 @@ export const api = {
   seek: (bar) => call('POST', '/api/transport/seek', { bar }),
   add: (spec) => call('POST', '/api/generators', spec),
   patch: (name, patch) => call('PATCH', gen(name), patch),
-  params: (name, values) => call('PATCH', gen(name) + '/params', values),
+  // `glideBars`: slide to the values over that many bars (the mixer does it,
+  // tempo-synced; state follows the slide). Without it they jump.
+  params: (name, values, glideBars) => call('PATCH', gen(name) + '/params' + glide(glideBars), values),
   remove: (name) => call('DELETE', gen(name)),
   restart: (name) => call('POST', gen(name) + '/restart'),
 
@@ -51,7 +54,7 @@ export const api = {
   addSend: (spec) => call('POST', '/api/effects', spec),
   addInsert: (generator, spec) => call('POST', gen(generator) + '/inserts', spec),
   patchEffect: (name, patch) => call('PATCH', fx(name), patch),
-  effectParams: (name, values) => call('PATCH', fx(name) + '/params', values),
+  effectParams: (name, values, glideBars) => call('PATCH', fx(name) + '/params' + glide(glideBars), values),
   removeEffect: (name) => call('DELETE', fx(name)),
   restartEffect: (name) => call('POST', fx(name) + '/restart'),
 };

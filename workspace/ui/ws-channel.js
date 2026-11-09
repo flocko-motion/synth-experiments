@@ -1,6 +1,6 @@
 // One channel strip. Either a generator channel (parameters, insert chain,
-// send boxes, fader, mute, restart, remove) or a send effect's return
-// (parameters, return fader, mute, restart, remove), in the effect's colour.
+// send boxes, fader, mute, pre-listen, remove) or a send effect's return
+// (parameters, return fader, mute, remove), in the effect's colour.
 
 import { LitElement, html, css, nothing } from './vendor/lit-all.min.js';
 import { api } from './api.js';
@@ -9,12 +9,12 @@ import './ws-params.js';
 import './ws-inserts.js';
 import './ws-send.js';
 import { colorOf } from './colors.js';
-import { duckParam, DUCK_ID, paramColor } from './ws-knob.js';
+import { duckParam, DUCK_ID } from './ws-knob.js';
 
 /** The endpoints for each kind of strip. */
 const OPS = {
-  generator: { patch: api.patch, params: api.params, restart: api.restart, remove: api.remove },
-  return: { patch: api.patchEffect, params: api.effectParams, restart: api.restartEffect, remove: api.removeEffect },
+  generator: { patch: api.patch, params: api.params, remove: api.remove },
+  return: { patch: api.patchEffect, params: api.effectParams, remove: api.removeEffect },
 };
 
 class WsChannel extends LitElement {
@@ -25,6 +25,7 @@ class WsChannel extends LitElement {
     inserts: { attribute: false }, // this generator's insert Effects, in order
     fxCatalog: { attribute: false }, // catalog entries with kind "effect"
     duck: { type: Number }, // the global duck level (return strips are ducked by it)
+
     armed: { state: true }, // the ✕ was clicked once; a second click removes
   };
 
@@ -73,9 +74,6 @@ class WsChannel extends LitElement {
     /* Long parameter lists scroll; a thin visible scrollbar shows there's more. */
     .params { max-height: 50vh; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--edge) transparent; }
     .inserts { max-height: 30vh; overflow-y: auto; overflow-x: hidden; }
-    .source { display: flex; align-items: center; gap: 4px; font-size: 9px; color: var(--dim); }
-    .source .bar { flex: 1; height: 4px; background: var(--led-off); border-radius: 2px; overflow: hidden; }
-    .source .fill { height: 100%; background: var(--c); box-shadow: 0 0 4px var(--c); transition: width 50ms linear; }
     .sends { display: grid; gap: 3px; max-height: 20vh; overflow-y: auto; }
     .buttons { display: flex; gap: 4px; justify-content: center; }
     button.b {
@@ -84,6 +82,8 @@ class WsChannel extends LitElement {
     }
     button.b:hover { border-color: var(--dim); }
     button.mute.on { background: var(--mute); border-color: var(--mute); color: #1f1300; }
+    button.solo.on { background: var(--led-cycle); border-color: var(--led-cycle); color: #06142b; }
+
     .name {
       text-align: center; font-weight: 600; font-size: 12px; padding: 4px 2px;
       background: var(--panel-2); border-radius: 4px;
@@ -112,6 +112,7 @@ class WsChannel extends LitElement {
     this.toggleAttribute('muted', !!this.gen?.muted);
     this.setAttribute('kind', this.kind);
     if (this.gen) this.style.setProperty('--plugin', colorOf(this.gen));
+
   }
 
   fail(e) {
@@ -123,14 +124,13 @@ class WsChannel extends LitElement {
   }
 
   patch(p) { return this.run(() => this.ops.patch(this.gen.name, p)); }
-  setParams(values) {
+  setParams(values, glideBars) {
     // The duck knob is a mixer setting, not a plugin param: it goes to the
     // effect or generator itself.
     const { [DUCK_ID]: duck, ...rest } = values;
     if (duck !== undefined) this.run(() => this.ops.patch(this.gen.name, { duck_sensitivity: duck }));
-    if (Object.keys(rest).length) this.run(() => this.ops.params(this.gen.name, rest));
+    if (Object.keys(rest).length) this.run(() => this.ops.params(this.gen.name, rest, glideBars));
   }
-  restart() { return this.run(() => this.ops.restart(this.gen.name)); }
 
   setSend(effect, amount) {
     return this.patch({ sends: { [effect]: amount } });
@@ -170,7 +170,6 @@ class WsChannel extends LitElement {
     // Ducking: what turns this strip down right now, and (generators) how much
     // it ducks the others. The source bar appears once it has ducked anything.
     const gr = isReturn ? (this.duck ?? 0) * (g.duck_sensitivity ?? 0) : (g.duck_level ?? 0) * (g.duck_sensitivity ?? 0);
-    if (!isReturn && (g.duck_source ?? 0) > 0.01) this.ducker = true;
     const duckNote = !duck && g.duck_sensitivity != null ? ` · duck sensitivity ${g.duck_sensitivity}` : '';
     return html`
       ${isReturn ? html`<div class="tag">fx return</div>` : nothing}
@@ -183,13 +182,8 @@ class WsChannel extends LitElement {
       ${err && err.seconds_ago < 60
         ? html`<div class="err" title=${err.message}>${err.message}</div>`
         : html`<div class="stats" title="channels · late blocks · restarts${duckNote}">${ch} · L${g.late} · R${g.restarts}</div>`}
-      ${this.ducker
-        ? html`<div class="source" style="--c:${paramColor('duck')}" title="how much ${g.name} is ducking the others right now">
-            <span>ducks</span><span class="bar"><span class="fill" style="display:block; width:${Math.round((g.duck_source ?? 0) * 100)}%"></span></span>
-          </div>`
-        : nothing}
       ${params.length
-        ? html`<ws-params class="params" .params=${params} @change=${(e) => this.setParams(e.detail)}></ws-params>`
+        ? html`<ws-params class="params" .params=${params} @change=${(e) => this.setParams(e.detail, e.glideBars)}></ws-params>`
         : empty}
       ${isReturn
         ? empty
@@ -200,11 +194,14 @@ class WsChannel extends LitElement {
               @change=${(e) => this.setSend(fx.name, e.detail)}></ws-send>`)}
           </div>`
         : empty}
-      <ws-fader .db=${g.gain_db} .peak=${g.peak} .gr=${gr} ?dimmed=${g.muted}
+      <ws-fader .db=${g.gain_db} .peak=${g.peak} .gr=${gr} .src=${isReturn ? 0 : g.duck_source ?? 0} ?dimmed=${g.muted}
         @change=${(e) => this.patch({ gain_db: e.detail })}></ws-fader>
       <div class="buttons">
         <button class="b mute ${g.muted ? 'on' : ''}" title="Mute" @click=${() => this.patch({ muted: !g.muted })}>M</button>
-        <button class="b" title="Restart, e.g. after rebuilding" @click=${this.restart}>↻</button>
+        ${!isReturn && g.cue !== undefined
+          ? html`<button class="b solo ${g.cue ? 'on' : ''}" title="Pre-listen: hear this channel on the cue output; the main mix is unchanged"
+              @click=${() => this.patch({ cue: !g.cue })}>S</button>`
+          : nothing}
       </div>
       <div class="name" title=${(g.description ? g.description + '\n' : '') + g.command.join(' ')}>${g.name}</div>
     `;
