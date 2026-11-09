@@ -13,8 +13,8 @@ import { duckParam, DUCK_ID } from './ws-knob.js';
 
 /** The endpoints for each kind of strip. */
 const OPS = {
-  generator: { patch: api.patch, params: api.params, remove: api.remove },
-  return: { patch: api.patchEffect, params: api.effectParams, remove: api.removeEffect },
+  generator: { patch: api.patch, params: api.params, randomize: api.randomize, remove: api.remove },
+  return: { patch: api.patchEffect, params: api.effectParams, randomize: api.randomizeEffect, remove: api.removeEffect },
 };
 
 class WsChannel extends LitElement {
@@ -183,7 +183,8 @@ class WsChannel extends LitElement {
         ? html`<div class="err" title=${err.message}>${err.message}</div>`
         : html`<div class="stats" title="channels · late blocks · restarts${duckNote}">${ch} · L${g.late} · R${g.restarts}</div>`}
       ${params.length
-        ? html`<ws-params class="params" .params=${params} @change=${(e) => this.setParams(e.detail, e.glideBars)}></ws-params>`
+        ? html`<ws-params class="params" .params=${params} @change=${(e) => this.setParams(e.detail, e.glideBars)}
+          @randomize=${() => this.run(() => this.ops.randomize(this.gen.name))}></ws-params>`
         : empty}
       ${isReturn
         ? empty

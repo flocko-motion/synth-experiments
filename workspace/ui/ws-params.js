@@ -3,49 +3,17 @@
 // `detail` = `{ [id]: value, ... }`. Used in channel strips and insert
 // panels.
 //
-// A random button slides every parameter to a random value in its range
-// over one bar (the mixer does the slide; knobs follow the state)
-// (log-uniform for `log` params, a random label for choices, 50/50 for
-// toggles); Shift-click only nudges each one around where it is. The undo
-// button restores the values from before the last roll. Mixer settings shown
+// The random button asks the mixer to randomize the plugin (it picks the
+// values and slides each param over the plugin's own random_glide_bars;
+// knobs follow the state). Emits `randomize`. The undo button slides back
+// to the values from before the last random. Mixer settings shown
 // alongside (the effect's Duck knob) are never randomised.
 
 import { LitElement, html, css, nothing } from './vendor/lit-all.min.js';
 import { live } from './vendor/lit-all.min.js';
 import { DUCK_ID } from './ws-knob.js';
-import './ws-knob.js';
 
-const NUDGE = 0.15; // Shift-click: at most this much of the travel either way
-const GLIDE_BARS = 1; // random and undo slide over this long
-
-/** Position 0..1 along the control's travel, for nudging. */
-function toNorm(p, v) {
-  if (p.max === p.min) return 0;
-  if (p.log && p.min > 0) return Math.log(v / p.min) / Math.log(p.max / p.min);
-  return (v - p.min) / (p.max - p.min);
-}
-
-function fromNorm(p, t) {
-  t = Math.min(1, Math.max(0, t));
-  const v = p.log && p.min > 0 ? p.min * Math.pow(p.max / p.min, t) : p.min + t * (p.max - p.min);
-  return p.kind === 'integer' ? Math.round(v) : v;
-}
-
-/** A random value for a parameter: across its range, or a nudge from `p.value`. */
-function roll(p, nudge) {
-  const u = Math.random();
-  switch (p.kind) {
-    case 'toggle':
-      return nudge ? p.value : u < 0.5 ? 0 : 1;
-    case 'choice':
-      return nudge ? p.value : Math.floor(u * Math.max(1, p.labels?.length ?? 0));
-    case 'integer':
-      if (nudge) return fromNorm(p, toNorm(p, p.value) + (u * 2 - 1) * NUDGE);
-      return Math.min(p.max, Math.floor(p.min + u * (p.max - p.min + 1)));
-    default:
-      return fromNorm(p, nudge ? toNorm(p, p.value) + (u * 2 - 1) * NUDGE : u);
-  }
-}
+const UNDO_GLIDE_BARS = 1; // undo slides back over this long
 
 class WsParams extends LitElement {
   static properties = {
@@ -86,16 +54,16 @@ class WsParams extends LitElement {
     return (this.params ?? []).filter((p) => p.id !== DUCK_ID);
   }
 
-  randomize(e) {
+  randomize() {
     const params = this.pluginParams;
     if (!params.length) return;
     this.previous = Object.fromEntries(params.map((p) => [p.id, p.value]));
-    this.send(Object.fromEntries(params.map((p) => [p.id, roll(p, e.shiftKey)])), GLIDE_BARS);
+    this.dispatchEvent(new CustomEvent('randomize'));
   }
 
   undo() {
     if (!this.previous) return;
-    this.send(this.previous, GLIDE_BARS);
+    this.send(this.previous, UNDO_GLIDE_BARS);
     this.previous = null;
   }
 
@@ -125,7 +93,7 @@ class WsParams extends LitElement {
     // The tools row comes first, so it stays visible when the panel scrolls.
     return html`<div class="grid">
       ${canRoll ? html`<div class="tools">
-        <button title="Random values for every parameter (Shift: just nudge them)" @click=${this.randomize}>random</button>
+        <button title="Random values for every parameter, sliding there" @click=${this.randomize}>random</button>
         <button title="Undo the last random" ?disabled=${!this.previous} @click=${this.undo}>undo</button>
       </div>` : nothing}
       ${this.params.map((p) => this.control(p))}

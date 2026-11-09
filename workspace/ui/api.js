@@ -47,6 +47,8 @@ export const api = {
   params: (name, values, glideBars) => call('PATCH', gen(name) + '/params' + glide(glideBars), values),
   remove: (name) => call('DELETE', gen(name)),
   restart: (name) => call('POST', gen(name) + '/restart'),
+  // The mixer picks random values and slides there (per-param slide times).
+  randomize: (name) => call('POST', gen(name) + '/randomize'),
 
   // Effects: send effects are buses every generator can send to (set with
   // `patch(gen, { sends: { [effect]: amount } })`); inserts sit in one
@@ -57,6 +59,7 @@ export const api = {
   effectParams: (name, values, glideBars) => call('PATCH', fx(name) + '/params' + glide(glideBars), values),
   removeEffect: (name) => call('DELETE', fx(name)),
   restartEffect: (name) => call('POST', fx(name) + '/restart'),
+  randomizeEffect: (name) => call('POST', fx(name) + '/randomize'),
 };
 
 /**
