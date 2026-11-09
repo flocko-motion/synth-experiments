@@ -38,6 +38,8 @@ const glide = (bars) => (bars ? `?glide_bars=${bars}` : '');
 export const api = {
   state: () => call('GET', '/api/state'),
   catalog: () => call('GET', '/api/catalog'),
+  // Plugin favourites, kept by the daemon.
+  setFavorite: (plugin, on) => call(on ? 'PUT' : 'DELETE', `/api/favorites/${encodeURIComponent(plugin)}`),
   transport: (patch) => call('PATCH', '/api/transport', patch),
   seek: (bar) => call('POST', '/api/transport/seek', { bar }),
   add: (spec) => call('POST', '/api/generators', spec),

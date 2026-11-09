@@ -38,6 +38,7 @@ class WsCatalog extends LitElement {
     error: { state: true },
     adding: { state: true }, // name -> count of adds in flight
     picking: { state: true }, // { name, db } while choosing a starting volume
+    favs: { state: true }, // starred plugin names (by the daemon; browser storage until it supports them)
     open: { state: true }, // the one open category group, "kind:category"
   };
 
@@ -74,7 +75,14 @@ class WsCatalog extends LitElement {
     .busy-mark { grid-row: 1 / span 2; grid-column: 2; font-size: 12px; color: var(--c); }
     /* Hold to choose the starting volume: the entry turns into a level bar. */
     li.entry.picking { cursor: ew-resize; background: var(--panel-2); }
-    li.entry > .top, li.entry > .desc, li.entry > .busy-mark { position: relative; z-index: 1; }
+    li.entry > .top, li.entry > .desc, li.entry > .busy-mark, li.entry > .star { position: relative; z-index: 1; }
+    .star {
+      grid-row: 1 / span 2; grid-column: 2; background: none; border: 0; padding: 2px 4px; cursor: pointer;
+      font-size: 14px; line-height: 1; color: var(--dim); opacity: .5;
+    }
+    li.entry:hover .star, .star:focus-visible { opacity: 1; }
+    .star:hover { color: var(--accent); }
+    .star.on { color: var(--accent); opacity: 1; }
     .vol { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
     .vol .fill { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--c) 45%, transparent); }
     .vol .zero { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text); opacity: .25; }
@@ -101,6 +109,7 @@ class WsCatalog extends LitElement {
     this.loading = false;
     this.error = null;
     this.adding = {};
+    try { this.favs = new Set(JSON.parse(localStorage.getItem('ws-favs') || '[]')); } catch { this.favs = new Set(); }
     try { this.open = localStorage.getItem('ws-catalog-open'); } catch { this.open = null; }
   }
 
@@ -152,6 +161,7 @@ class WsCatalog extends LitElement {
     try {
       const entries = await api.catalog();
       setCatalog(entries.map((e) => e.name));
+      this.syncFavs(entries);
       this.entries = entries;
       this.error = null;
       this.dispatchEvent(new CustomEvent('catalog', { detail: this.entries, bubbles: true, composed: true }));
@@ -217,6 +227,53 @@ class WsCatalog extends LitElement {
     this.picking = null;
   }
 
+  /** True once the daemon keeps favourites (catalog entries carry `favorite`). */
+  serverFavs(entries) {
+    return entries.length > 0 && 'favorite' in entries[0];
+  }
+
+  /**
+   * With daemon support, favourites come from the catalog; stars set in this
+   * browser before that are pushed up once and then dropped locally.
+   */
+  syncFavs(entries) {
+    if (!this.serverFavs(entries)) return;
+    let local = [];
+    try { local = JSON.parse(localStorage.getItem('ws-favs') || '[]'); } catch {}
+    const names = new Set(entries.map((e) => e.name));
+    const toPush = local.filter((n) => names.has(n) && !entries.find((e) => e.name === n)?.favorite);
+    for (const n of toPush) api.setFavorite(n, true).catch(() => {});
+    if (local.length) try { localStorage.removeItem('ws-favs'); } catch {}
+    this.favs = new Set([...entries.filter((e) => e.favorite).map((e) => e.name), ...toPush]);
+  }
+
+  async toggleFav(name) {
+    const on = !this.favs.has(name);
+    const favs = new Set(this.favs);
+    on ? favs.add(name) : favs.delete(name);
+    this.favs = favs; // show it right away
+    if (this.serverFavs(this.entries)) {
+      try {
+        await api.setFavorite(name, on);
+      } catch (e) {
+        this.dispatchEvent(new CustomEvent('ws-error', { detail: `favourite ${name}: ${e.message}`, bubbles: true, composed: true }));
+        this.refresh();
+      }
+    } else {
+      try { localStorage.setItem('ws-favs', JSON.stringify([...favs])); } catch {}
+    }
+  }
+
+  /** The star: toggles the favourite and never adds the plugin. */
+  star(e) {
+    const on = this.favs.has(e.name);
+    const stop = (ev) => ev.stopPropagation();
+    return html`<button class="star ${on ? 'on' : ''}" aria-pressed=${on}
+      title=${on ? 'Remove from favourites' : 'Add to favourites (shown at the top)'}
+      @pointerdown=${stop} @pointerup=${stop} @keydown=${stop}
+      @click=${(ev) => { ev.stopPropagation(); this.toggleFav(e.name); }}>${on ? '★' : '☆'}</button>`;
+  }
+
   item(e, verb, onAdd) {
     const key = (ev) => {
       if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onAdd(undefined); }
@@ -232,7 +289,7 @@ class WsCatalog extends LitElement {
         @pointercancel=${this.cancel} @keydown=${key}>
         <span class="top"><span class="name">${e.name}</span><span class="ch">${e.channels === 2 ? 'stereo' : 'mono'}</span></span>
         <span class="desc">${e.description}</span>
-        ${this.adding[e.name] ? html`<span class="busy-mark" aria-hidden="true">…</span>` : ''}
+        ${this.adding[e.name] ? html`<span class="busy-mark" aria-hidden="true">…</span>` : this.star(e)}
         ${pick ? html`<div class="vol">
           <div class="fill" style="width:${pos(pick.db)}%"></div>
           <div class="zero" style="left:${pos(0)}%"></div>
@@ -243,6 +300,8 @@ class WsCatalog extends LitElement {
   render() {
     const gens = this.entries.filter((e) => e.kind !== 'effect').sort(byCategory);
     const fxs = this.entries.filter((e) => e.kind === 'effect').sort(byCategory);
+    // Starred plugins, always open at the top (they also stay in their group).
+    const favs = [...gens, ...fxs].filter((e) => this.favs.has(e.name));
     // First visit: open the first generator group.
     this.defaultOpen = gens.length ? `generator:${gens[0].category ?? 'other'}` : null;
     return html`
@@ -255,6 +314,10 @@ class WsCatalog extends LitElement {
         ? html`<div class="note">No plugins found in the catalog directory. Build some with <code>make build</code>.</div>`
         : ''}
       <ul>
+        ${favs.length ? html`<li class="section">★ Favorites</li>` : ''}
+        ${favs.map((e) => e.kind === 'effect'
+          ? this.item(e, 'Add a send effect (bus) with', (db) => this.add(e.name, 'add-send', 'effect', db))
+          : this.item(e, 'Add a channel with', (db) => this.add(e.name, 'add', 'generator', db)))}
         ${gens.length ? html`<li class="section">Generators</li>` : ''}
         ${this.groups(gens, 'generator', 'Add a channel with', (e, db) => this.add(e.name, 'add', 'generator', db))}
         ${fxs.length ? html`<li class="section">Effects</li>` : ''}
