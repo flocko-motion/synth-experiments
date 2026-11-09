@@ -57,6 +57,8 @@ pub struct Opts {
     pub catalog: PathBuf,
     /// Where the web UI's files are served from.
     pub ui: PathBuf,
+    /// Where the daemon keeps what it remembers (favourites).
+    pub state: PathBuf,
 }
 
 /// Per-block falloff of the level meters (about -20 dB in 0.4 s).
@@ -674,7 +676,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let catalog_dir = cwd.join(&opts.catalog);
     let ui_dir = cwd.join(&opts.ui);
-    let ctl = Ctl { jobs: job_tx, sample_rate, http_url: http_url.clone(), catalog: Arc::new(Catalog::new(catalog_dir)) };
+    let ctl = Ctl { jobs: job_tx, sample_rate, http_url: http_url.clone(), catalog: Arc::new(Catalog::new(catalog_dir)), favorites: Arc::new(crate::favorites::Favorites::load(opts.state.clone())) };
     {
         let ctl = ctl.clone();
         thread::Builder::new().name("control".into()).spawn(move || control(listener, ctl)).map_err(|e| e.to_string())?;
@@ -730,6 +732,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
             wlog!("http api on {u}  (spec: {u}/api/openapi.yaml, catalog: {})", ctl.catalog.dir().display());
             let missing = if ui_dir.is_dir() { "" } else { "  (missing)" };
             wlog!("web ui on {u}/  from {}{missing}", ui_dir.display());
+            wlog!("favorites in {}", ctl.favorites.path().display());
         }
         None => {}
     }

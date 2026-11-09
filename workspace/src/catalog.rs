@@ -29,6 +29,8 @@ pub struct Entry {
     pub duck_sensitivity: f64,
     pub entry: EntryMode,
     pub path: String,
+    /// Starred by the user; filled in by the API, not the probe.
+    pub favorite: bool,
 }
 
 #[derive(Deserialize)]
@@ -134,5 +136,6 @@ fn ask_info(path: &Path, file: &str) -> Option<Entry> {
         duck_sensitivity: info.duck_sensitivity,
         entry: info.entry,
         path: path.to_string_lossy().into_owned(),
+        favorite: false,
     })
 }

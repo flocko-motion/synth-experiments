@@ -138,6 +138,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         415 => "Unsupported Media Type",
         422 => "Unprocessable Content",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "",
     }
@@ -170,7 +171,7 @@ fn handle(mut stream: TcpStream, ctl: &Ctl, cwd: &PathBuf, ui: &Path, port: u16)
 
     if req.method == "OPTIONS" {
         let pre = format!(
-            "{cors}Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Max-Age: 600\r\n"
+            "{cors}Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Max-Age: 600\r\n"
         );
         return write_head(&mut stream, 204, "text/plain", Some(0), &pre);
     }
@@ -246,12 +247,17 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
         ("POST", ["api", "effects", name, "randomize"]) => reply(200, ctl.randomize_effect(name.to_string())),
         ("POST", ["api", "effects", name, "restart"]) => reply(202, ctl.restart_effect(name.to_string())),
         ("POST", ["api", "generators", name, "restart"]) => reply(202, ctl.restart(name.to_string())),
-        ("GET", ["api", "catalog"]) => Response::json(200, &ctl.catalog.list()),
+        ("GET", ["api", "catalog"]) => Response::json(200, &ctl.catalog_list()),
+        ("GET", ["api", "favorites"]) => Response::json(200, &ctl.favorites.list()),
+        ("PUT" | "DELETE", ["api", "favorites", name]) => match ctl.set_favorite(name, m == "PUT") {
+            Ok(()) => Response::empty(204),
+            Err(e) => Response::error(&e),
+        },
         ("GET", ["api", "log"]) => {
             let after = req.query.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
             Response::json(200, &log_lines(after))
         }
-        (_, ["api", "state" | "transport" | "generators" | "effects" | "catalog" | "log" | "openapi.yaml", ..]) => {
+        (_, ["api", "state" | "transport" | "generators" | "effects" | "catalog" | "favorites" | "log" | "openapi.yaml", ..]) => {
             Response::json(405, &serde_json::json!({ "error": format!("{m} not allowed on {}", req.path) }))
         }
         _ => Response::json(404, &serde_json::json!({ "error": format!("no such endpoint {}", req.path) })),

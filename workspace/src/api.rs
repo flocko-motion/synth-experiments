@@ -30,6 +30,8 @@ pub enum ApiError {
     Unprocessable(String),
     /// 503: the mixer has stopped.
     Unavailable,
+    /// 500: e.g. the state directory isn't writable.
+    Internal(String),
 }
 
 impl ApiError {
@@ -40,6 +42,7 @@ impl ApiError {
             ApiError::Conflict(_) => 409,
             ApiError::Unprocessable(_) => 422,
             ApiError::Unavailable => 503,
+            ApiError::Internal(_) => 500,
         }
     }
 }
@@ -49,6 +52,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::BadRequest(m) | ApiError::NotFound(m) | ApiError::Conflict(m) | ApiError::Unprocessable(m) => f.write_str(m),
             ApiError::Unavailable => f.write_str("the workspace is stopping"),
+            ApiError::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -484,6 +488,7 @@ pub struct Ctl {
     /// The HTTP API's address, if it's being served.
     pub http_url: Option<String>,
     pub catalog: Arc<Catalog>,
+    pub favorites: Arc<crate::favorites::Favorites>,
 }
 
 impl Ctl {
@@ -838,6 +843,25 @@ impl Ctl {
         })?
     }
 
+    /// The catalog, with each entry's favourite flag.
+    pub fn catalog_list(&self) -> Vec<crate::catalog::Entry> {
+        let mut entries = self.catalog.list();
+        for e in &mut entries {
+            e.favorite = self.favorites.contains(&e.name);
+        }
+        entries
+    }
+
+    /// Stars or unstars a plugin by name; saved to disk. Idempotent. Names
+    /// needn't be in the catalog right now.
+    pub fn set_favorite(&self, name: &str, favorite: bool) -> Result<()> {
+        let ok = !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+        if !ok {
+            return Err(bad(format!("{name:?}: plugin names are 1-64 of A-Z a-z 0-9 - _ .")));
+        }
+        self.favorites.set(name, favorite).map_err(|e| ApiError::Internal(format!("saving favorites: {e}")))
+    }
+
     pub fn quit(&self) -> Result<()> {
         self.on_mixer(|m| m.quit = true)
     }
@@ -917,6 +941,12 @@ impl Ctl {
                 let targets: Vec<String> = params.iter().map(|p| p.desc.id.clone()).collect();
                 Ok(format!("{name}: randomizing {}\n", targets.join(", ")))
             }
+            "fav" | "unfav" => {
+                let name = arg(0, "PLUGIN")?;
+                self.set_favorite(&name, cmd == "fav")?;
+                Ok(format!("{name} {}\n", if cmd == "fav" { "starred" } else { "unstarred" }))
+            }
+            "favs" => Ok(self.favorites.list().into_iter().map(|n| n + "\n").collect()),
             "duck" => {
                 let name = arg(0, "NAME")?;
                 let s = num(arg(1, "SENSITIVITY (0..1)")?, "a number")?;

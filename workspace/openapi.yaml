@@ -490,6 +490,45 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/CatalogEntry" }
 
+  /api/favorites:
+    get:
+      operationId: listFavorites
+      summary: Starred plugins
+      description: |
+        Plugin names the user starred, sorted. Kept on disk by the daemon
+        (`--state DIR`, default `~/.config/synth-ws/favorites.json`), so they
+        survive restarts. Names no longer in the catalog stay listed.
+      responses:
+        "200":
+          description: Names
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+
+  /api/favorites/{plugin}:
+    parameters:
+      - name: plugin
+        in: path
+        required: true
+        schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$" }
+        description: A catalog name; it needn't be in the catalog right now.
+    put:
+      operationId: addFavorite
+      summary: Star a plugin (idempotent)
+      responses:
+        "204": { description: Starred }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      operationId: removeFavorite
+      summary: Unstar a plugin (idempotent)
+      responses:
+        "204": { description: Unstarred }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/Internal" }
+
   /api/log:
     get:
       operationId: getLog
@@ -540,6 +579,11 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     Unprocessable:
       description: The generator didn't start (missing program, no `--pipe` support, failed handshake)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Internal:
+      description: The daemon couldn't save its state (e.g. the state directory isn't writable)
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -901,7 +945,7 @@ components:
 
     CatalogEntry:
       type: object
-      required: [name, kind, description, category, channels, inputs, params, duck_sensitivity, entry, path]
+      required: [name, kind, description, category, channels, inputs, params, duck_sensitivity, entry, path, favorite]
       properties:
         name: { type: string, description: "Pass as `generator` to addGenerator, or as `effect` to addSendEffect/addInsert." }
         kind: { type: string, enum: [generator, effect] }
@@ -927,6 +971,7 @@ components:
               log: { type: boolean }
               unit: { type: string }
               labels: { type: array, items: { type: string } }
+        favorite: { type: boolean, description: "Starred by the user (see /api/favorites)." }
         path: { type: string }
 
     LogLine:

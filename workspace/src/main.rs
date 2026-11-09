@@ -10,6 +10,7 @@ mod api;
 mod catalog;
 mod click;
 mod daemon;
+mod favorites;
 mod gen;
 mod http;
 mod ring;
@@ -33,6 +34,7 @@ daemon options:
   --click         start with the metronome on (off by default; ws click on)
   --http ADDR     serve the HTTP API here (default {DEFAULT_HTTP}, loopback only)
   --catalog DIR   where to look for generator binaries (default target/release)
+  --state DIR     where the daemon keeps favourites (default ~/.config/synth-ws)
   --ui DIR        serve the web UI from this directory at / (default workspace/ui)
 
 commands (sent to the running daemon):
@@ -72,6 +74,8 @@ commands (sent to the running daemon):
   play / stop                start or stop the transport (stop lets voices ring)
   seek BAR                   jump to a bar, from 1
   url                        the HTTP API's address
+  fav PLUGIN / unfav PLUGIN  star or unstar a plugin (kept across restarts)
+  favs                       list starred plugins
   quit                       stop the daemon and its generators
 
 grid: tick (16th) -> beat -> bar -> cycle (4 bars) -> epoch (16 bars)
@@ -117,6 +121,7 @@ fn run_daemon(args: &[String]) {
         http: Some(DEFAULT_HTTP.parse().unwrap()),
         catalog: PathBuf::from("target/release"),
         ui: PathBuf::from("workspace/ui"),
+        state: std::env::var_os("HOME").map_or_else(|| PathBuf::from(".synth-ws"), |h| PathBuf::from(h).join(".config/synth-ws")),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -131,6 +136,7 @@ fn run_daemon(args: &[String]) {
             "--http" => opts.http = Some(val().parse().unwrap_or_else(|_| fail("--http takes an address like 127.0.0.1:7700"))),
             "--no-http" => opts.http = None,
             "--catalog" => opts.catalog = PathBuf::from(val()),
+            "--state" => opts.state = PathBuf::from(val()),
             "--ui" => opts.ui = PathBuf::from(val()),
             _ => fail(&format!("{a}: unknown option\n{}", usage())),
         }
