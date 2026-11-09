@@ -5,21 +5,11 @@ later. Newest first within each section.
 
 ## Mixing
 
-### Duck sensitivity as a parameter
+### Per-source duck envelopes
 
-Today each generator declares a fixed duck sensitivity (how strongly the
-mixer ducks it when a duck event arrives): psybass 0, percussion 0.2,
-acid 0.6. The mixer applies it as is.
-
-Later: make it adjustable per channel and per bus in the mixer, seeded
-from the generator's declared value. The right amount depends on the rest
-of the mix: the same pad needs heavy ducking in a dense drop and none in a
-breakdown without kick. Keep it a mixer setting rather than a generator
-parameter, so it isn't controlled in two places.
-
-Related: release and curve of the duck envelope are global mix settings
-for now; they could become per source (a long kick ducks longer than a
-snare).
+Duck sensitivity is a mixer setting on every channel now. Release and
+curve of the duck envelope are still global mix settings; they could
+become per source (a long kick ducks longer than a snare).
 
 ### Insert effect chains
 
