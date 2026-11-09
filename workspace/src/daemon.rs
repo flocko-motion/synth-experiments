@@ -20,7 +20,7 @@
 use crate::api::{self, ApiError, Ctl, Job};
 use crate::catalog::Catalog;
 use crate::click::Click;
-use crate::gen::{adapt_channels, Entering, Slot, Spawned};
+use crate::gen::{adapt_channels, Entering, Exit, Exiting, Slot, Spawned};
 use crate::log::wlog;
 use crate::ring::Ring;
 use crate::sys;
@@ -134,6 +134,7 @@ fn apply_duck(buf: &mut [f32], channels: usize, env: &[f32], sensitivity: f32) {
 struct Stage {
     seq: u64,
     req: Request,
+    score: Arc<gen_api::Score>,
     channels: usize,
     deadline: Instant,
     block_secs: f64,
@@ -159,7 +160,7 @@ fn run_chains(fx: &mut [Slot], chains: &[Vec<String>], bufs: &mut [Vec<f32>], st
             if fx[fi].bypass {
                 continue;
             }
-            fx[fi].request(st.seq, st.req, &bufs[c], st.channels);
+            fx[fi].request(st.seq, st.req, &st.score, &bufs[c], st.channels);
             asked.push((c, fi));
         }
         let short = Instant::now() + Duration::from_secs_f64(st.block_secs / 3.0);
@@ -230,6 +231,10 @@ pub struct Mixer {
     /// (frame, global duck level) at each block's start, so the API can report the
     /// envelope at the audible position rather than the render position.
     duck_history: std::collections::VecDeque<(u64, f32)>,
+    pub sequencer: crate::sequencer::Sequencer,
+    /// Render time over playing time per block: smoothed, and its peak.
+    dsp_load: f64,
+    dsp_peak: f64,
     pub quit: bool,
     mix: Vec<f32>,
 }
@@ -248,6 +253,12 @@ impl Mixer {
     /// roughly `ahead` ms from now.
     pub fn start_entry(&self, slot: &mut Slot) {
         slot.entering = slot.entry().and_then(|e| Entering::start(e, self.beat_at(self.frame), self.beats_per_bar));
+    }
+
+    /// An exit for a channel removed now, starting at the next block to
+    /// render (like [`Mixer::start_entry`]); None for `now`.
+    pub fn start_exit(&self, exit: Exit) -> Option<Exiting> {
+        Exiting::start(exit, self.beat_at(self.frame), self.beats_per_bar)
     }
 
     fn beat_at(&self, frame: u64) -> f64 {
@@ -340,9 +351,12 @@ impl Mixer {
             latency_ms: self.lead_frames() as f64 * 1000.0 / self.sample_rate as f64,
             latency_beats: self.lead_frames() as f64 / self.samples_per_beat(),
             underruns: self.underruns.load(Ordering::Relaxed),
+            dsp_load: self.dsp_load,
+            dsp_peak: self.dsp_peak,
             sample_rate: self.sample_rate,
             generators: self.gens.iter().map(api::Generator::of).collect(),
             effects: self.fx.iter().map(api::Effect::of).collect(),
+            sequencer: self.sequencer.view(beat),
         }
     }
 
@@ -432,15 +446,19 @@ impl Mixer {
         let n = BLOCK;
         let ch = self.channels;
         let beat0 = self.beat_at(self.frame);
+        self.sequencer.advance(beat0, self.beats_per_bar);
+        let score = self.sequencer.timeline(self.tonality);
         let req = Request {
             frames: n as u32,
             frame: self.frame,
             transport: Transport { bpm: self.bpm, beat: beat0, beats_per_bar: self.beats_per_bar, playing: self.playing },
-            tonality: self.tonality,
+            // A key region in the score overrides the host key, so plugins
+            // that know nothing about the score still follow it.
+            tonality: score.at(beat0, self.beats_per_bar).key.unwrap_or(self.tonality),
         };
         let seq = self.seq;
         for g in &mut self.gens {
-            g.request(seq, req, &[], 0);
+            g.request(seq, req, &score, &[], 0);
         }
 
         // Wait for chunks at most until half of what's buffered would have
@@ -449,7 +467,7 @@ impl Mixer {
         let buffered = Duration::from_secs_f64(self.ring.len() as f64 / ch as f64 / self.sample_rate as f64);
         let now = Instant::now();
         let block_secs = n as f64 / self.sample_rate as f64;
-        let st = Stage { seq, req, channels: ch, deadline: now + (buffered / 2).max(Duration::from_millis(2)), block_secs };
+        let st = Stage { seq, req, score: score.clone(), channels: ch, deadline: now + (buffered / 2).max(Duration::from_millis(2)), block_secs };
         // For processes already behind: a few ms, well under a block's
         // duration, so the mixer always outpaces the device.
         let short_deadline = now + Duration::from_secs_f64(block_secs / 3.0);
@@ -460,6 +478,11 @@ impl Mixer {
         let silence = vec![0.0f32; n * ch];
         let mut chans: Vec<Vec<f32>> = Vec::with_capacity(self.gens.len());
         let (beats_per_frame, playing, bpb) = (1.0 / self.samples_per_beat(), self.playing, self.beats_per_bar);
+        // A channel on its way out: its gains for this block (applied
+        // post-insert, at the fader, so its insert tails fade with it), or
+        // gone once it's past its line.
+        let mut gone: Vec<String> = Vec::new();
+        let mut exit_gains: Vec<Option<Vec<f32>>> = Vec::with_capacity(self.gens.len());
         for g in &mut self.gens {
             g.peak *= PEAK_FALLOFF;
             let mut buf = match (g.collect(seq, st.deadline, short_deadline), g.channels()) {
@@ -483,6 +506,22 @@ impl Mixer {
                     None => g.entering = None,
                 }
             }
+            let exit = g.exiting.as_mut().map(|e| e.block(beat0, beats_per_frame, playing, n));
+            match exit {
+                Some(None) => {
+                    gone.push(g.name.clone());
+                    buf.fill(0.0);
+                    g.ducks.clear();
+                }
+                Some(Some(ref gains)) => {
+                    for (f, s) in &mut g.ducks {
+                        *s *= gains.get(*f as usize).copied().unwrap_or(1.0);
+                    }
+                    g.ducks.retain(|d| d.1 > 0.0);
+                }
+                None => {}
+            }
+            exit_gains.push(exit.flatten());
             chans.push(buf);
         }
 
@@ -534,13 +573,18 @@ impl Mixer {
         // included. Send-effect returns stay audible (solo-safe), and ducking
         // is untouched, so a soloed channel sounds as it does in the mix.
         let soloing = self.gens.iter().any(|g| g.solo);
-        for ((g, buf), level) in self.gens.iter_mut().zip(chans.iter_mut()).zip(&levels) {
-            let gain = if soloing && !g.solo { 0.0 } else { g.gain() };
+        for (((g, buf), level), exit) in self.gens.iter_mut().zip(chans.iter_mut()).zip(&levels).zip(&exit_gains) {
+            let gain = if soloing && !g.solo || gone.contains(&g.name) { 0.0 } else { g.gain() };
             if gain == 0.0 {
                 continue;
             }
             if ducking {
                 apply_duck(buf, ch, level, g.duck_sensitivity().unwrap_or(0.0) as f32);
+            }
+            if let Some(gains) = exit {
+                for (frame, k) in buf.chunks_exact_mut(ch).zip(gains) {
+                    frame.iter_mut().for_each(|x| *x *= k);
+                }
             }
             g.peak = buf.iter().fold(g.peak, |p, s| p.max(s.abs() * gain));
             add_scaled(&mut self.mix, buf, gain);
@@ -557,13 +601,21 @@ impl Mixer {
         for (f, input) in self.fx.iter_mut().zip(&send_in) {
             if let Some(input) = input {
                 f.peak *= PEAK_FALLOFF;
-                f.request(seq, req, input, ch);
+                f.request(seq, req, &score, input, ch);
             }
         }
         for (f, input) in self.fx.iter_mut().zip(&send_in) {
             if input.is_none() {
                 continue;
             }
+            // Its exit moves on even while it's muted or late.
+            let exit = match f.exiting.as_mut().map(|e| e.block(beat0, beats_per_frame, playing, n)) {
+                Some(None) => {
+                    gone.push(f.name.clone());
+                    continue;
+                }
+                e => e.flatten(),
+            };
             let (Some(mut chunk), Some(fch)) = (f.collect(seq, st.deadline, short_deadline), f.channels()) else { continue };
             f.sanitize(&mut chunk);
             let gain = f.gain();
@@ -573,6 +625,11 @@ impl Mixer {
             let mut out = adapt_channels(&chunk, fch, ch);
             if ducking {
                 apply_duck(&mut out, ch, &env, f.duck_sensitivity().unwrap_or(0.0) as f32);
+            }
+            if let Some(gains) = exit {
+                for (frame, k) in out.chunks_exact_mut(ch).zip(&gains) {
+                    frame.iter_mut().for_each(|x| *x *= k);
+                }
             }
             f.peak = out.iter().fold(f.peak, |p, s| p.max(s.abs() * gain));
             add_scaled(&mut self.mix, &out, gain);
@@ -595,6 +652,14 @@ impl Mixer {
         self.ring.push(&self.mix);
         self.frame += n as u64;
         self.seq += 1;
+
+        // Channels whose exit has run its course go, with their inserts.
+        if !gone.is_empty() {
+            let mut fx: Vec<String> = self.gens.iter().filter(|g| gone.contains(&g.name)).flat_map(|g| g.inserts.clone()).collect();
+            fx.extend(self.fx.iter().filter(|f| gone.contains(&f.name)).map(|f| f.name.clone()));
+            self.gens.retain(|g| !gone.contains(&g.name));
+            crate::api::drop_effects(self, &fx);
+        }
     }
 }
 
@@ -676,7 +741,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let catalog_dir = cwd.join(&opts.catalog);
     let ui_dir = cwd.join(&opts.ui);
-    let ctl = Ctl { jobs: job_tx, sample_rate, http_url: http_url.clone(), catalog: Arc::new(Catalog::new(catalog_dir)), favorites: Arc::new(crate::favorites::Favorites::load(opts.state.clone())) };
+    let ctl = Ctl { jobs: job_tx, sample_rate, http_url: http_url.clone(), catalog: Arc::new(Catalog::new(catalog_dir)), favorites: Arc::new(crate::favorites::Favorites::load(opts.state.clone())), sequencer_path: opts.state.join("sequencer.json") };
     {
         let ctl = ctl.clone();
         thread::Builder::new().name("control".into()).spawn(move || control(listener, ctl)).map_err(|e| e.to_string())?;
@@ -713,6 +778,9 @@ pub fn run(opts: Opts) -> Result<(), String> {
         master_db: 0.0,
         master_peak: 0.0,
         duck_history: std::collections::VecDeque::new(),
+        sequencer: crate::sequencer::Sequencer::load(&ctl.sequencer_path),
+        dsp_load: 0.0,
+        dsp_peak: 0.0,
         quit: false,
         mix: Vec::new(),
     };
@@ -733,6 +801,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
             let missing = if ui_dir.is_dir() { "" } else { "  (missing)" };
             wlog!("web ui on {u}/  from {}{missing}", ui_dir.display());
             wlog!("favorites in {}", ctl.favorites.path().display());
+            wlog!("sequencer banks in {}", ctl.sequencer_path.display());
         }
         None => {}
     }
@@ -756,10 +825,22 @@ pub fn run(opts: Opts) -> Result<(), String> {
 
 fn fill(m: &mut Mixer) {
     let ch = m.channels;
+    let block_secs = BLOCK as f64 / m.sample_rate as f64;
     while m.ring.len() < m.ahead_frames * ch && m.ring.free() >= BLOCK * ch {
+        let t0 = Instant::now();
         m.render_block();
+        // DSP load: time to render a block (every generator and effect,
+        // which run in parallel, then the mix) over the time it plays.
+        let load = t0.elapsed().as_secs_f64() / block_secs;
+        m.dsp_load += (load - m.dsp_load) * LOAD_SMOOTH;
+        m.dsp_peak = load.max(m.dsp_peak * PEAK_HOLD);
     }
 }
+
+/// DSP load meter: smoothing per block (about 0.2 s), and how fast the
+/// peak falls back (about 2 s to a third).
+const LOAD_SMOOTH: f64 = 0.05;
+const PEAK_HOLD: f64 = 0.995;
 
 fn mix_loop(m: &mut Mixer, jobs: Receiver<Job>, spawned: Receiver<Spawned>) {
     loop {

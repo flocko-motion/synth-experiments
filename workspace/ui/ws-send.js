@@ -1,7 +1,9 @@
 // A send box: how much of a channel goes to one effect. A tiny box in the
-// effect's colour showing the amount; click-drag up/down (or sideways) to
-// change it, Shift for fine, double-click for 0, wheel and arrow keys work
-// too. Emits throttled `change` events with `detail` in 0..1.
+// effect's colour showing the amount. A quick click sets it to where you
+// click (left edge 0, right edge 100); press and hold, or drag, to slide it
+// up/down (or sideways) from where it is, Shift for fine. Double-click for
+// 0; wheel and arrow keys work too. Emits throttled `change` events with
+// `detail` in 0..1.
 //
 // Every loaded effect is a bus, so a strip has one box per effect.
 
@@ -9,6 +11,9 @@ import { LitElement, html, css } from './vendor/lit-all.min.js';
 import { throttle } from './api.js';
 
 const DRAG_PX = 120;
+/** A press shorter than this that barely moves is a click, not a slide. */
+const CLICK_MS = 250;
+const CLICK_PX = 3;
 
 class WsSend extends LitElement {
   static properties = {
@@ -22,7 +27,7 @@ class WsSend extends LitElement {
   static styles = css`
     :host { display: block; }
     .box {
-      position: relative; height: 18px; border-radius: 3px; overflow: hidden; cursor: ew-resize;
+      position: relative; height: 13px; border-radius: 2px; overflow: hidden; cursor: ew-resize;
       background: color-mix(in srgb, var(--c) 14%, var(--panel-2));
       border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
       touch-action: none; user-select: none; outline: none;
@@ -31,7 +36,7 @@ class WsSend extends LitElement {
     .fill { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--c) 55%, transparent); }
     .text {
       position: relative; display: flex; justify-content: space-between; gap: 4px; padding: 0 4px;
-      font: 600 9px/16px var(--sans); color: var(--text);
+      font: 600 9px/11px var(--sans); color: var(--text);
     }
     .fx { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .amt { font-family: var(--mono); font-variant-numeric: tabular-nums; }
@@ -52,6 +57,16 @@ class WsSend extends LitElement {
     this.emit(v);
   }
 
+  up(e) {
+    const d = this.dragging;
+    // A quick click: jump to the clicked spot.
+    if (d && !d.sliding && performance.now() - d.at < CLICK_MS) {
+      const r = e.currentTarget.getBoundingClientRect();
+      this.set(Math.round(((e.clientX - r.left) / r.width) * 100) / 100);
+    }
+    this.release();
+  }
+
   release() {
     this.dragging = null;
     clearTimeout(this.releaseTimer);
@@ -63,12 +78,17 @@ class WsSend extends LitElement {
     e.currentTarget.focus();
     clearTimeout(this.releaseTimer);
     this.local = this.local ?? this.amount;
-    this.dragging = { x: e.clientX, y: e.clientY, v: this.local };
+    this.dragging = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, at: performance.now(), v: this.local, sliding: false };
   }
 
   move(e) {
     const d = this.dragging;
     if (!d) return;
+    // Slide only once it's a hold or a real drag, so a click doesn't nudge.
+    if (!d.sliding) {
+      if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < CLICK_PX && performance.now() - d.at < CLICK_MS) return;
+      d.sliding = true;
+    }
     // Up or right increases; whichever axis moved more wins.
     const dx = e.clientX - d.x, dy = d.y - e.clientY;
     const delta = Math.abs(dx) > Math.abs(dy) ? dx : dy;
@@ -97,11 +117,11 @@ class WsSend extends LitElement {
   render() {
     const v = this.local ?? this.amount;
     const pct = Math.round(v * 100);
-    const tip = `send to ${this.effect}: ${pct}%${this.preview ? ' (preview: effect routing is not in the API yet)' : ''}\ndrag to change, Shift for fine, double-click for 0`;
+    const tip = `send to ${this.effect}: ${pct}%${this.preview ? ' (preview: effect routing is not in the API yet)' : ''}\nclick to set, hold or drag to slide (Shift for fine), double-click for 0`;
     return html`
       <div class="box" style="--c:${this.color || 'var(--accent)'}" tabindex="0" role="slider"
         aria-label="send to ${this.effect}" aria-valuemin="0" aria-valuemax="100" aria-valuenow=${pct} title=${tip}
-        @pointerdown=${this.down} @pointermove=${this.move} @pointerup=${this.release} @pointercancel=${this.release}
+        @pointerdown=${this.down} @pointermove=${this.move} @pointerup=${this.up} @pointercancel=${this.release}
         @dblclick=${() => { this.set(0); this.release(); }} @wheel=${this.wheel} @keydown=${this.key}>
         <div class="fill" style="width:${pct}%"></div>
         <div class="text"><span class="fx">${this.effect}</span><span class="amt">${pct}</span></div>

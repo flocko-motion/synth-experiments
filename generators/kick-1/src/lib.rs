@@ -9,9 +9,16 @@
 //! sweep) settling on the key's root in the bass register, plus a
 //! highpassed noise click, then drive. Every kick sends a duck event, which
 //! is what the mixer ducks everything else from.
+//!
+//! The workspace score: no kick in a `break` (so nothing ducks either),
+//! softer kicks in a `quiet`, and beats 1 and 3 only in half-time feel or a
+//! deep `quiet`. Double-time feel drives on 8ths, quad rolls on 16ths (the
+//! in-between kicks a little softer, ducking at 0.6, and every kick cut
+//! short before the next). Turn `tempo` off to keep four on the floor under
+//! every feel. It stays on the key's root: psy kicks don't follow chords.
 
 use dsp::OnePole;
-use gen_api::{Config, Context, Entry, Event, EventKind, Generator, Info, Param, Rng, StepClock, Tonality, TICKS_PER_BEAT};
+use gen_api::{Config, Context, Entry, Event, EventKind, Feel, Generator, Info, Mark, Param, Rng, ScoreBar, StepClock, Tonality, TICKS_PER_BEAT};
 use std::f64::consts::PI;
 
 const TUNE: usize = 0;
@@ -21,8 +28,9 @@ const LENGTH: usize = 3;
 const CLICK: usize = 4;
 const DRIVE: usize = 5;
 const FILLS: usize = 6;
+const TEMPO: usize = 7;
 
-const PARAMS: [Param; 7] = [
+const PARAMS: [Param; 8] = [
     // Semitones away from the key's root.
     Param::integer("tune", "Tune", -12, 12, 0).unit("st").glide(0.0),
     // Depth of the body's pitch drop.
@@ -33,6 +41,9 @@ const PARAMS: [Param; 7] = [
     Param::continuous("click", "Click", 0.0, 1.0, 0.35),
     Param::continuous("drive", "Drive", 0.5, 4.0, 1.25).unit("x"),
     Param::toggle("fills", "Fills", true).glide(0.0),
+    // Follow the score's tempo feel (8ths on double, 16ths on quad, beats
+    // 1 and 3 on half); off keeps four on the floor whatever the others do.
+    Param::toggle("tempo", "Tempo", true).glide(0.0),
 ];
 
 /// Soft clip, then a -1 dBFS ceiling.
@@ -43,6 +54,22 @@ const CEILING: f64 = 0.891;
 fn big_fill(beat_abs: u64, beats_per_bar: u64) -> bool {
     let bar = beat_abs / beats_per_bar;
     (bar + 1) % 16 == 0 && beat_abs % beats_per_bar >= beats_per_bar.saturating_sub(2)
+}
+
+/// How the score shapes the kick on beat `beat_in_bar`: its level, or
+/// `None` for no kick (and no duck event).
+/// - break: out
+/// - quiet: softer with intensity, and above 0.8 only beats 1 and 3
+/// - half-time feel: only beats 1 and 3
+fn score_level(sb: &ScoreBar, beat_in_bar: u64) -> Option<f64> {
+    let i = sb.intensity as f64;
+    let half = sb.feel == Feel::Half || (sb.mark == Mark::Quiet && i >= 0.8);
+    match sb.mark {
+        Mark::Break => None,
+        _ if half && beat_in_bar % 2 == 1 => None,
+        Mark::Quiet => Some(1.0 - 0.5 * i),
+        _ => Some(1.0),
+    }
 }
 
 /// Bass register root: D1 (36.7 Hz) up to C#2 (69.3 Hz), as in psybass.
@@ -67,6 +94,7 @@ struct Voice {
     len: usize,
     phase: f64,
     root_hz: f64,
+    level: f64,
 }
 
 pub struct Kick {
@@ -102,7 +130,7 @@ impl Kick {
         let amp = attack * (1.0 - u).powf(self.character.tail);
         let n = self.noise.range(-1.0, 1.0);
         let click = self.click_hp.hp(n) * (-t / 0.0015).exp() * p[CLICK];
-        ((body * amp * 1.8).tanh() + click) * 0.95
+        ((body * amp * 1.8).tanh() + click) * 0.95 * v.level
     }
 }
 
@@ -155,20 +183,38 @@ impl Generator for Kick {
         let mut steps = self.clock.block(ctx);
         for (i, o) in out.iter_mut().enumerate() {
             while let Some(step) = steps.due(i) {
-                if step % TICKS_PER_BEAT as u64 != 0 {
-                    continue;
-                }
+                let tick = step % TICKS_PER_BEAT as u64;
                 let beat = step / TICKS_PER_BEAT as u64;
-                if ctx.param(FILLS) != 0.0 && big_fill(beat, tr.beats_per_bar.max(1) as u64) {
+                let bpb = tr.beats_per_bar.max(1) as u64;
+                let mut bar = ctx.score.bar(beat / bpb);
+                if ctx.param(TEMPO) == 0.0 {
+                    bar.feel = Feel::Normal;
+                }
+                // Feel: 8ths on double, 16ths on quad; otherwise the beat.
+                let spacing = match bar.feel {
+                    Feel::Double => 2,
+                    Feel::Quad => 1,
+                    _ => TICKS_PER_BEAT as u64,
+                };
+                if tick % spacing != 0 {
                     continue;
                 }
+                if ctx.param(FILLS) != 0.0 && big_fill(beat, bpb) {
+                    continue;
+                }
+                let Some(level) = score_level(&bar, beat % bpb) else { continue };
+                // In-between kicks are a touch softer and duck less, so
+                // faster pumping doesn't choke the mix.
+                let (level, duck) = if tick == 0 { (level, level) } else { (level * 0.85, level * 0.6) };
                 // Tune and length apply per hit, so they never bend a kick
                 // that's already sounding.
                 self.params[TUNE] = ctx.param(TUNE);
                 self.params[LENGTH] = ctx.param(LENGTH);
                 let root_hz = dsp::midi_hz((root_midi(&ctx.tonality) as f64) + self.params[TUNE]);
-                self.voice = Voice { len: (six * self.params[LENGTH] * self.sr) as usize, root_hz, ..Voice::default() };
-                self.events.push(Event { frame: i as u32, kind: EventKind::Duck { strength: 1.0 } });
+                // Never longer than the gap to the next kick.
+                let len = self.params[LENGTH].min(spacing as f64 - 0.05);
+                self.voice = Voice { len: (six * len * self.sr) as usize, root_hz, level, ..Voice::default() };
+                self.events.push(Event { frame: i as u32, kind: EventKind::Duck { strength: duck as f32 } });
             }
             for k in [PUNCH, SWEEP, CLICK, DRIVE] {
                 self.params[k] += (ctx.param(k) - self.params[k]) * self.param_smooth;
@@ -190,6 +236,10 @@ mod tests {
     /// Render `bars` at 120 bpm (one beat = 24 000 frames); returns audio
     /// and the frames of all duck events.
     fn render(bars: usize, params: &[f64]) -> (Vec<f32>, Vec<usize>) {
+        render_with(bars, params, &gen_api::Score::EMPTY)
+    }
+
+    fn render_with(bars: usize, params: &[f64], score: &gen_api::Score) -> (Vec<f32>, Vec<usize>) {
         let mut k = Kick::new(&Config { sample_rate: SR, seed: 3 });
         let block = 480;
         let mut out = vec![0.0f32; bars * 4 * 24_000];
@@ -197,6 +247,7 @@ mod tests {
         let mut ev = Vec::new();
         for (b, chunk) in out.chunks_mut(block).enumerate() {
             let ctx = Context {
+                score,
                 sample_rate: SR,
                 transport: Transport { bpm: 120.0, beat: (b * block) as f64 / 24_000.0, beats_per_bar: 4, playing: true },
                 tonality: Tonality { root: 9, scale: Scale::Phrygian },
@@ -231,6 +282,64 @@ mod tests {
         let mut p = defaults();
         p[FILLS] = 0.0;
         assert_eq!(render(16, &p).1.len(), 16 * 4);
+    }
+
+    #[test]
+    fn follows_the_score() {
+        let mut score = gen_api::Score::EMPTY;
+        score.bars[0] = ScoreBar { mark: Mark::Break, intensity: 1.0, ..ScoreBar::NONE };
+        score.bars[1] = ScoreBar { feel: Feel::Half, ..ScoreBar::NONE };
+        score.bars[2] = ScoreBar { mark: Mark::Quiet, intensity: 0.4, ..ScoreBar::NONE };
+        let (out, ducks) = render_with(4, &defaults(), &score);
+        let beats: Vec<usize> = ducks.iter().map(|f| f / 24_000).collect();
+        // Break: nothing in bar 1. Half: beats 1 and 3 of bar 2. Quiet 0.4
+        // and bar 4: all four.
+        assert_eq!(beats, vec![4, 6, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let peak = |bar: usize| out[bar * 96_000..bar * 96_000 + 4_000].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak(2) < peak(3) * 0.95, "quiet is softer: {} vs {}", peak(2), peak(3));
+    }
+
+    #[test]
+    fn eighths_on_double_sixteenths_on_quad() {
+        let mut score = gen_api::Score::EMPTY;
+        score.bars[0] = ScoreBar { feel: Feel::Double, ..ScoreBar::NONE };
+        score.bars[1] = ScoreBar { feel: Feel::Quad, ..ScoreBar::NONE };
+        let mut ev = Vec::new();
+        let mut k = Kick::new(&Config { sample_rate: SR, seed: 3 });
+        let params = defaults();
+        let block = 480;
+        let mut out = vec![0.0f32; block];
+        let mut frames = Vec::new();
+        for b in 0..3 * 96_000 / block {
+            let ctx = Context {
+                sample_rate: SR,
+                transport: Transport { bpm: 120.0, beat: (b * block) as f64 / 24_000.0, beats_per_bar: 4, playing: true },
+                tonality: Tonality { root: 9, scale: Scale::Phrygian },
+                params: &params,
+                input: &[],
+                score: &score,
+            };
+            k.process(&ctx, &mut out);
+            assert!(out.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+            k.take_events(&mut ev);
+            frames.extend(ev.drain(..).map(|e| (b * block + e.frame as usize, e.kind)));
+        }
+        let six = 6_000;
+        let count = |bar: usize| frames.iter().filter(|f| f.0 / 96_000 == bar).count();
+        assert_eq!((count(0), count(1), count(2)), (8, 16, 4), "8ths, 16ths, then the beat");
+        assert!(frames.iter().filter(|f| f.0 / 96_000 < 2).all(|f| f.0 % six == 0), "on the grid");
+        let strengths: Vec<f32> = frames[..2].iter().map(|f| match f.1 { EventKind::Duck { strength } => strength }).collect();
+        assert_eq!(strengths, vec![1.0, 0.6], "the in-between kick ducks less");
+    }
+
+    #[test]
+    fn tempo_off_keeps_four_on_the_floor() {
+        let mut score = gen_api::Score::EMPTY;
+        score.bars[0] = ScoreBar { feel: Feel::Double, ..ScoreBar::NONE };
+        score.bars[1] = ScoreBar { feel: Feel::Half, ..ScoreBar::NONE };
+        let mut p = defaults();
+        p[TEMPO] = 0.0;
+        assert_eq!(render_with(2, &p, &score).1.len(), 8);
     }
 
     #[test]

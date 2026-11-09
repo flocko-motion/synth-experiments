@@ -10,6 +10,7 @@
 //! allowed cross-origin (CORS).
 
 use crate::api::{ApiError, Ctl};
+use crate::gen::Exit;
 use crate::log::{self, wlog};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -223,9 +224,9 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
         ("GET", ["api", "generators"]) => reply(200, ctl.generators()),
         ("POST", ["api", "generators"]) => reply(201, ctl.add(body!(), cwd)),
         ("PATCH", ["api", "generators", name]) => reply(200, ctl.patch_generator(name.to_string(), body!())),
-        ("DELETE", ["api", "generators", name]) => match ctl.remove(name.to_string()) {
+        ("DELETE", ["api", "generators", name]) => match exit_of(req).and_then(|x| ctl.remove(name.to_string(), x).map_err(|e| Response::error(&e))) {
             Ok(()) => Response::empty(204),
-            Err(e) => Response::error(&e),
+            Err(r) => r,
         },
         ("PATCH", ["api", "generators", name, "params"]) => match glide_of(req) {
             Ok(g) => reply(200, ctl.set_params(name.to_string(), body!(), g)),
@@ -235,9 +236,9 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
         ("GET", ["api", "effects"]) => reply(200, ctl.effects()),
         ("POST", ["api", "effects"]) => reply(201, ctl.add_effect(body!(), None, cwd)),
         ("PATCH", ["api", "effects", name]) => reply(200, ctl.patch_effect(name.to_string(), body!())),
-        ("DELETE", ["api", "effects", name]) => match ctl.remove_effect(name.to_string()) {
+        ("DELETE", ["api", "effects", name]) => match exit_of(req).and_then(|x| ctl.remove_effect(name.to_string(), x).map_err(|e| Response::error(&e))) {
             Ok(()) => Response::empty(204),
-            Err(e) => Response::error(&e),
+            Err(r) => r,
         },
         ("PATCH", ["api", "effects", name, "params"]) => match glide_of(req) {
             Ok(g) => reply(200, ctl.set_effect_params(name.to_string(), body!(), g)),
@@ -253,11 +254,17 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
             Ok(()) => Response::empty(204),
             Err(e) => Response::error(&e),
         },
+        ("GET", ["api", "sequencer"]) => reply(200, ctl.sequencer()),
+        ("PUT", ["api", "sequencer", lane, "banks", bank]) => reply(200, ctl.set_bank(lane, bank, body!())),
+        ("DELETE", ["api", "sequencer", lane, "banks", bank]) => reply(200, ctl.set_bank(lane, bank, Default::default())),
+        ("POST", ["api", "sequencer", lane, "cue"]) => reply(200, ctl.cue(lane, body!())),
+        ("POST", ["api", "sequencer", lane, "banks", bank, "repeat"]) => reply(200, ctl.repeat_bank(lane, bank, body!())),
+        ("POST", ["api", "sequencer", "copy"]) => reply(200, ctl.copy_banks(body!())),
         ("GET", ["api", "log"]) => {
             let after = req.query.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
             Response::json(200, &log_lines(after))
         }
-        (_, ["api", "state" | "transport" | "generators" | "effects" | "catalog" | "favorites" | "log" | "openapi.yaml", ..]) => {
+        (_, ["api", "state" | "transport" | "generators" | "effects" | "catalog" | "favorites" | "sequencer" | "log" | "openapi.yaml", ..]) => {
             Response::json(405, &serde_json::json!({ "error": format!("{m} not allowed on {}", req.path) }))
         }
         _ => Response::json(404, &serde_json::json!({ "error": format!("no such endpoint {}", req.path) })),
@@ -265,6 +272,13 @@ fn route(req: &Request, ctl: &Ctl, cwd: &PathBuf) -> Response {
 }
 
 /// The optional `?glide_bars=N` on param changes.
+fn exit_of(req: &Request) -> Result<Exit, Response> {
+    match req.query.get("exit") {
+        None => Ok(Exit::Now),
+        Some(v) => Exit::parse(v).ok_or_else(|| Response::error(&ApiError::BadRequest(format!("exit={v}: one of now, cycle, epoch, fade_cycle, fade_epoch")))),
+    }
+}
+
 fn glide_of(req: &Request) -> Result<Option<f64>, Response> {
     match req.query.get("glide_bars") {
         None => Ok(None),

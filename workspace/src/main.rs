@@ -14,6 +14,7 @@ mod favorites;
 mod gen;
 mod http;
 mod ring;
+mod sequencer;
 mod sys;
 mod ui;
 
@@ -34,7 +35,8 @@ daemon options:
   --click         start with the metronome on (off by default; ws click on)
   --http ADDR     serve the HTTP API here (default {DEFAULT_HTTP}, loopback only)
   --catalog DIR   where to look for generator binaries (default target/release)
-  --state DIR     where the daemon keeps favourites (default ~/.config/synth-ws)
+  --state DIR     where the daemon keeps favourites and sequencer banks
+                  (default ~/.config/synth-ws)
   --ui DIR        serve the web UI from this directory at / (default workspace/ui)
 
 commands (sent to the running daemon):
@@ -76,6 +78,14 @@ commands (sent to the running daemon):
   url                        the HTTP API's address
   fav PLUGIN / unfav PLUGIN  star or unstar a plugin (kept across restarts)
   favs                       list starred plugins
+  seq                        the sequencer: every lane's banks, playing and cued
+  cue LANE BANK              play BANK (A-D) in LANE from the next epoch;
+                             cueing the playing bank cancels
+  copy FROM TO [LANE..]      copy bank FROM onto TO, in every lane or the
+                             given ones (dynamics, harmony, tempo)
+  repeat LANE BANK 2|4|8     repeat the bank's first half, quarter or eighth
+                             over all 16 bars
+  clear LANE BANK            empty a bank
   quit                       stop the daemon and its generators
 
 grid: tick (16th) -> beat -> bar -> cycle (4 bars) -> epoch (16 bars)

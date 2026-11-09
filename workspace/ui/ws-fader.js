@@ -31,7 +31,6 @@ class WsFader extends LitElement {
 
   static styles = css`
     :host { display: grid; justify-items: center; gap: 6px; --h: 150px; }
-    .readout { font: 12px var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
     .body { display: flex; gap: 6px; height: var(--h); }
     .meter { width: 6px; background: var(--led-off); border-radius: 2px; position: relative; overflow: hidden; }
     .meter .fill {
@@ -192,8 +191,9 @@ class WsFader extends LitElement {
     const shown = this.toDb(v);
     const pct = ((toDb(this.peak, MIN) - MIN) / (0 - MIN)) * 100;
     const pos = (n) => `calc(9px + ${n} * (100% - 18px))`;
+    // No readout on the strip (space); the level is in the tooltip.
+    const dbText = shown <= FLOOR_DB ? '−∞ dB' : `${shown > 0 ? '+' : ''}${shown.toFixed(1)} dB`;
     return html`
-      <span class="readout">${shown <= FLOOR_DB ? '−∞' : (shown > 0 ? '+' : '') + shown.toFixed(1)}</span>
       <div class="body">
         <div class="meter" title="peak"><div class="fill" style="height:${Math.max(0, pct)}%"></div></div>
         ${this.gr === undefined ? '' : html`
@@ -204,7 +204,7 @@ class WsFader extends LitElement {
           </div>`}
         <div class="fader" tabindex="0" role="slider" aria-label="volume in dB"
           aria-valuemin=${FLOOR_DB} aria-valuemax=${MAX} aria-valuenow=${shown}
-          title="drag the cap, click to glide there, Shift for fine, double-click for 0 dB"
+          title="${dbText}\ndrag the cap, click to glide there, Shift for fine, double-click for 0 dB"
           @pointerdown=${this.down} @pointermove=${this.move} @pointerup=${this.release} @pointercancel=${this.release}
           @dblclick=${this.reset} @wheel=${this.wheel} @keydown=${this.key}>
           <div class="groove"></div>

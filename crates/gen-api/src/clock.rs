@@ -89,6 +89,7 @@ mod tests {
 
     fn ctx(beat: f64, playing: bool) -> Context<'static> {
         Context {
+            score: &crate::Score::EMPTY,
             sample_rate: 48_000.0,
             transport: Transport { bpm: 120.0, beat, beats_per_bar: 4, playing },
             tonality: Tonality { root: 0, scale: Scale::Minor },

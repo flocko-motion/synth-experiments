@@ -40,15 +40,35 @@ class WsCatalog extends LitElement {
     picking: { state: true }, // { name, db } while choosing a starting volume
     favs: { state: true }, // starred plugin names (by the daemon; browser storage until it supports them)
     open: { state: true }, // the one open category group, "kind:category"
+    collapsed: { state: true }, // folded to a slim strip; click the title to toggle
   };
 
   static styles = css`
-    :host { display: flex; flex-direction: column; background: var(--panel); }
+    :host { display: flex; flex-direction: column; background: var(--panel); width: 210px; }
+    /* Slim title like the sequencer's; clicking it folds the pane. */
     header {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 10px 12px; border-bottom: 1px solid var(--edge);
+      padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--edge);
     }
-    h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); font-weight: 600; }
+    h2 {
+      margin: 0; font: 600 10px var(--sans); text-transform: uppercase; letter-spacing: 1px; color: var(--text);
+      cursor: pointer; white-space: nowrap;
+    }
+    h2:hover { color: var(--accent); }
+    h2::before { content: '▾'; display: inline-block; width: 11px; }
+    header .refresh { padding: 0 6px; font-size: 11px; border-radius: 4px; }
+    /* Folded: a narrow strip with the title running down it. */
+    :host([collapsed]) { width: 22px; }
+    :host([collapsed]) header { padding: 6px 0; border-bottom: 0; justify-content: center; }
+    :host([collapsed]) h2 { writing-mode: vertical-rl; }
+    :host([collapsed]) h2::before { content: '▸'; height: 11px; width: auto; }
+    :host([collapsed]) header .refresh, :host([collapsed]) ul, :host([collapsed]) .note { display: none; }
+    /* Phones: the pane is a row above the strips, so fold it to its title line. */
+    @media (max-width: 720px) {
+      :host([collapsed]) header { padding: 4px 12px; justify-content: flex-start; }
+      :host([collapsed]) h2 { writing-mode: horizontal-tb; }
+      :host([collapsed]) h2::before { width: 11px; height: auto; }
+    }
     button {
       font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--edge);
       border-radius: 6px; padding: 4px 8px; cursor: pointer;
@@ -111,6 +131,16 @@ class WsCatalog extends LitElement {
     this.adding = {};
     try { this.favs = new Set(JSON.parse(localStorage.getItem('ws-favs') || '[]')); } catch { this.favs = new Set(); }
     try { this.open = localStorage.getItem('ws-catalog-open'); } catch { this.open = null; }
+    try { this.collapsed = localStorage.getItem('ws-catalog-collapsed') === '1'; } catch { this.collapsed = false; }
+  }
+
+  updated() {
+    this.toggleAttribute('collapsed', this.collapsed);
+  }
+
+  toggleCollapsed() {
+    this.collapsed = !this.collapsed;
+    try { localStorage.setItem('ws-catalog-collapsed', this.collapsed ? '1' : '0'); } catch {}
   }
 
   toggle(key) {
@@ -306,7 +336,8 @@ class WsCatalog extends LitElement {
     this.defaultOpen = gens.length ? `generator:${gens[0].category ?? 'other'}` : null;
     return html`
       <header>
-        <h2>Plugins</h2>
+        <h2 role="button" tabindex="0" aria-expanded=${!this.collapsed} title=${this.collapsed ? 'Show the plugins' : 'Hide the plugins'}
+          @click=${this.toggleCollapsed} @keydown=${(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), this.toggleCollapsed())}>Plugins</h2>
         <button class="refresh ${this.loading ? 'spin' : ''}" title="Refresh the list" @click=${this.refresh}>↻</button>
       </header>
       ${this.error ? html`<div class="note err">${this.error}</div>` : ''}

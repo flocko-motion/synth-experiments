@@ -317,7 +317,7 @@ pub fn run<G: Generator>() {
             }
             // Position from the frame count, not accumulated: no drift.
             transport.beat = frame as f64 / spb;
-            let ctx = Context { sample_rate: sr, transport, tonality, params: &values, input: &input[..n * inputs] };
+            let ctx = Context { score: &crate::Score::EMPTY, sample_rate: sr, transport, tonality, params: &values, input: &input[..n * inputs] };
             let out = &mut buf[..n * ch];
             gen.process(&ctx, out);
             // Standalone there's nothing to duck; drain so events don't pile up.

@@ -1,5 +1,8 @@
-// Transport bar: play/stop, tempo, key, click, and the position display
-// (LCD counter plus sequencer LEDs for tick, beat, bar and cycle).
+// Transport bar: play/stop, tempo, and the position display (LCD counter
+// plus LEDs for the 16th and the beat; bars and cycles show in the
+// sequencer grid, the duck level on the master strip). One slim row. Key
+// and chords live in the sequencer; the host key and the metronome are set
+// with `ws key` and `ws click`.
 //
 // State events arrive about 20 times a second; between them the position is
 // extrapolated from `beat` and `bpm` on every animation frame, and the
@@ -11,10 +14,7 @@
 import { LitElement, html, css, nothing } from './vendor/lit-all.min.js';
 import { live } from './vendor/lit-all.min.js';
 import { api } from './api.js';
-import { paramColor } from './ws-knob.js';
 
-const ROOTS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-const SCALES = ['phrygian', 'minor', 'harmonic-minor', 'dorian', 'major'];
 
 /** The grid from openapi.yaml: each level is four of the one below. */
 function grid(beat) {
@@ -30,17 +30,6 @@ function grid(beat) {
   };
 }
 
-/** Latency in beats as a musician would say it: "½ beat", "1¼ beats". */
-function beatsText(b) {
-  if (b == null) return '–';
-  const quarters = Math.round(b * 4);
-  if (quarters === 0) return '<¼ beat';
-  const whole = Math.floor(quarters / 4);
-  const frac = ['', '¼', '½', '¾'][quarters % 4];
-  const n = `${whole || ''}${frac}` || '0';
-  return `${n} beat${quarters === 4 ? '' : quarters > 4 ? 's' : ''}`;
-}
-
 class WsTransport extends LitElement {
   static properties = {
     state: { attribute: false },
@@ -49,13 +38,13 @@ class WsTransport extends LitElement {
 
   static styles = css`
     :host {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px;
-      padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--edge);
+      display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px;
+      padding: 5px 16px; background: var(--panel); border-bottom: 1px solid var(--edge);
     }
-    .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     button {
-      font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--edge);
-      border-radius: 6px; padding: 6px 10px; cursor: pointer; min-width: 36px;
+      font: inherit; font-size: 12px; color: var(--text); background: var(--panel-2); border: 1px solid var(--edge);
+      border-radius: 5px; padding: 3px 8px; cursor: pointer; min-width: 30px;
     }
     button:hover { border-color: var(--dim); }
     button.on { background: var(--accent); color: #1a1205; border-color: var(--accent); }
@@ -63,58 +52,57 @@ class WsTransport extends LitElement {
     label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
     input, select {
       font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--edge);
-      border-radius: 6px; padding: 5px 6px;
+      border-radius: 5px; padding: 2px 5px; font-size: 12px;
     }
-    input[type=number] { width: 64px; }
+    input[type=number] { width: 58px; }
 
     .lcd {
       background: var(--lcd-bg); border: 1px solid #1d2b20; border-radius: 6px;
-      padding: 6px 12px; box-shadow: inset 0 0 12px #000;
-      display: flex; gap: 14px; align-items: flex-end;
+      padding: 3px 10px; box-shadow: inset 0 0 10px #000;
+      display: flex; gap: 8px; align-items: flex-end;
     }
     .field { display: grid; justify-items: center; }
     .digits {
-      font: 600 28px/1 var(--mono); color: var(--lcd); letter-spacing: 1px;
+      font: 600 20px/1 var(--mono); color: var(--lcd); letter-spacing: 1px;
       text-shadow: 0 0 6px color-mix(in srgb, var(--lcd) 60%, transparent);
       font-variant-numeric: tabular-nums;
     }
     .digits.stopped { opacity: .55; }
-    .unit { font: 10px/1.6 var(--sans); color: #4b7a57; text-transform: uppercase; letter-spacing: 1px; }
-    .sep { font: 600 28px/1 var(--mono); color: #2f5a3a; }
+    .unit { font: 7px/1.3 var(--sans); color: #4b7a57; text-transform: uppercase; letter-spacing: 1px; }
+    .sep { font: 600 20px/1 var(--mono); color: #2f5a3a; align-self: flex-start; }
 
-    .leds { display: grid; gap: 5px; }
-    .row { display: flex; align-items: center; gap: 4px; }
-    .row .name { width: 44px; font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+    .leds { display: grid; gap: 4px; }
+    .row { display: flex; align-items: center; gap: 3px; }
+    .row .name { width: 30px; font-size: 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
     .led {
-      width: 14px; height: 10px; border-radius: 2px; background: var(--led-off);
+      width: 14px; height: 7px; border-radius: 2px; background: var(--led-off);
       transition: background 60ms, box-shadow 60ms;
     }
     .group { display: flex; gap: 4px; }
-    .group + .group { margin-left: 6px; }
+    .group { gap: 3px; }
+    .group + .group { margin-left: 5px; }
     .led.lit { box-shadow: 0 0 6px var(--c); background: var(--c); }
     .led.past { background: color-mix(in srgb, var(--c) 28%, var(--led-off)); }
     .row.steps .led { --c: var(--led-beat); width: 10px; }
     .row.steps .led.downbeat:not(.lit) { background: #3a3e43; }
     .row.steps .led.land { outline: 1.5px solid var(--accent); outline-offset: 1px; }
-    .latency { display: grid; justify-items: start; line-height: 1.2; }
-    .latency .big { font: 600 13px var(--mono); color: var(--accent); }
-    .latency .small { font: 10px var(--sans); color: var(--dim); }
-    .buffer { display: grid; gap: 3px; font-size: 10px; color: var(--dim); }
+    .buffer { display: grid; gap: 1px; font-size: 10px; color: var(--dim); }
     .buffer label { font-size: 10px; gap: 4px; }
     .buffer input { width: 52px; padding: 2px 4px; font: 11px var(--mono); }
     .underruns { font: 10px var(--mono); }
     .underruns.recent { color: var(--danger); font-weight: 700; }
     .row.beats .led { --c: var(--led-beat); }
-    .row.bars .led { --c: var(--led-bar); }
-    .row.cycles .led { --c: var(--led-cycle); }
-    .duck { position: relative; height: 6px; width: 200px; background: var(--led-off); border-radius: 2px; overflow: hidden; }
-    .duck .fill {
-      position: absolute; inset: 0 auto 0 0; background: var(--c);
-      box-shadow: 0 0 6px var(--c); transition: width 50ms linear;
-    }
+    .load { display: grid; gap: 3px; font-size: 10px; color: var(--dim); min-width: 92px; }
+    .load b { font: 600 12px var(--mono); color: var(--led-beat); }
+    .load b.warn { color: var(--warn); }
+    .load b.hot { color: var(--danger); }
+    .load .peak { font: 10px var(--mono); }
+    .load .bar { position: relative; height: 4px; border-radius: 2px; background: var(--led-off); overflow: hidden; }
+    .load .fill { position: absolute; inset: 0 auto 0 0; background: var(--led-beat); }
+    .load .fill.warn { background: var(--warn); }
+    .load .fill.hot { background: var(--danger); }
+    .load .pk { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); opacity: .7; }
 
-    .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); }
-    .meta .bad { color: var(--danger); }
   `;
 
   constructor() {
@@ -196,6 +184,18 @@ class WsTransport extends LitElement {
     return [0, 4, 8, 12].map((i) => html`<span class="group">${all.slice(i, i + 4)}</span>`);
   }
 
+  /** DSP load: render time over playing time per block, with its peak. */
+  renderLoad(s) {
+    const load = s.dsp_load ?? 0, peak = s.dsp_peak ?? 0;
+    const level = (x) => (x >= 0.9 ? 'hot' : x >= 0.7 ? 'warn' : '');
+    const pct = (x) => `${Math.round(x * 100)}%`;
+    const width = (x) => `${Math.min(100, x * 100).toFixed(1)}%`;
+    return html`<div class="load" title="DSP load: how long the mixer takes to render a block (every generator and effect, running in parallel, then the mix) compared with how long that block plays. Near 100% the buffer drains and audio drops out; a bigger buffer only buys time. The tick marks the peak of the last few seconds.">
+      <span>DSP <b class=${level(load)}>${pct(load)}</b> <span class="peak">peak ${pct(peak)}</span></span>
+      <span class="bar"><span class="fill ${level(load)}" style="width: ${width(load)}"></span><span class="pk" style="left: ${width(peak)}"></span></span>
+    </div>`;
+  }
+
   render() {
     const s = this.state;
     const p = this.pos;
@@ -221,12 +221,6 @@ class WsTransport extends LitElement {
       <div class="leds">
         <div class="row steps"><span class="name">16th</span>${this.steps(p.step, playing ? p.land : undefined)}</div>
         <div class="row beats"><span class="name">beat</span>${this.leds(4, p.beat)}</div>
-        <div class="row bars"><span class="name">bar</span>${this.leds(4, p.bar)}</div>
-        <div class="row cycles"><span class="name">cycle</span>${this.leds(4, p.cycle)}</div>
-        <div class="row" title="Duck envelope: how far the kick is turning things down right now">
-          <span class="name">duck</span>
-          <span class="duck" style="--c:${paramColor('duck')}"><span class="fill" style="width:${Math.round((s?.duck ?? 0) * 100)}%"></span></span>
-        </div>
       </div>
 
       <div class="controls">
@@ -234,23 +228,9 @@ class WsTransport extends LitElement {
           <input type="number" min="20" max="300" step="0.5" .value=${live(String(s?.bpm ?? ''))}
             @change=${(e) => this.send({ bpm: Number(e.target.value) })}>
         </label>
-        <label>Key
-          <select .value=${live(s?.root ?? 'E')} @change=${(e) => this.send({ root: e.target.value })}>
-            ${ROOTS.map((r) => html`<option ?selected=${s?.root === r}>${r}</option>`)}
-          </select>
-          <select .value=${live(s?.scale ?? 'phrygian')} @change=${(e) => this.send({ scale: e.target.value })}>
-            ${SCALES.map((sc) => html`<option ?selected=${s?.scale === sc}>${sc}</option>`)}
-          </select>
-        </label>
-        <button class=${s?.click ? 'on' : ''} title="Metronome" @click=${() => this.send({ click: !s?.click })}>Click</button>
       </div>
 
       ${s ? html`
-        <div class="latency" title="How far in the future a fader, knob or transport change lands: ${Math.round(s.latency_ms ?? s.ahead_ms)} ms measured, ${Math.round(s.ahead_ms)} ms target, plus the audio device's own few ms. The outlined LED marks the step.">
-          <span class="small">changes land</span>
-          <span class="big">${beatsText(s.latency_beats)} later</span>
-          <span class="small">${Math.round(s.latency_ms ?? s.ahead_ms)} ms</span>
-        </div>
         <div class="buffer" title="Render-ahead buffer: smaller means changes land sooner, but heavy plugins may glitch (underruns). Shrinking takes effect as the buffer drains, without a cut.">
           <label>buffer
             <input type="number" min="20" max="2000" step="10" .value=${live(String(Math.round(s.ahead_ms)))}
@@ -259,7 +239,7 @@ class WsTransport extends LitElement {
           <span class="underruns ${this.underrunAt && performance.now() - this.underrunAt < 5000 ? 'recent' : ''}"
             title="Times the audio device found the buffer empty (audible glitches). Red for 5 s after a new one.">${s.underruns} underruns</span>
         </div>
-        <div class="meta">${s.sample_rate / 1000} kHz</div>` : nothing}
+        ${this.renderLoad(s)}` : nothing}
     `;
   }
 }

@@ -3,22 +3,31 @@
 // `detail` = `{ [id]: value, ... }`. Used in channel strips and insert
 // panels.
 //
+// Next to random (R) sit the standard toggles many plugins share, fills
+// (F) and tempo (T), on every channel strip: lit when on, greyed when the
+// plugin doesn't have one, explained on hover. They're left out of the
+// grid. Insert panels (`standard` off) show only R.
+//
 // The random button asks the mixer to randomize the plugin (it picks the
 // values and slides each param over the plugin's own random_glide_bars;
-// knobs follow the state). Emits `randomize`. The undo button slides back
-// to the values from before the last random. Mixer settings shown
+// knobs follow the state). Emits `randomize`. Mixer settings shown
 // alongside (the effect's Duck knob) are never randomised.
 
 import { LitElement, html, css, nothing } from './vendor/lit-all.min.js';
 import { live } from './vendor/lit-all.min.js';
 import { DUCK_ID } from './ws-knob.js';
 
-const UNDO_GLIDE_BARS = 1; // undo slides back over this long
+/** Toggles many plugins share, as buttons in the tools row. */
+const STANDARD = [
+  { id: 'fills', label: 'F', title: 'Fills: drop-outs and runs at the end of phrases' },
+  { id: 'tempo', label: 'T', title: "Tempo: follow the score's tempo feel (half, double, quad, triplet)" },
+];
+const isStandard = (p) => p.kind === 'toggle' && STANDARD.some((t) => t.id === p.id);
 
 class WsParams extends LitElement {
   static properties = {
     params: { attribute: false },
-    previous: { state: true }, // values before the last roll, for undo
+    standard: { type: Boolean }, // show the fills and tempo buttons
   };
 
   static styles = css`
@@ -35,11 +44,12 @@ class WsParams extends LitElement {
     .tools button { flex: 1; font: 600 9px/1 var(--sans); letter-spacing: .5px; text-transform: uppercase; padding: 3px 0; color: var(--dim); }
     .tools button:hover:not(:disabled) { color: var(--text); border-color: var(--dim); }
     .tools button:disabled { opacity: .35; cursor: default; }
+    .tools button.on { background: var(--accent); border-color: var(--accent); color: #1a1205; }
   `;
 
   constructor() {
     super();
-    this.previous = null;
+    this.standard = true;
   }
 
   /** `glideBars` makes the mixer slide there instead of jumping. */
@@ -57,14 +67,7 @@ class WsParams extends LitElement {
   randomize() {
     const params = this.pluginParams;
     if (!params.length) return;
-    this.previous = Object.fromEntries(params.map((p) => [p.id, p.value]));
     this.dispatchEvent(new CustomEvent('randomize'));
-  }
-
-  undo() {
-    if (!this.previous) return;
-    this.send(this.previous, UNDO_GLIDE_BARS);
-    this.previous = null;
   }
 
   control(p) {
@@ -87,16 +90,23 @@ class WsParams extends LitElement {
     }
   }
 
+  toggleButton(t) {
+    const p = (this.params ?? []).find((d) => d.id === t.id && d.kind === 'toggle');
+    if (!p) return html`<button disabled title="${t.title}. This plugin doesn't have it.">${t.label}</button>`;
+    const on = p.value >= 0.5;
+    return html`<button class=${on ? 'on' : ''} aria-pressed=${on} title="${t.title} (${on ? 'on' : 'off'})"
+      @click=${() => this.send({ [t.id]: on ? 0 : 1 })}>${t.label}</button>`;
+  }
+
   render() {
-    if (!this.params?.length) return nothing;
     const canRoll = this.pluginParams.length > 0;
     // The tools row comes first, so it stays visible when the panel scrolls.
     return html`<div class="grid">
-      ${canRoll ? html`<div class="tools">
-        <button title="Random values for every parameter, sliding there" @click=${this.randomize}>random</button>
-        <button title="Undo the last random" ?disabled=${!this.previous} @click=${this.undo}>undo</button>
-      </div>` : nothing}
-      ${this.params.map((p) => this.control(p))}
+      <div class="tools">
+        <button title="Random: new values for every parameter, sliding there" ?disabled=${!canRoll} @click=${this.randomize}>R</button>
+        ${this.standard ? STANDARD.map((t) => this.toggleButton(t)) : nothing}
+      </div>
+      ${(this.params ?? []).filter((p) => !(this.standard && isStandard(p))).map((p) => this.control(p))}
     </div>`;
   }
 }

@@ -33,6 +33,7 @@ async function call(method, path, body) {
 
 const gen = (name) => `/api/generators/${encodeURIComponent(name)}`;
 const fx = (name) => `/api/effects/${encodeURIComponent(name)}`;
+const exitQuery = (exit) => (exit && exit !== 'now' ? `?exit=${exit}` : '');
 const glide = (bars) => (bars ? `?glide_bars=${bars}` : '');
 
 export const api = {
@@ -47,7 +48,9 @@ export const api = {
   // `glideBars`: slide to the values over that many bars (the mixer does it,
   // tempo-synced; state follows the slide). Without it they jump.
   params: (name, values, glideBars) => call('PATCH', gen(name) + '/params' + glide(glideBars), values),
-  remove: (name) => call('DELETE', gen(name)),
+  // `exit`: now (default), cycle, epoch, fade_cycle or fade_epoch; the
+  // mixer cuts or fades the channel out and removes it at that line.
+  remove: (name, exit) => call('DELETE', gen(name) + exitQuery(exit)),
   restart: (name) => call('POST', gen(name) + '/restart'),
   // The mixer picks random values and slides there (per-param slide times).
   randomize: (name) => call('POST', gen(name) + '/randomize'),
@@ -59,9 +62,19 @@ export const api = {
   addInsert: (generator, spec) => call('POST', gen(generator) + '/inserts', spec),
   patchEffect: (name, patch) => call('PATCH', fx(name), patch),
   effectParams: (name, values, glideBars) => call('PATCH', fx(name) + '/params' + glide(glideBars), values),
-  removeEffect: (name) => call('DELETE', fx(name)),
+  removeEffect: (name, exit) => call('DELETE', fx(name) + exitQuery(exit)),
   restartEffect: (name) => call('POST', fx(name) + '/restart'),
   randomizeEffect: (name) => call('POST', fx(name) + '/randomize'),
+
+  // Sequencer (docs/sequencer.md): banks A-D per lane. A bank is
+  // { layer: [regions] }; setting the playing bank is live.
+  setBank: (lane, bank, content) => call('PUT', `/api/sequencer/${lane}/banks/${bank}`, content),
+  clearBank: (lane, bank) => call('DELETE', `/api/sequencer/${lane}/banks/${bank}`),
+  cue: (lane, bank) => call('POST', `/api/sequencer/${lane}/cue`, { bank }),
+  // Repeat the first half (2), quarter (4) or eighth (8) over the bank.
+  repeatBank: (lane, bank, times) => call('POST', `/api/sequencer/${lane}/banks/${bank}/repeat`, { times }),
+  // Every lane unless `lanes` names some.
+  copyBanks: (from, to, lanes) => call('POST', '/api/sequencer/copy', lanes ? { from, to, lanes } : { from, to }),
 };
 
 /**

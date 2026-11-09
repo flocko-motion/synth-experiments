@@ -11,11 +11,19 @@
 //! - **Zaps**: short laser sweeps on off-beat 16ths, panned left and right;
 //!   each cycle seeds a few candidate spots and `zaps` sets how many fire.
 //!
+//! Tonal parts (the impact's sub, the riser's saw) tune to the workspace
+//! score's chord root where the bar has one, otherwise to the key's root.
+//!
+//! The workspace score: a `rise` gets a riser across the whole region that
+//! ends on its last bar, then an impact; a `break` and a `peak` land with
+//! an impact and downlifter; zaps thin out in a `quiet` and pick up in a
+//! `break` (fx carries it) and a `peak`.
+//!
 //! Everything hangs on the host's grid (the same 16-bar sections `kick` and
 //! `bass` fill on), so the riser ends where the kick's gap ends.
 
 use dsp::{decay_coef, midi_hz, pan_gains, saw, soft_limit, OnePole, Svf};
-use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock, Tonality, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
+use gen_api::{Config, Context, Entry, Generator, Info, Mark, Param, Rng, StepClock, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
 use std::f64::consts::PI;
 
 const SECTION_BARS: u64 = (BARS_PER_CYCLE * CYCLES_PER_EPOCH) as u64;
@@ -49,8 +57,17 @@ const ZAP_CANDIDATES: usize = 6;
 const ZAP_VOICES: usize = 4;
 
 /// Bass register root (D1..C#2), as in psybass, kick and bass.
-fn root_midi(t: &Tonality) -> i32 {
-    26 + (t.root as i32 + 10) % 12
+fn root_midi(pc: u8) -> i32 {
+    26 + (pc as i32 + 10) % 12
+}
+
+/// The root pitch class at `beat`: the score's chord root where it has a
+/// chord, otherwise the key's.
+fn root_at(ctx: &Context, beat: f64) -> u8 {
+    match ctx.score.at(beat, ctx.transport.beats_per_bar).chord {
+        Some(c) => c.root,
+        None => ctx.tonality.root,
+    }
 }
 
 // ---------------------------------------------------------------- voices
@@ -144,11 +161,19 @@ impl Fx {
         let section_steps = bar_steps * SECTION_BARS;
         let spb = 60.0 / tr.bpm;
 
-        // Impact and downlifter on the downbeat of every section but the first.
-        if step % section_steps == 0 && step > 0 {
+        // Impact and downlifter on the downbeat of every section but the
+        // first, and where the score lands somewhere: the start of a break
+        // or a peak, and the bar after a rise.
+        let bar = step / bar_steps;
+        let lands = step % bar_steps == 0 && bar > 0 && {
+            let (now, before) = (ctx.score.bar(bar), ctx.score.bar(bar - 1));
+            let new_region = now.mark_start == bar;
+            (new_region && matches!(now.mark, Mark::Break | Mark::Peak)) || (before.mark == Mark::Rise && new_region)
+        };
+        if (step % section_steps == 0 && step > 0) || lands {
             self.impact_t = Some(0.0);
             self.impact_phase = 0.0;
-            self.impact_root = midi_hz(root_midi(&ctx.tonality) as f64);
+            self.impact_root = midi_hz(root_midi(root_at(ctx, step as f64 / tpb as f64)) as f64);
             self.down_t = Some(0.0);
             self.down_len = 2.0 * tr.beats_per_bar.max(1) as f64 * spb;
         }
@@ -158,7 +183,16 @@ impl Fx {
             self.cycle = Some(self.compose_cycle(cycle, cycle_steps));
         }
         let in_cycle = step % cycle_steps;
-        let zaps = ctx.param(ZAPS);
+        // The score: no zaps in a deep quiet, more in a break (fx carries
+        // it) and a peak.
+        let sb = ctx.score.bar(bar);
+        let i = sb.intensity as f64;
+        let zaps = match sb.mark {
+            Mark::Quiet => ctx.param(ZAPS) * (1.0 - i),
+            Mark::Break => (ctx.param(ZAPS) + 0.4 * i).min(1.0),
+            Mark::Peak => (ctx.param(ZAPS) + 0.2 * i).min(1.0),
+            _ => ctx.param(ZAPS),
+        };
         let candidates = self.cycle.as_ref().unwrap().1;
         for c in candidates.iter().filter(|c| c.step == in_cycle && c.draw < zaps) {
             self.zaps[self.next_zap] = c.zap;
@@ -250,10 +284,20 @@ impl Generator for Fx {
 
             // Riser: position within its window at the end of the section.
             let beat = tr.beat + i as f64 / spb;
-            let riser_beats = LENGTH_BARS[ctx.param(LENGTH) as usize] * tr.beats_per_bar.max(1) as f64;
-            let u = ((beat % section_beats) - (section_beats - riser_beats)) / riser_beats;
+            // Where the score has a rise, the riser spans it and ends on its
+            // last bar; in a quiet it fades with intensity; otherwise it
+            // rides the 16-bar grid.
+            let sb = ctx.score.at(beat, tr.beats_per_bar);
+            let (u, level) = match sb.mark {
+                Mark::Rise => (ctx.score.progress(beat, tr.beats_per_bar), 0.5 + 0.5 * sb.intensity as f64),
+                mark => {
+                    let riser_beats = LENGTH_BARS[ctx.param(LENGTH) as usize] * tr.beats_per_bar.max(1) as f64;
+                    let u = ((beat % section_beats) - (section_beats - riser_beats)) / riser_beats;
+                    (u, if mark == Mark::Quiet { 1.0 - sb.intensity as f64 } else { 1.0 })
+                }
+            };
             let in_riser = tr.playing && (0.0..1.0).contains(&u);
-            let target = if in_riser { u.powf(self.character.riser_curve) * p[RISER] } else { 0.0 };
+            let target = if in_riser { u.powf(self.character.riser_curve) * p[RISER] * level } else { 0.0 };
             self.riser_amp += (target - self.riser_amp) * self.amp_smooth;
             if self.riser_amp > 1e-5 {
                 let u = u.clamp(0.0, 1.0);
@@ -264,7 +308,7 @@ impl Generator for Fx {
                 let mid = (n[0] + n[1]) * 0.5;
                 let side = (n[0] - n[1]) * 0.5 * w;
                 let src = [mid + side, mid - side];
-                let saw_hz = midi_hz((root_midi(&ctx.tonality) + 24) as f64 + 24.0 * u);
+                let saw_hz = midi_hz((root_midi(root_at(ctx, beat)) + 24) as f64 + 24.0 * u);
                 let s = saw(self.saw_phase, saw_hz * dt) * self.character.riser_saw;
                 self.saw_phase = (self.saw_phase + saw_hz * dt).fract();
                 for k in 0..2 {
@@ -333,18 +377,23 @@ impl Generator for Fx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gen_api::{Scale, Transport};
+    use gen_api::{Scale, Tonality, Transport};
 
     const SR: f64 = 48_000.0;
     const BEAT: usize = 24_000; // 120 bpm
     const BAR: usize = 4 * BEAT;
 
     fn render(bars: usize, params: &[f64], playing: bool) -> Vec<f32> {
+        render_with(bars, params, playing, &gen_api::Score::EMPTY)
+    }
+
+    fn render_with(bars: usize, params: &[f64], playing: bool, score: &gen_api::Score) -> Vec<f32> {
         let mut g = Fx::new(&Config { sample_rate: SR, seed: 5 });
         let block = 480;
         let mut out = vec![0.0f32; bars * BAR * 2];
         for (b, chunk) in out.chunks_mut(block * 2).enumerate() {
             let ctx = Context {
+                score,
                 sample_rate: SR,
                 transport: Transport { bpm: 120.0, beat: (b * block) as f64 / BEAT as f64, beats_per_bar: 4, playing },
                 tonality: Tonality { root: 9, scale: Scale::Phrygian },
@@ -389,6 +438,60 @@ mod tests {
         let at = 16 * BAR * 2;
         let peak = out[at..at + 9600 * 2].iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!(peak > 0.3, "impact peak {peak}");
+    }
+
+    #[test]
+    fn impact_tunes_to_the_score_chord() {
+        // F in E phrygian on bar 17, where the impact lands.
+        let mut score = gen_api::Score::EMPTY;
+        score.bars[16].chord = Some(gen_api::Chord { root: 5, tones: (1 << 5) | (1 << 9) | (1 << 0) });
+        for (score, pc) in [(&gen_api::Score::EMPTY, 4), (&score, 5)] {
+            let mut g = Fx::new(&Config { sample_rate: SR, seed: 5 });
+            let params = defaults();
+            let block = 480;
+            let mut out = vec![0.0f32; block * 2];
+            for b in 0..(16 * BAR + BEAT) / block {
+                let ctx = Context {
+                    score,
+                    sample_rate: SR,
+                    transport: Transport { bpm: 120.0, beat: (b * block) as f64 / BEAT as f64, beats_per_bar: 4, playing: true },
+                    tonality: Tonality { root: 4, scale: Scale::Phrygian },
+                    params: &params,
+                    input: &[],
+                };
+                g.process(&ctx, &mut out);
+            }
+            assert!((g.impact_root - midi_hz(root_midi(pc) as f64)).abs() < 1e-9, "pc {pc}: {}", g.impact_root);
+        }
+    }
+
+    #[test]
+    fn rise_gets_a_riser_and_lands_with_an_impact() {
+        use gen_api::ScoreBar;
+        // A 4-bar rise over bars 3-6 (0-based 2..6); nothing else marked.
+        let mut score = gen_api::Score::EMPTY;
+        for b in 2..6 {
+            score.bars[b] = ScoreBar { mark: Mark::Rise, intensity: 1.0, mark_start: 2, mark_bars: 4, ..ScoreBar::NONE };
+        }
+        let out = render_with(8, &quiet(), true, &score);
+        assert!(rms(&out, 0, 2) < 1e-4, "quiet before the rise");
+        assert!(rms(&out, 5, 6) > 2.0 * rms(&out, 3, 4), "builds to the rise's end");
+        // Impact on the bar after the rise, where unscored fx is silent.
+        let at = 6 * BAR * 2;
+        let peak = |x: &[f32]| x[at..at + 9600 * 2].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let plain = render(8, &quiet(), true);
+        assert!(peak(&out) > 0.15 && peak(&plain) < 1e-4, "{} vs {}", peak(&out), peak(&plain));
+    }
+
+    #[test]
+    fn deep_quiet_mutes_the_grid_riser() {
+        use gen_api::ScoreBar;
+        let mut score = gen_api::Score::EMPTY;
+        for b in 0..16 {
+            score.bars[b] = ScoreBar { mark: Mark::Quiet, intensity: 1.0, mark_start: 0, mark_bars: 16, ..ScoreBar::NONE };
+        }
+        let out = render_with(16, &defaults(), true, &score);
+        assert!(rms(&out, 0, 16) < 1e-6, "no riser, no zaps");
     }
 
     #[test]

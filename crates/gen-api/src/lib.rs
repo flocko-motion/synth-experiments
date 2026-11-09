@@ -224,6 +224,27 @@ impl Tonality {
     pub fn degree(&self, degree: i32) -> i32 {
         self.scale.intervals()[degree.rem_euclid(7) as usize] + 12 * degree.div_euclid(7)
     }
+
+    /// A line written in scale degrees, played over `chord`: returns the
+    /// pitch class the line is built on and the semitones from it to
+    /// `degree`. With a chord, degree 0 is the chord root and the other
+    /// degrees count up the scale from the chord's degree, so they stay in
+    /// the key; a chord root outside the scale transposes the key's shape
+    /// instead. Without a chord it's the key's root and [`degree`](Self::degree).
+    ///
+    /// Callers put the pitch class in their own register, e.g.
+    /// `register_root(pc) + semis`.
+    pub fn chord_degree(&self, chord: Option<Chord>, degree: i32) -> (u8, i32) {
+        let Some(chord) = chord else { return (self.root, self.degree(degree)) };
+        let from = chord.degree_in(self).unwrap_or(0);
+        (chord.root, self.degree(from + degree) - self.degree(from))
+    }
+
+    /// The scale degree whose [`degree`](Self::degree) is `semis`, if any
+    /// (from three octaves down to three up): for lines stored as semitones.
+    pub fn degree_of(&self, semis: i32) -> Option<i32> {
+        (-21..=21).find(|&d| self.degree(d) == semis)
+    }
 }
 
 /// Everything the host tells the generator for one block.
@@ -240,12 +261,141 @@ pub struct Context<'a> {
     /// [`Generator::inputs`] channels, the same frame count as `out`.
     /// Empty for generators.
     pub input: &'a [f32],
+    /// The workspace's score around now: dynamics marks, chords, keys and
+    /// tempo feel per bar. [`Score::EMPTY`] when the host has none (the
+    /// standalone CLI, older hosts), which reads as "nothing marked".
+    pub score: &'a Score,
 }
 
 impl Context<'_> {
     /// Value of parameter `index` (its position in [`Generator::params`]).
     pub fn param(&self, index: usize) -> f64 {
         self.params[index]
+    }
+}
+
+/// A dynamics mark from the host's score: what the music is doing at a bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mark {
+    /// Nothing marked: play as without a score.
+    #[default]
+    Normal,
+    /// Take things away.
+    Quiet,
+    /// Build towards the region's end.
+    Rise,
+    /// Everything in, full energy.
+    Peak,
+    /// Breakdown: kick and bass out, pads and FX carry it.
+    Break,
+}
+
+impl Mark {
+    pub const ALL: [Mark; 5] = [Mark::Normal, Mark::Quiet, Mark::Rise, Mark::Peak, Mark::Break];
+}
+
+/// Tempo feel from the host's score: a hint, the clock never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Feel {
+    #[default]
+    Normal,
+    Half,
+    Double,
+    Quad,
+    Triplet,
+}
+
+impl Feel {
+    pub const ALL: [Feel; 5] = [Feel::Normal, Feel::Half, Feel::Double, Feel::Quad, Feel::Triplet];
+}
+
+/// A chord the host resolved from the score: its root and its pitch
+/// classes, absolute (not relative to the key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chord {
+    /// Pitch class, 0 = C.
+    pub root: u8,
+    /// Bit `n` set: pitch class `n` is in the chord. The root is always in.
+    pub tones: u16,
+}
+
+impl Chord {
+    pub fn contains(&self, pitch_class: i32) -> bool {
+        self.tones & (1 << pitch_class.rem_euclid(12)) != 0
+    }
+
+    /// The scale degree (0-6) of the chord root in `key`, if it's in the
+    /// scale.
+    pub fn degree_in(&self, key: &Tonality) -> Option<i32> {
+        (0..7).find(|&d| (key.root as i32 + key.degree(d)).rem_euclid(12) == self.root as i32)
+    }
+}
+
+/// One bar of the score.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScoreBar {
+    pub mark: Mark,
+    /// 0..1; 1 unless the mark says otherwise. 0 for [`Mark::Normal`].
+    pub intensity: f32,
+    /// The mark's region: first bar (absolute, see
+    /// [`Position::absolute_bar`]) and length in bars. For an unmarked bar,
+    /// the bar itself and 1.
+    pub mark_start: u64,
+    pub mark_bars: u32,
+    /// The key at this bar when the score sets one; `None` means the host's
+    /// key. [`Context::tonality`] already follows it.
+    pub key: Option<Tonality>,
+    pub chord: Option<Chord>,
+    pub feel: Feel,
+}
+
+impl ScoreBar {
+    pub const NONE: ScoreBar =
+        ScoreBar { mark: Mark::Normal, intensity: 0.0, mark_start: 0, mark_bars: 1, key: None, chord: None, feel: Feel::Normal };
+}
+
+/// Bars in the score window the host sends: the current epoch and the next.
+pub const SCORE_BARS: usize = 32;
+
+/// The score around now: [`SCORE_BARS`] bars from the start of the current
+/// epoch. The host sends it again whenever it changes (an edit, a bank
+/// switch, the next epoch starting), with a new `revision`; generators that
+/// plan ahead re-plan when it changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Score {
+    pub revision: u32,
+    /// Absolute bar of `bars[0]`.
+    pub first_bar: u64,
+    pub bars: [ScoreBar; SCORE_BARS],
+}
+
+impl Default for Score {
+    fn default() -> Score {
+        Score::EMPTY
+    }
+}
+
+impl Score {
+    pub const EMPTY: Score = Score { revision: 0, first_bar: 0, bars: [ScoreBar::NONE; SCORE_BARS] };
+
+    /// The bar at `absolute_bar`; unmarked outside the window.
+    pub fn bar(&self, absolute_bar: u64) -> ScoreBar {
+        match absolute_bar.checked_sub(self.first_bar) {
+            Some(i) if (i as usize) < SCORE_BARS => self.bars[i as usize],
+            _ => ScoreBar { mark_start: absolute_bar, ..ScoreBar::NONE },
+        }
+    }
+
+    /// The bar at a musical position (quarter notes since 0).
+    pub fn at(&self, beat: f64, beats_per_bar: u32) -> ScoreBar {
+        self.bar((beat.max(0.0) / beats_per_bar.max(1) as f64) as u64)
+    }
+
+    /// How far through its mark region `beat` is, 0..1.
+    pub fn progress(&self, beat: f64, beats_per_bar: u32) -> f64 {
+        let b = self.at(beat, beats_per_bar);
+        let bpb = beats_per_bar.max(1) as f64;
+        ((beat / bpb - b.mark_start as f64) / b.mark_bars.max(1) as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -512,6 +662,21 @@ fn json_num(v: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chord_degree_counts_from_the_chord_in_the_key() {
+        let a_phr = Tonality { root: 9, scale: Scale::Phrygian }; // A Bb C D E F G
+        assert_eq!(a_phr.chord_degree(None, 4), (9, 7));
+        let c = Some(Chord { root: 0, tones: 0b1000_1001_0001 });
+        assert_eq!(a_phr.chord_degree(c, 0), (0, 0));
+        assert_eq!(a_phr.chord_degree(c, 1), (0, 2), "C to D");
+        assert_eq!(a_phr.chord_degree(c, 3), (0, 5), "C to F");
+        let cs = Some(Chord { root: 1, tones: 0b10 });
+        assert_eq!(a_phr.chord_degree(cs, 1), (1, 1), "outside the scale: the key's shape");
+        assert_eq!(a_phr.degree_of(12), Some(7));
+        assert_eq!(a_phr.degree_of(-2), Some(-1));
+        assert_eq!(a_phr.degree_of(2), None);
+    }
+
     use super::*;
 
     #[test]

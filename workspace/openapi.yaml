@@ -227,8 +227,16 @@ paths:
     delete:
       operationId: removeGenerator
       summary: Stop a generator and remove it
+      description: |
+        With `exit`, the generator stays until a grid line (cut there, or
+        faded out on the way), reporting state `exiting` and `exiting`, then
+        goes with its inserts. Removing again replaces a pending exit, so
+        `exit=now` cuts a fade short.
+      parameters:
+        - $ref: "#/components/parameters/Exit"
       responses:
-        "204": { description: Removed }
+        "204": { description: Removed, or its exit is scheduled }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /api/generators/{name}/params:
@@ -366,9 +374,15 @@ paths:
     delete:
       operationId: removeEffect
       summary: Stop an effect and remove it
-      description: Removes it from its chain, or drops every generator's send to it.
+      description: |
+        Removes it from its chain, or drops every generator's send to it.
+        `exit` schedules a send effect's removal as for removeGenerator
+        (its return is cut or faded); inserts always go at once.
+      parameters:
+        - $ref: "#/components/parameters/Exit"
       responses:
-        "204": { description: Removed }
+        "204": { description: Removed, or its exit is scheduled }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /api/effects/{name}/params:
@@ -529,6 +543,147 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "500": { $ref: "#/components/responses/Internal" }
 
+  /api/sequencer:
+    get:
+      operationId: getSequencer
+      summary: The score, every lane's banks
+      description: |
+        See docs/sequencer.md. Three lanes (dynamics, harmony, tempo), each
+        with banks A-D of 16 bars; each lane plays one bank in a loop. Also
+        in every `state` event. Bank contents are kept on disk
+        (`--state DIR`, `sequencer.json`); which bank plays is not.
+      responses:
+        "200":
+          description: The sequencer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+
+  /api/sequencer/{lane}/banks/{bank}:
+    parameters:
+      - { $ref: "#/components/parameters/Lane" }
+      - { $ref: "#/components/parameters/Bank" }
+    put:
+      operationId: setBank
+      summary: Replace a bank's regions
+      description: |
+        Editing the playing bank is live; editing another prepares it.
+        Regions are checked (inside bars 1-16, no overlaps within a layer,
+        values valid for the layer) and returned in canonical form.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Bank" }
+      responses:
+        "200":
+          description: The sequencer after the edit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+    delete:
+      operationId: clearBank
+      summary: Empty a bank
+      responses:
+        "200":
+          description: The sequencer after the edit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/sequencer/{lane}/banks/{bank}/repeat:
+    parameters:
+      - { $ref: "#/components/parameters/Lane" }
+      - { $ref: "#/components/parameters/Bank" }
+    post:
+      operationId: repeatBank
+      summary: Repeat a bank's start over the rest of it
+      description: |
+        `times` 2 copies the first 8 bars onto the last 8, 4 repeats the
+        first 4 bars, 8 the first 2. Regions reaching past the repeated part
+        are cut at its end. Live on the playing bank.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [times]
+              additionalProperties: false
+              properties:
+                times: { type: integer, enum: [2, 4, 8] }
+      responses:
+        "200":
+          description: The sequencer after the edit
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/sequencer/{lane}/cue:
+    parameters:
+      - { $ref: "#/components/parameters/Lane" }
+    post:
+      operationId: cueBank
+      summary: Play a bank from the next epoch
+      description: |
+        The cued bank takes over at the next epoch boundary, from its bar 1.
+        One cue per lane: cueing again replaces it, and cueing the playing
+        bank cancels it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bank]
+              additionalProperties: false
+              properties:
+                bank: { $ref: "#/components/schemas/BankName" }
+      responses:
+        "200":
+          description: The sequencer with the cue
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/sequencer/copy:
+    post:
+      operationId: copyBanks
+      summary: Copy a bank onto another
+      description: |
+        Replaces bank `to` with bank `from` in every lane, or only in
+        `lanes`. Copying onto the playing bank is live.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              additionalProperties: false
+              properties:
+                from: { $ref: "#/components/schemas/BankName" }
+                to: { $ref: "#/components/schemas/BankName" }
+                lanes:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/LaneName" }
+      responses:
+        "200":
+          description: The sequencer after the copy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sequencer" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/log:
     get:
       operationId: getLog
@@ -549,6 +704,28 @@ paths:
 
 components:
   parameters:
+    Lane:
+      name: lane
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/LaneName" }
+    Bank:
+      name: bank
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/BankName" }
+    Exit:
+      name: exit
+      in: query
+      required: false
+      description: |
+        How it leaves the mix. `now` (default): straight away. `cycle` /
+        `epoch`: cut at the next cycle (4 bars) or epoch (16 bars) line.
+        `fade_cycle` / `fade_epoch`: fade out, gone at that line. A removal
+        right on a line waits for the next one. Only playing time counts: a
+        stopped transport holds it; a seek back moves the line to the next
+        one after the new position.
+      schema: { $ref: "#/components/schemas/ExitMode" }
     GlideBars:
       name: glide_bars
       in: query
@@ -640,7 +817,7 @@ components:
 
     State:
       type: object
-      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, duck, soloing, ahead_ms, latency_ms, latency_beats, underruns, sample_rate, generators, effects]
+      required: [playing, position, beat, bpm, root, scale, click, click_db, master_db, master_peak, duck, soloing, ahead_ms, latency_ms, latency_beats, underruns, dsp_load, dsp_peak, sample_rate, generators, effects, sequencer]
       properties:
         playing: { type: boolean }
         position: { $ref: "#/components/schemas/Position" }
@@ -658,7 +835,10 @@ components:
         latency_ms: { type: number, minimum: 0, description: "How far in the future a change lands right now: from what's playing to where the mixer renders next. Varies around ahead_ms; the audio device's own few ms come on top." }
         latency_beats: { type: number, minimum: 0, description: "latency_ms in beats at the current tempo." }
         underruns: { type: integer, minimum: 0, description: "Times the audio device found the buffer empty (audible glitches)." }
+        dsp_load: { type: number, minimum: 0, description: "Time to render a block (every generator and effect, in parallel, then the mix) over the time it plays, smoothed. Near 1 the buffer drains and audio drops out." }
+        dsp_peak: { type: number, minimum: 0, description: "Recent peak of dsp_load, falling back over a couple of seconds." }
         sample_rate: { type: integer }
+        sequencer: { $ref: "#/components/schemas/Sequencer" }
         generators:
           type: array
           items: { $ref: "#/components/schemas/Generator" }
@@ -692,13 +872,14 @@ components:
         - `nan`: producing NaN/inf (silenced; restarted if it persists)
         - `muted`: running, muted
         - `entering`: just added, waiting for the bar line or fading in (see `entry`)
+        - `exiting`: removed with an `exit`, playing or fading out until its line (see `exiting`)
         - `starting`: a restart is in progress
         - `retry 1.2s`: waiting to restart after a failure (pattern `retry <seconds>s`)
       examples: [ok, late, nan, muted, entering, starting, "retry 1.2s"]
 
     Generator:
       type: object
-      required: [name, command, description, category, channels, inputs, params, gain_db, muted, solo, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, duck_source, duck_level, entry, inserts, sends]
+      required: [name, command, description, category, channels, inputs, params, gain_db, muted, solo, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, duck_source, duck_level, entry, exiting, inserts, sends]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command:
@@ -753,6 +934,7 @@ components:
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/Entry"
+        exiting: { $ref: "#/components/schemas/Exiting" }
         inserts:
           type: array
           items: { $ref: "#/components/schemas/GeneratorName" }
@@ -851,6 +1033,18 @@ components:
         - { mode: bar }
         - { mode: fade, bars: 4 }
 
+    ExitMode:
+      type: string
+      enum: [now, cycle, epoch, fade_cycle, fade_epoch]
+
+    Exiting:
+      type: [object, "null"]
+      required: [mode, at]
+      description: On its way out after a removal with `exit`; null otherwise.
+      properties:
+        mode: { $ref: "#/components/schemas/ExitMode" }
+        at: { type: number, description: "The beat it's gone at (a cycle or epoch line)." }
+
     DuckSensitivity:
       type: [number, "null"]
       minimum: 0
@@ -864,7 +1058,7 @@ components:
 
     Effect:
       type: object
-      required: [name, command, description, category, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity]
+      required: [name, command, description, category, role, owner, channels, inputs, params, gain_db, muted, bypass, state, late, restarts, peak, last_error, duck_sensitivity, declared_duck_sensitivity, exiting]
       properties:
         name: { $ref: "#/components/schemas/GeneratorName" }
         command: { type: array, items: { type: string } }
@@ -899,6 +1093,7 @@ components:
           minimum: 0
           maximum: 1
           description: The plugin's own default. Null while not running.
+        exiting: { $ref: "#/components/schemas/Exiting" }
         state: { $ref: "#/components/schemas/GeneratorState" }
         late: { type: integer, minimum: 0 }
         restarts: { type: integer, minimum: 0 }
@@ -981,3 +1176,67 @@ components:
       properties:
         seq: { type: integer, description: Increasing; use as `after` to fetch only newer lines. }
         line: { type: string, examples: ["[psybass] bars 9-16 rolling K B B B"] }
+
+    LaneName:
+      type: string
+      enum: [dynamics, harmony, tempo]
+
+    BankName:
+      type: string
+      enum: [A, B, C, D]
+      description: Case-insensitive on input.
+
+    Region:
+      type: object
+      required: [start, bars, value]
+      properties:
+        start: { type: integer, minimum: 1, maximum: 16, description: First bar, from 1. }
+        bars: { type: integer, minimum: 1, maximum: 16 }
+        value:
+          type: string
+          description: |
+            Depends on the layer. marks: quiet, rise, peak, break. feels:
+            half, double, quad, triplet. chords: `[b|#]DEGREE[QUALITY]`,
+            DEGREE 1-7 of the key's scale, QUALITY one of M m dim aug sus2
+            sus4 7 M7 m7 m7b5 dim7 or none for the diatonic triad. keys:
+            "ROOT SCALE".
+          examples: ["rise", "3m", "5dim", "F# phrygian", "half"]
+        intensity: { type: number, minimum: 0, maximum: 1, description: "marks only; absent means 1." }
+
+    Bank:
+      type: object
+      description: |
+        Regions per layer. dynamics has `marks`, harmony has `chords` and
+        `keys`, tempo has `feels`. Layers without regions are left out.
+      additionalProperties: false
+      properties:
+        marks: { type: array, items: { $ref: "#/components/schemas/Region" } }
+        chords: { type: array, items: { $ref: "#/components/schemas/Region" } }
+        keys: { type: array, items: { $ref: "#/components/schemas/Region" } }
+        feels: { type: array, items: { $ref: "#/components/schemas/Region" } }
+
+    Sequencer:
+      type: object
+      required: [bars, lanes]
+      properties:
+        bars: { type: integer, description: Bars per bank (16). }
+        lanes:
+          type: array
+          items:
+            type: object
+            required: [lane, layers, playing, cued, banks]
+            properties:
+              lane: { $ref: "#/components/schemas/LaneName" }
+              layers:
+                type: array
+                items: { type: string, enum: [marks, chords, keys, feels] }
+              playing: { $ref: "#/components/schemas/BankName" }
+              cued:
+                description: Takes over at the next epoch; null if none.
+                oneOf:
+                  - { $ref: "#/components/schemas/BankName" }
+                  - { type: "null" }
+              banks:
+                type: object
+                description: All four, A-D.
+                additionalProperties: { $ref: "#/components/schemas/Bank" }

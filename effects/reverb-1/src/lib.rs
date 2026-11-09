@@ -135,6 +135,7 @@ mod tests {
         let mut out = vec![0.0f32; input.len()];
         for (b, (o, i)) in out.chunks_mut(1024).zip(input.chunks(1024)).enumerate() {
             let ctx = Context {
+                score: &gen_api::Score::EMPTY,
                 sample_rate: SR,
                 transport: Transport { bpm: 145.0, beat: b as f64 * 512.0 / (SR * 60.0 / 145.0), beats_per_bar: 4, playing: true },
                 tonality: Tonality { root: 0, scale: Scale::Minor },

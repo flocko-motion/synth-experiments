@@ -173,6 +173,49 @@ impl DelayLine {
     }
 }
 
+// ---------------------------------------------------------------- sub clock
+
+/// Finds subdivision boundaries at any rate per beat (16ths, triplets,
+/// 32nds, …), sample by sample, for generators that need steps finer or
+/// odder than `gen_api::StepClock`'s 16ths, or a rate that changes with the
+/// score's feel.
+///
+/// Call [`SubClock::tick`] once per sample, in order, with that sample's
+/// musical position. It returns the subdivision index when that sample is
+/// the first of a subdivision. Blocks that don't follow on (first block,
+/// seek, loop) and rate changes resync silently, except when the sample
+/// sits exactly on a boundary, so an entry on a bar line, or a feel change
+/// there, keeps its downbeat. While stopped nothing fires.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubClock {
+    /// Last subdivision seen, and the rate it was counted at.
+    last: Option<(i64, u64)>,
+}
+
+impl SubClock {
+    pub fn new() -> SubClock {
+        SubClock::default()
+    }
+
+    /// `beat`: this sample's position in quarter notes; `per_beat`:
+    /// subdivisions per beat (4 = 16ths, 6 = 16th triplets, 8 = 32nds);
+    /// `samples_per_beat`: from the tempo. Returns the index of the
+    /// subdivision starting here, counted from 0 at beat 0.
+    pub fn tick(&mut self, beat: f64, per_beat: u64, samples_per_beat: f64, playing: bool) -> Option<u64> {
+        let per_beat = per_beat.max(1);
+        let pos = beat.max(0.0) * per_beat as f64;
+        let n = (pos + 1e-9).floor() as i64;
+        let due = match self.last {
+            Some((last, rate)) if rate == per_beat && n == last + 1 => true,
+            Some((last, rate)) if rate == per_beat && n == last => false,
+            // Resync: fire only when this sample is the boundary itself.
+            _ => (pos - n as f64) * samples_per_beat / (per_beat as f64) < 1.0,
+        };
+        self.last = Some((n, per_beat));
+        (due && playing).then_some(n as u64)
+    }
+}
+
 // ---------------------------------------------------------------- reverb
 
 /// Schroeder allpass: smears transients without colouring the spectrum.
@@ -318,6 +361,52 @@ mod tests {
         assert!(early > 0.0 && early.is_finite());
         assert!(late < early * 0.1, "early {early} late {late}");
         assert!(later < late, "late {late} later {later}");
+    }
+
+    /// Indices fired over `frames` samples from `start_beat`, at 120 bpm
+    /// (24 000 samples per beat), with the rate given per sample.
+    fn sub_run(clock: &mut SubClock, start_beat: f64, frames: usize, rate: impl Fn(f64) -> u64) -> Vec<(usize, u64)> {
+        let spb = 24_000.0;
+        (0..frames)
+            .filter_map(|i| {
+                let beat = start_beat + i as f64 / spb;
+                clock.tick(beat, rate(beat), spb, true).map(|n| (i, n))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sub_clock_fires_every_subdivision_once() {
+        let mut c = SubClock::new();
+        let got = sub_run(&mut c, 0.0, 48_000, |_| 6); // two beats of 16th triplets
+        assert_eq!(got.iter().map(|g| g.1).collect::<Vec<_>>(), (0..12).collect::<Vec<_>>());
+        assert_eq!(got[1].0, 4_000, "second triplet 16th a sixth of a beat in");
+    }
+
+    #[test]
+    fn sub_clock_resyncs_silently_off_the_grid_but_keeps_exact_boundaries() {
+        let mut c = SubClock::new();
+        assert!(sub_run(&mut c, 0.1, 100, |_| 4).is_empty(), "joined mid-16th: nothing");
+        let mut c = SubClock::new();
+        assert_eq!(sub_run(&mut c, 2.0, 1, |_| 4), vec![(0, 8)], "joined on a beat: fires");
+        let mut c = SubClock::new();
+        let mut stopped = Vec::new();
+        for i in 0..24_000 {
+            if let Some(n) = c.tick(i as f64 / 24_000.0, 4, 24_000.0, false) {
+                stopped.push(n);
+            }
+        }
+        assert!(stopped.is_empty(), "stopped: nothing");
+    }
+
+    #[test]
+    fn sub_clock_follows_a_rate_change_on_the_beat() {
+        // 16ths for beat 1, triplet 16ths from beat 2: beat 2's downbeat
+        // fires once, as triplet index 6, and the grid continues from there.
+        let mut c = SubClock::new();
+        let got = sub_run(&mut c, 0.0, 48_000, |b| if b < 1.0 { 4 } else { 6 });
+        assert_eq!(got.iter().map(|g| g.1).collect::<Vec<_>>(), vec![0, 1, 2, 3, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(got[4].0, 24_000);
     }
 
     #[test]

@@ -14,6 +14,8 @@
 use crate::log::wlog;
 use crate::sys;
 use gen_api::pipe::{decode_chunk_header, decode_events, read_gen_hello, write_request, Hello, Request, CHUNK_HEADER_LEN, EVENT_LEN};
+use gen_api::Score;
+use std::sync::Arc;
 use gen_api::EventKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -60,6 +62,9 @@ struct Job {
     params: Vec<f64>,
     /// Effects: `frames * inputs` samples, interleaved. Empty means silence.
     input: Vec<f32>,
+    /// The score as of this block; sent to v5 plugins when its revision
+    /// differs from the last one they got.
+    score: Arc<Score>,
 }
 
 /// Remixes interleaved audio from `from` to `to` channels: mono goes to
@@ -213,6 +218,99 @@ impl Entering {
     }
 }
 
+/// How a channel leaves the mix when it's removed. Each mode except `now`
+/// names the grid line it's gone at; the `fade_` ones fade out on the way
+/// there (`?exit=` on DELETE).
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Exit {
+    /// Gone straight away.
+    #[default]
+    Now,
+    /// Cut at the next cycle line.
+    Cycle,
+    /// Cut at the next epoch line.
+    Epoch,
+    /// Fades out, gone at the next cycle line.
+    FadeCycle,
+    /// Fades out, gone at the next epoch line.
+    FadeEpoch,
+}
+
+impl Exit {
+    pub fn parse(s: &str) -> Option<Exit> {
+        serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
+    }
+}
+
+/// A channel on its way out of the mix, as its [`Exit`] asks.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Exiting {
+    pub mode: Exit,
+    /// The grid line it's gone at, in beats.
+    pub at: f64,
+    /// Grid unit in beats (a cycle or an epoch).
+    #[serde(skip)]
+    unit: f64,
+    /// Fades: the fade's length in beats, from the removal to `at`.
+    #[serde(skip)]
+    len: f64,
+}
+
+/// The first `unit` line strictly after `beat` (a removal on a line waits
+/// for the next one rather than cutting at once).
+fn line_after(beat: f64, unit: f64) -> f64 {
+    ((beat / unit + 1e-9).floor().max(-1.0) + 1.0) * unit
+}
+
+impl Exiting {
+    /// Starts an exit for a channel removed with the block at `beat` next
+    /// to render. `Now` needs nothing: the channel goes at once.
+    pub fn start(mode: Exit, beat: f64, beats_per_bar: u32) -> Option<Exiting> {
+        let cycle = (gen_api::BARS_PER_CYCLE * beats_per_bar.max(1)) as f64;
+        let unit = match mode {
+            Exit::Now => return None,
+            Exit::Cycle | Exit::FadeCycle => cycle,
+            Exit::Epoch | Exit::FadeEpoch => cycle * gen_api::CYCLES_PER_EPOCH as f64,
+        };
+        let at = line_after(beat, unit);
+        Some(Exiting { mode, at, unit, len: at - beat.max(0.0) })
+    }
+
+    fn fades(&self) -> bool {
+        matches!(self.mode, Exit::FadeCycle | Exit::FadeEpoch)
+    }
+
+    /// The gain for each of the block's `n` frames, starting at `beat0` and
+    /// `beats_per_frame` apart. Returns None once the channel is gone (it
+    /// should be removed; this block is silent).
+    ///
+    /// Only moves while the transport plays. A seek back moves the line to
+    /// the next one after the new position, so it never waits longer than a
+    /// unit; a seek past it removes the channel.
+    pub fn block(&mut self, beat0: f64, beats_per_frame: f64, playing: bool, n: usize) -> Option<Vec<f32>> {
+        self.at = self.at.min(line_after(beat0, self.unit));
+        if beat0 >= self.at {
+            return None;
+        }
+        let step = if playing { beats_per_frame } else { 0.0 };
+        let gains = (0..n)
+            .map(|i| {
+                let left = self.at - (beat0 + i as f64 * step);
+                if left <= 0.0 {
+                    0.0
+                } else if self.fades() {
+                    // Mirror of the entry fade: quick at first, a long tail.
+                    (left / self.len).min(1.0).powi(2) as f32
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        Some(gains)
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ParamDesc {
     pub id: String,
@@ -323,6 +421,8 @@ struct Ready {
     channels: usize,
     inputs: usize,
     desc: Description,
+    /// Pipe protocol version agreed on: 4 or 5 (gets the score).
+    version: u32,
 }
 
 struct Chunk {
@@ -375,7 +475,7 @@ impl Proc {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
         let (chunk_tx, chunk_rx) = mpsc::channel();
-        let hello = Hello { sample_rate: spec.sample_rate, max_frames: spec.max_frames };
+        let hello = Hello { sample_rate: spec.sample_rate, max_frames: spec.max_frames, version: gen_api::pipe::VERSION };
         let worker_spawned = thread::Builder::new()
             .name(format!("gen-{name}"))
             .spawn(move || worker(stdin, stdout, hello, ready_tx, job_rx, chunk_tx));
@@ -485,6 +585,8 @@ pub struct Slot {
     pub entry_override: Option<Entry>,
     /// Generators: still coming in after being added.
     pub entering: Option<Entering>,
+    /// On its way out after being removed; dropped once it's gone.
+    pub exiting: Option<Exiting>,
     /// Parameter values set by the user, by id; kept across restarts.
     /// Unset params use the generator's default.
     pub values: BTreeMap<String, f64>,
@@ -531,6 +633,7 @@ impl Slot {
             duck_override: None,
             entry_override: None,
             entering: None,
+            exiting: None,
             values: BTreeMap::new(),
             glides: BTreeMap::new(),
             glide_now: BTreeMap::new(),
@@ -662,6 +765,7 @@ impl Slot {
 
     pub fn state_label(&self) -> String {
         match &self.state {
+            _ if self.exiting.is_some() => "exiting".into(),
             State::Running(_) if self.nan_blocks > 0 => "nan".into(),
             State::Running(_) if self.muted => "muted".into(),
             State::Running(_) if !self.on_time => "late".into(),
@@ -683,7 +787,7 @@ impl Slot {
     /// Sends a block request. `input` is the effect's input audio with
     /// `input_channels` channels (adapted to what the effect takes); empty
     /// for generators.
-    pub fn request(&mut self, seq: u64, req: Request, input: &[f32], input_channels: usize) {
+    pub fn request(&mut self, seq: u64, req: Request, score: &Arc<Score>, input: &[f32], input_channels: usize) {
         self.asked = false;
         self.drain();
         let State::Running(p) = &mut self.state else { return };
@@ -710,7 +814,7 @@ impl Slot {
             params.push(v);
         }
         let input = if p.inputs == 0 || input.is_empty() { Vec::new() } else { adapt_channels(input, input_channels, p.inputs) };
-        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params, input }).is_ok());
+        let sent = p.jobs.as_ref().is_some_and(|j| j.send(Job { seq, req, params, input, score: score.clone() }).is_ok());
         if !sent {
             return self.fail("exited".into(), false);
         }
@@ -944,11 +1048,11 @@ fn worker(
         if desc.params.len() != h.params as usize {
             return Err(format!("hello says {} params, description lists {}", h.params, desc.params.len()));
         }
-        Ok(Ready { channels: h.channels as usize, inputs: h.inputs as usize, desc })
+        Ok(Ready { channels: h.channels as usize, inputs: h.inputs as usize, desc, version: h.version })
     })();
-    let (channels, inputs) = match handshake {
+    let (channels, inputs, version) = match handshake {
         Ok(r) => {
-            let dims = (r.channels, r.inputs);
+            let dims = (r.channels, r.inputs, r.version);
             let _ = ready.send(Ok(r));
             dims
         }
@@ -960,6 +1064,7 @@ fn worker(
 
     let mut bytes = Vec::new();
     let mut silence = Vec::new();
+    let mut score_sent: Option<u32> = None;
     for job in jobs {
         let result = (|| -> Result<Chunk, String> {
             let want = job.req.frames as usize * inputs;
@@ -969,7 +1074,11 @@ fn worker(
                 silence.resize(want, 0.0);
                 &silence[..]
             };
-            write_request(&mut stdin, &job.req, &job.params, input).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
+            let score = (version >= 5 && score_sent != Some(job.score.revision)).then_some(&*job.score);
+            write_request(&mut stdin, &job.req, &job.params, score, input).and_then(|_| stdin.flush()).map_err(|_| "exited".to_string())?;
+            if score.is_some() {
+                score_sent = Some(job.score.revision);
+            }
             let mut header = [0u8; CHUNK_HEADER_LEN];
             stdout.read_exact(&mut header).map_err(|_| "exited".to_string())?;
             let h = decode_chunk_header(&header).map_err(|e| format!("garbled output ({e})"))?;
@@ -1000,7 +1109,7 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{adapt_channels, Description, Entering, Entry};
+    use super::{adapt_channels, Description, Entering, Entry, Exit, Exiting};
 
     #[test]
     fn random_values_stay_in_range_and_respect_kinds() {
@@ -1059,6 +1168,48 @@ mod tests {
         // stopped mid-bar: stays shut
         let mut e = Entering::start(Entry::Bar, 1.0, 4).unwrap();
         assert_eq!(e.block(1.0, 0.25, false, 4, 4), Some(vec![0.0; 4]));
+    }
+
+    #[test]
+    fn exit_parses_query_values() {
+        assert_eq!(Exit::parse("fade_epoch"), Some(Exit::FadeEpoch));
+        assert_eq!(Exit::parse("cycle"), Some(Exit::Cycle));
+        assert_eq!(Exit::parse("soon"), None);
+        assert_eq!(Exiting::start(Exit::Now, 3.0, 4), None);
+    }
+
+    #[test]
+    fn exit_cuts_at_the_next_line() {
+        // 4/4: a cycle is 16 beats, an epoch 64
+        let mut e = Exiting::start(Exit::Cycle, 5.0, 4).unwrap();
+        assert_eq!(e.at, 16.0);
+        assert_eq!(Exiting::start(Exit::Epoch, 5.0, 4).unwrap().at, 64.0);
+        // removed right on a line: waits for the next one
+        assert_eq!(Exiting::start(Exit::Cycle, 16.0, 4).unwrap().at, 32.0);
+        assert_eq!(e.block(5.0, 0.25, true, 4), Some(vec![1.0; 4]));
+        assert_eq!(e.block(15.5, 0.25, true, 4), Some(vec![1.0, 1.0, 0.0, 0.0]));
+        assert_eq!(e.block(16.0, 0.25, true, 4), None);
+        // stopped: stays
+        let mut e = Exiting::start(Exit::Cycle, 15.9, 4).unwrap();
+        assert_eq!(e.block(15.9, 0.25, false, 4), Some(vec![1.0; 4]));
+    }
+
+    #[test]
+    fn exit_fade_reaches_silence_on_the_line() {
+        let mut e = Exiting::start(Exit::FadeCycle, 8.0, 4).unwrap();
+        let g = e.block(8.0, 2.0, true, 4).unwrap();
+        assert_eq!(g, vec![1.0, 0.5625, 0.25, 0.0625]);
+        assert_eq!(e.block(16.0, 2.0, true, 4), None);
+    }
+
+    #[test]
+    fn exit_follows_a_seek_back() {
+        let mut e = Exiting::start(Exit::Epoch, 60.0, 4).unwrap();
+        e.block(1.0, 0.25, true, 4);
+        assert_eq!(e.at, 64.0);
+        let mut e = Exiting::start(Exit::Cycle, 60.0, 4).unwrap();
+        e.block(1.0, 0.25, true, 4);
+        assert_eq!(e.at, 16.0);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //! little-endian.
 //!
 //! ```text
-//! host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 reserved
-//! gen  -> host  hello     16 bytes   "WSG4" | u16 channels | u16 inputs | u16 params
+//! host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 version
+//! gen  -> host  hello     16 bytes   "WSG4" or "WSG5" | u16 channels | u16 inputs | u16 params
 //!                                    | u16 reserved | u32 json_len
 //!                         + json_len bytes: the plugin's description, the
 //!                           same JSON `--info --json` prints
@@ -15,6 +15,8 @@
 //! host -> gen   request   32 bytes   see Request
 //!                         + params * f64: every parameter's value, in
 //!                           description order (a full snapshot each time)
+//!                         + 528 bytes of score, v5 only and only when the
+//!                           request's score flag is set, see encode_score
 //!                         + frames * inputs * f32, interleaved (effects only)
 //! gen  -> host  chunk     12 bytes   "WSC4" | u32 frames | u32 events
 //!                          + events * 12 bytes: u32 frame | u16 kind | u16 reserved | f32 value
@@ -23,6 +25,13 @@
 //! Event kinds: 1 = duck (value = strength 0..1). Events are in frame order,
 //! frames within the chunk. Most plugins send none.
 //! ```
+//!
+//! Version 5 adds the score (the workspace sequencer) and is negotiated, so
+//! v4 plugins and hosts keep working: the host puts the highest version it
+//! speaks in the hello's last field (v4 hosts send 0 there), and the
+//! generator answers "WSG5" if both speak 5, else "WSG4". Only to a v5
+//! generator does the host send the score, on the first request and
+//! whenever it changes, flagged in the request header.
 //!
 //! Plugins without inputs or params send requests that are just the 32-byte
 //! header. The host sends parameter defaults until something is set, and
@@ -42,11 +51,20 @@
 //! * 4` and writing `12 + frames * channels * 4` bytes (plus 12 per event, if
 //! it sends any), and log only to stderr.
 
-use crate::{describe_json, Config, Context, Event, EventKind, Generator, Scale, Tonality, Transport};
+use crate::{describe_json, Chord, Config, Context, Event, EventKind, Feel, Generator, Mark, Scale, Score, ScoreBar, Tonality, Transport, SCORE_BARS};
 use std::io::{self, BufWriter, Read, Write};
 
 pub const HOST_MAGIC: [u8; 4] = *b"WSH4";
 pub const GEN_MAGIC: [u8; 4] = *b"WSG4";
+pub const GEN_MAGIC_V5: [u8; 4] = *b"WSG5";
+/// The highest protocol version this crate speaks.
+pub const VERSION: u32 = 5;
+/// Bytes of score after the parameter snapshot, when flagged.
+pub const SCORE_LEN: usize = 16 + SCORE_BARS * SCORE_BAR_LEN;
+const SCORE_BAR_LEN: usize = 16;
+/// Request byte 4: bit 0 playing, bit 1 a score follows the parameters.
+const FLAG_PLAYING: u8 = 1;
+const FLAG_SCORE: u8 = 2;
 pub const CHUNK_MAGIC: [u8; 4] = *b"WSC4";
 pub const HELLO_LEN: usize = 16;
 pub const GEN_HELLO_LEN: usize = 16;
@@ -119,6 +137,8 @@ pub struct Hello {
     pub sample_rate: u32,
     /// Upper bound on `Request::frames`, so the generator can size buffers.
     pub max_frames: u32,
+    /// The highest protocol version the host speaks; 0 from v4 hosts.
+    pub version: u32,
 }
 
 impl Hello {
@@ -127,6 +147,7 @@ impl Hello {
         b[0..4].copy_from_slice(&HOST_MAGIC);
         b[4..8].copy_from_slice(&self.sample_rate.to_le_bytes());
         b[8..12].copy_from_slice(&self.max_frames.to_le_bytes());
+        b[12..16].copy_from_slice(&self.version.to_le_bytes());
         b
     }
 
@@ -134,7 +155,7 @@ impl Hello {
         if b[0..4] != HOST_MAGIC {
             return Err(bad("not a workspace host, or a different protocol version (bad hello magic)"));
         }
-        Ok(Hello { sample_rate: u32_at(b, 4), max_frames: u32_at(b, 8) })
+        Ok(Hello { sample_rate: u32_at(b, 4), max_frames: u32_at(b, 8), version: u32_at(b, 12) })
     }
 }
 
@@ -148,12 +169,14 @@ pub struct GenHello {
     pub params: u16,
     /// Length of the JSON description that follows the hello.
     pub json_len: u32,
+    /// The protocol version agreed on: 4 or 5.
+    pub version: u32,
 }
 
 impl GenHello {
     pub fn encode(&self) -> [u8; GEN_HELLO_LEN] {
         let mut b = [0u8; GEN_HELLO_LEN];
-        b[0..4].copy_from_slice(&GEN_MAGIC);
+        b[0..4].copy_from_slice(if self.version >= 5 { &GEN_MAGIC_V5 } else { &GEN_MAGIC });
         b[4..6].copy_from_slice(&self.channels.to_le_bytes());
         b[6..8].copy_from_slice(&self.inputs.to_le_bytes());
         b[8..10].copy_from_slice(&self.params.to_le_bytes());
@@ -162,11 +185,13 @@ impl GenHello {
     }
 
     pub fn decode(b: &[u8; GEN_HELLO_LEN]) -> io::Result<GenHello> {
-        if b[0..4] != GEN_MAGIC {
-            return Err(bad("not a pipe generator, or a different protocol version (bad hello magic)"));
-        }
+        let version = match &b[0..4] {
+            m if m == GEN_MAGIC => 4,
+            m if m == GEN_MAGIC_V5 => 5,
+            _ => return Err(bad("not a pipe generator, or a different protocol version (bad hello magic)")),
+        };
         let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
-        let h = GenHello { channels: u16_at(4), inputs: u16_at(6), params: u16_at(8), json_len: u32_at(b, 12) };
+        let h = GenHello { channels: u16_at(4), inputs: u16_at(6), params: u16_at(8), json_len: u32_at(b, 12), version };
         if h.channels == 0 || h.channels > 8 {
             return Err(bad("generator reported an unsupported channel count"));
         }
@@ -195,13 +220,21 @@ pub fn read_gen_hello(r: &mut impl Read) -> io::Result<(GenHello, String)> {
     Ok((h, json))
 }
 
-/// Host side: write one request with its parameter snapshot and, for
-/// effects, its input audio (`frames * inputs` samples, interleaved).
-pub fn write_request(w: &mut impl Write, req: &Request, params: &[f64], input: &[f32]) -> io::Result<()> {
-    let mut bytes = Vec::with_capacity(REQUEST_LEN + params.len() * 8 + input.len() * 4);
-    bytes.extend_from_slice(&req.encode());
+/// Host side: write one request with its parameter snapshot, the score if
+/// given (v5 generators only), and, for effects, its input audio
+/// (`frames * inputs` samples, interleaved).
+pub fn write_request(w: &mut impl Write, req: &Request, params: &[f64], score: Option<&Score>, input: &[f32]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(REQUEST_LEN + params.len() * 8 + SCORE_LEN + input.len() * 4);
+    let mut head = req.encode();
+    if score.is_some() {
+        head[4] |= FLAG_SCORE;
+    }
+    bytes.extend_from_slice(&head);
     for p in params {
         bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    if let Some(score) = score {
+        bytes.extend_from_slice(&encode_score(score));
     }
     for s in input {
         bytes.extend_from_slice(&s.to_le_bytes());
@@ -213,7 +246,7 @@ pub fn write_request(w: &mut impl Write, req: &Request, params: &[f64], input: &
 ///
 /// ```text
 ///  0  u32  frames
-///  4  u8   playing (0/1)
+///  4  u8   flags: bit 0 playing, bit 1 a score follows the params (v5)
 ///  5  u8   root pitch class, 0 = C
 ///  6  u8   scale, index into Scale::ALL
 ///  7  u8   beats_per_bar
@@ -233,7 +266,7 @@ impl Request {
     pub fn encode(&self) -> [u8; REQUEST_LEN] {
         let mut b = [0u8; REQUEST_LEN];
         b[0..4].copy_from_slice(&self.frames.to_le_bytes());
-        b[4] = self.transport.playing as u8;
+        b[4] = if self.transport.playing { FLAG_PLAYING } else { 0 };
         b[5] = self.tonality.root % 12;
         b[6] = self.tonality.scale.index() as u8;
         b[7] = self.transport.beats_per_bar as u8;
@@ -252,11 +285,81 @@ impl Request {
                 bpm: f64::from_le_bytes(b[8..16].try_into().unwrap()),
                 beat: f64::from_le_bytes(b[16..24].try_into().unwrap()),
                 beats_per_bar: b[7].max(1) as u32,
-                playing: b[4] != 0,
+                playing: b[4] & FLAG_PLAYING != 0,
             },
             tonality: Tonality { root: b[5] % 12, scale },
         })
     }
+}
+
+/// Whether a score follows this request's parameter snapshot.
+pub fn score_follows(b: &[u8; REQUEST_LEN]) -> bool {
+    b[4] & FLAG_SCORE != 0
+}
+
+/// The score on the wire:
+///
+/// ```text
+///  0  u32  revision
+///  4  u32  bars (32)
+///  8  u64  first_bar
+/// 16  bars * 16 bytes:
+///      0 u8 mark (index into Mark::ALL)   1 u8 mark start, index into these bars
+///      2 u8 mark length in bars           3 u8 feel (index into Feel::ALL)
+///      4 f32 intensity
+///      8 u8 key root, 255 = the host key  9 u8 key scale (index into Scale::ALL)
+///     10 u8 chord root, 255 = no chord   11 reserved
+///     12 u16 chord pitch classes (bit n = pitch class n)   14 reserved
+/// ```
+///
+/// A mark region always lies within the 32 bars.
+pub fn encode_score(s: &Score) -> [u8; SCORE_LEN] {
+    let mut b = [0u8; SCORE_LEN];
+    b[0..4].copy_from_slice(&s.revision.to_le_bytes());
+    b[4..8].copy_from_slice(&(SCORE_BARS as u32).to_le_bytes());
+    b[8..16].copy_from_slice(&s.first_bar.to_le_bytes());
+    for (i, bar) in s.bars.iter().enumerate() {
+        let o = 16 + i * SCORE_BAR_LEN;
+        let c = &mut b[o..o + SCORE_BAR_LEN];
+        c[0] = Mark::ALL.iter().position(|&m| m == bar.mark).unwrap() as u8;
+        c[1] = bar.mark_start.saturating_sub(s.first_bar).min(SCORE_BARS as u64 - 1) as u8;
+        c[2] = bar.mark_bars.clamp(1, SCORE_BARS as u32) as u8;
+        c[3] = Feel::ALL.iter().position(|&f| f == bar.feel).unwrap() as u8;
+        c[4..8].copy_from_slice(&bar.intensity.to_le_bytes());
+        (c[8], c[9]) = bar.key.map_or((255, 0), |k| (k.root % 12, k.scale.index() as u8));
+        if let Some(ch) = bar.chord {
+            c[10] = ch.root % 12;
+            c[12..14].copy_from_slice(&ch.tones.to_le_bytes());
+        } else {
+            c[10] = 255;
+        }
+    }
+    b
+}
+
+pub fn decode_score(b: &[u8; SCORE_LEN]) -> io::Result<Score> {
+    if u32_at(b, 4) as usize != SCORE_BARS {
+        return Err(bad("score with an unexpected bar count"));
+    }
+    let first_bar = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let mut s = Score { revision: u32_at(b, 0), first_bar, bars: [ScoreBar::NONE; SCORE_BARS] };
+    for (i, bar) in s.bars.iter_mut().enumerate() {
+        let o = 16 + i * SCORE_BAR_LEN;
+        let c = &b[o..o + SCORE_BAR_LEN];
+        *bar = ScoreBar {
+            mark: Mark::ALL.get(c[0] as usize).copied().unwrap_or_default(),
+            intensity: f32::from_le_bytes(c[4..8].try_into().unwrap()).clamp(0.0, 1.0),
+            mark_start: first_bar + (c[1] as u64).min(i as u64),
+            mark_bars: c[2].max(1) as u32,
+            key: match (c[8], Scale::ALL.get(c[9] as usize)) {
+                (r, Some(&scale)) if r < 12 => Some(Tonality { root: r, scale }),
+                _ => None,
+            },
+            chord: (c[10] < 12).then(|| Chord { root: c[10], tones: u16::from_le_bytes([c[12], c[13]]) | 1 << c[10] }),
+            feel: Feel::ALL.get(c[3] as usize).copied().unwrap_or_default(),
+        };
+    }
+    Ok(s)
 }
 
 fn u32_at(b: &[u8], i: usize) -> u32 {
@@ -321,7 +424,8 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
     let json = describe_json(&gen);
     eprintln!("{}  seed {seed}  {} Hz  {} ch  {} in  {} params", info.name, hello.sample_rate, ch, inputs, params.len());
 
-    let gh = GenHello { channels: info.channels, inputs: inputs as u16, params: params.len() as u16, json_len: json.len() as u32 };
+    let version = if hello.version >= 5 { 5 } else { 4 };
+    let gh = GenHello { channels: info.channels, inputs: inputs as u16, params: params.len() as u16, json_len: json.len() as u32, version };
     stdout.write_all(&gh.encode())?;
     stdout.write_all(json.as_bytes())?;
     stdout.flush()?;
@@ -335,6 +439,8 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
     let mut buf = vec![0.0f32; max * ch];
     let mut bytes = Vec::with_capacity(buf.len() * 4);
     let mut events: Vec<Event> = Vec::new();
+    let mut sb = [0u8; SCORE_LEN];
+    let mut score = Score::EMPTY;
     while read_message(&mut stdin, &mut rb)? {
         let req = Request::decode(&rb)?;
         let n = req.frames as usize;
@@ -343,6 +449,12 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
         }
         for (i, (v, p)) in values.iter_mut().zip(params).enumerate() {
             *v = p.clamp(f64::from_le_bytes(pb[i * 8..i * 8 + 8].try_into().unwrap()));
+        }
+        if version >= 5 && score_follows(&rb) {
+            if !read_message(&mut stdin, &mut sb)? {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            score = decode_score(&sb)?;
         }
         input.clear();
         if inputs > 0 {
@@ -355,7 +467,7 @@ pub(crate) fn serve<G: Generator>(seed: u64) -> io::Result<()> {
         if buf.len() < n * ch {
             buf.resize(n * ch, 0.0);
         }
-        let ctx = Context { sample_rate, transport: req.transport, tonality: req.tonality, params: &values, input: &input };
+        let ctx = Context { sample_rate, transport: req.transport, tonality: req.tonality, params: &values, input: &input, score: &score };
         let out = &mut buf[..n * ch];
         gen.process(&ctx, out);
         events.clear();
@@ -394,10 +506,32 @@ mod tests {
     }
 
     #[test]
+    fn score_round_trips() {
+        let mut s = Score { revision: 7, first_bar: 32, bars: [ScoreBar::NONE; SCORE_BARS] };
+        for (i, b) in s.bars.iter_mut().enumerate() {
+            b.mark_start = 32 + i as u64;
+        }
+        for i in 4..8 {
+            s.bars[i] = ScoreBar { mark: Mark::Rise, intensity: 0.5, mark_start: 36, mark_bars: 4, ..s.bars[i] };
+        }
+        s.bars[0].chord = Some(Chord { root: 4, tones: 1 << 4 | 1 << 7 | 1 << 11 });
+        s.bars[20].key = Some(Tonality { root: 6, scale: Scale::Phrygian });
+        s.bars[31].feel = Feel::Triplet;
+        assert_eq!(decode_score(&encode_score(&s)).unwrap(), s);
+    }
+
+    #[test]
+    fn v4_generator_hello_still_reads() {
+        let g = GenHello { channels: 1, inputs: 0, params: 0, json_len: 0, version: 4 };
+        assert_eq!(&g.encode()[0..4], b"WSG4");
+        assert_eq!(GenHello::decode(&g.encode()).unwrap().version, 4);
+    }
+
+    #[test]
     fn hellos_round_trip() {
-        let h = Hello { sample_rate: 44_100, max_frames: 1024 };
+        let h = Hello { sample_rate: 44_100, max_frames: 1024, version: VERSION };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
-        let g = GenHello { channels: 2, inputs: 2, params: 3, json_len: 120 };
+        let g = GenHello { channels: 2, inputs: 2, params: 3, json_len: 120, version: 5 };
         assert_eq!(GenHello::decode(&g.encode()).unwrap(), g);
         let mut wire = g.encode().to_vec();
         wire.extend_from_slice(&[b'x'; 120]);

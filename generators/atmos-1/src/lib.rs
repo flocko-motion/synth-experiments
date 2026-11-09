@@ -13,12 +13,21 @@
 //! - per cycle (4 bars): the chord; voices glide to the nearest inversion,
 //!   so changes are legato
 //!
+//! Where the workspace score has a chord for a bar, atmos voices that chord
+//! instead (root, then its other tones upwards; a fourth tone, if any, on
+//! top), and goes back to its own progression where the score has none.
+//!
+//! Dynamics from the score swell in over about half a second: a `break`
+//! opens the pad up (it carries the breakdown), a `quiet` darkens it and
+//! pulls it back, a `rise` opens it towards the region's end, a `peak`
+//! brightens it.
+//!
 //! Chords are stored as scale degrees and voiced every block from the host
 //! tonality, so key and scale changes glide in right away. When the
 //! transport stops the pad releases slowly; it never cuts off.
 
 use dsp::{decay_coef, midi_hz, saw, OnePole, Reverb, Svf};
-use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock, Tonality, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
+use gen_api::{Config, Context, Entry, Generator, Info, Mark, Param, Rng, Score, StepClock, Tonality, BARS_PER_CYCLE, CYCLES_PER_EPOCH, TICKS_PER_BEAT};
 use std::f64::consts::PI;
 
 const EPOCH_BARS: f64 = (BARS_PER_CYCLE * CYCLES_PER_EPOCH) as f64;
@@ -111,13 +120,59 @@ impl Chord {
     /// sorted, so voices move to the nearest inversion; the colour tone
     /// folded into the octave above the lowest triad note.
     fn voice(&self, t: &Tonality) -> [i32; VOICES] {
-        let fold = |degree: i32, low: i32| {
-            let note = t.root as i32 + t.degree(degree);
-            low + (note - low).rem_euclid(12)
-        };
-        let mut triad = [fold(self.0[0], LOW), fold(self.0[1], LOW), fold(self.0[2], LOW)];
-        triad.sort_unstable();
-        [triad[0], triad[1], triad[2], fold(self.0[3], triad[0] + 7)]
+        voice_pitches(self.0.map(|degree| t.root as i32 + t.degree(degree)))
+    }
+}
+
+/// MIDI notes for pitch classes [triad, triad, triad, colour]: see
+/// [`Chord::voice`].
+fn voice_pitches(pcs: [i32; VOICES]) -> [i32; VOICES] {
+    let fold = |pc: i32, low: i32| low + (pc - low).rem_euclid(12);
+    let mut triad = [fold(pcs[0], LOW), fold(pcs[1], LOW), fold(pcs[2], LOW)];
+    triad.sort_unstable();
+    [triad[0], triad[1], triad[2], fold(pcs[3], triad[0] + 7)]
+}
+
+/// Pitch classes of a score chord in the order [`voice_pitches`] takes:
+/// the root, then the chord's other tones going up from it (a triad's 3rd
+/// and 5th), and the fourth tone on top, or the root again for a triad.
+/// Chords with fewer tones repeat what they have.
+fn score_pitches(chord: &gen_api::Chord) -> [i32; VOICES] {
+    let root = chord.root as i32;
+    let mut tones = [root; VOICES];
+    let mut n = 1;
+    for k in 1..12 {
+        if n < VOICES && chord.contains(root + k) {
+            tones[n] = (root + k) % 12;
+            n += 1;
+        }
+    }
+    match n {
+        1 => [root, root + 7, root, root],             // a bare root: add a fifth
+        2 => [root, tones[1], root + 7, root],          // a dyad: fill with the fifth
+        3 => [tones[0], tones[1], tones[2], root],      // a triad: root on top
+        _ => tones,                                     // four or more: the first four
+    }
+}
+
+/// What the score's dynamics do to the pad at `beat`: (octaves of
+/// brightness, level, air), all scaled by the mark's intensity.
+/// - break: the pad carries it: opens up, a bit louder, more air
+/// - quiet: darker, quieter, no air
+/// - rise: opens and fills with air towards the region's end
+/// - peak: brighter
+fn score_shape(score: &Score, beat: f64, bpb: u32) -> [f64; 3] {
+    let sb = score.at(beat, bpb);
+    let i = sb.intensity as f64;
+    match sb.mark {
+        Mark::Break => [1.2 * i, 1.0 + 0.4 * i, 0.3 * i],
+        Mark::Quiet => [-1.0 * i, 1.0 - 0.6 * i, -1.0 * i],
+        Mark::Rise => {
+            let u = score.progress(beat, bpb);
+            [1.5 * i * u, 1.0, 0.4 * i * u]
+        }
+        Mark::Peak => [0.6 * i, 1.15, 0.0],
+        Mark::Normal => [0.0, 1.0, 0.0],
     }
 }
 
@@ -183,6 +238,10 @@ pub struct Atmos {
     params: Smoothed,
     amp: f64,
     cutoff_oct: f64,
+    /// What the score's dynamics add: (octaves of brightness, level, air),
+    /// smoothed so marks swell in rather than switch.
+    shape: [f64; 3],
+    shape_smooth: f64,
     // coefficients
     glide: f64,
     param_smooth: f64,
@@ -228,6 +287,8 @@ impl Atmos {
         let cycle_steps = (TICKS_PER_BEAT * ctx.transport.beats_per_bar * BARS_PER_CYCLE) as u64;
         let cycle = step / cycle_steps;
         if self.cycle == Some(cycle) {
+            // Score chords change per bar: keep following them.
+            self.retarget(ctx, step as f64 / TICKS_PER_BEAT as f64);
             return;
         }
         self.cycle = Some(cycle);
@@ -239,17 +300,21 @@ impl Atmos {
         let root = e.progression[(cycle % CYCLES_PER_EPOCH as u64) as usize];
         let first = self.chord.is_none();
         self.chord = Some(Chord::new(root, e.colour, e.sus));
-        self.retarget(&ctx.tonality);
+        self.retarget(ctx, step as f64 / TICKS_PER_BEAT as f64);
         if first {
             self.voices.iter_mut().for_each(|v| v.lf = v.lf_target);
         }
     }
 
-    fn retarget(&mut self, t: &Tonality) {
-        if let Some(chord) = self.chord {
-            for (v, note) in self.voices.iter_mut().zip(chord.voice(t)) {
-                v.lf_target = midi_hz(note as f64).log2();
-            }
+    /// Aim the voices at the chord for `beat`: the score's, or our own.
+    fn retarget(&mut self, ctx: &Context, beat: f64) {
+        let Some(own) = self.chord else { return };
+        let notes = match ctx.score.at(beat, ctx.transport.beats_per_bar).chord {
+            Some(c) => voice_pitches(score_pitches(&c)),
+            None => own.voice(&ctx.tonality),
+        };
+        for (v, note) in self.voices.iter_mut().zip(notes) {
+            v.lf_target = midi_hz(note as f64).log2();
         }
     }
 }
@@ -288,6 +353,8 @@ impl Generator for Atmos {
             params: Smoothed(PARAMS.map(|p| p.default)),
             amp: 0.0,
             cutoff_oct: 0.0,
+            shape: [0.0, 1.0, 0.0],
+            shape_smooth: 1.0 - decay_coef(0.5, sr),
             glide: smooth(0.15),
             param_smooth: smooth(0.03),
             cutoff_smooth: smooth(0.08),
@@ -329,7 +396,7 @@ impl Generator for Atmos {
         let spb = tr.samples_per_beat(sr);
         let epoch_beats = EPOCH_BARS * tr.beats_per_bar as f64;
         let lfo_beats = self.character.lfo_bars * tr.beats_per_bar as f64;
-        self.retarget(&ctx.tonality);
+        self.retarget(ctx, tr.beat);
         let mut steps = self.clock.block(ctx);
 
         for (i, frame) in out.chunks_exact_mut(2).enumerate() {
@@ -352,7 +419,13 @@ impl Generator for Atmos {
             let target = if tr.playing && sounding { 1.0 } else { 0.0 };
             self.amp += (target - self.amp) * if target > self.amp { self.attack } else { self.release };
 
-            let gain = self.amp;
+            let beat = tr.beat + i as f64 / spb;
+            let target = score_shape(ctx.score, beat, tr.beats_per_bar);
+            for (v, t) in self.shape.iter_mut().zip(target) {
+                *v += (t - *v) * self.shape_smooth;
+            }
+            let [shape_oct, shape_gain, shape_air] = self.shape;
+            let gain = self.amp * shape_gain;
 
             // Pad: supersaw → stereo lowpass.
             let (mut mid, mut side) = (0.0, 0.0);
@@ -363,7 +436,7 @@ impl Generator for Atmos {
             }
             let width = p[WIDTH] * 0.5;
             let (l, r) = ((mid + side * width) * 0.05, (mid - side * width) * 0.05);
-            let oct = p[BRIGHTNESS] + 0.6 + p[MOTION] * (sw * 2.6 + lfo * 0.5);
+            let oct = p[BRIGHTNESS] + shape_oct + 0.6 + p[MOTION] * (sw * 2.6 + lfo * 0.5);
             self.cutoff_oct += (oct - self.cutoff_oct) * self.cutoff_smooth;
             let fc = 500.0 * self.cutoff_oct.exp2();
             let mut pad = [l, r];
@@ -378,7 +451,7 @@ impl Generator for Atmos {
             for k in 0..2 {
                 let n = self.noise.f() * 2.0 - 1.0;
                 self.air[k].set(afc, 0.4, sr);
-                air[k] = self.air_hp[k].hp(self.air[k].tick(n).1) * p[AIR] * 0.35;
+                air[k] = self.air_hp[k].hp(self.air[k].tick(n).1) * (p[AIR] + shape_air).clamp(0.0, 1.5) * 0.35;
             }
 
             let dry = [(pad[0] + air[0]) * gain, (pad[1] + air[1]) * gain];
@@ -400,6 +473,10 @@ mod tests {
     use gen_api::{Scale, Transport};
 
     fn render(seed: u64, bars: usize, playing: bool) -> Vec<f32> {
+        render_with(seed, bars, playing, &gen_api::Score::EMPTY)
+    }
+
+    fn render_with(seed: u64, bars: usize, playing: bool, score: &gen_api::Score) -> Vec<f32> {
         let sr = 48_000.0;
         let mut g = Atmos::new(&Config { sample_rate: sr, seed });
         let params: Vec<f64> = PARAMS.iter().map(|p| p.default).collect();
@@ -410,6 +487,7 @@ mod tests {
         for (b, chunk) in out.chunks_mut(block * 2).enumerate() {
             let beat = (b * block) as f64 / (sr * 60.0 / bpm);
             let ctx = Context {
+                score,
                 sample_rate: sr,
                 transport: Transport { bpm, beat, beats_per_bar: 4, playing },
                 tonality: Tonality { root: 2, scale: Scale::Phrygian },
@@ -434,6 +512,76 @@ mod tests {
     #[test]
     fn silent_when_stopped() {
         assert!(render(3, 2, false).iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn break_opens_up_and_quiet_pulls_back() {
+        use gen_api::ScoreBar;
+        let mut score = gen_api::Score::EMPTY;
+        for b in 0..8 {
+            score.bars[b] = ScoreBar { mark: Mark::Quiet, intensity: 1.0, mark_start: 0, mark_bars: 8, ..ScoreBar::NONE };
+            score.bars[b + 8] = ScoreBar { mark: Mark::Break, intensity: 1.0, mark_start: 8, mark_bars: 8, ..ScoreBar::NONE };
+        }
+        let out = render_with(7, 16, true, &score);
+        // 145 bpm: one bar is 1.655 s; compare bars 6-8 with bars 14-16.
+        let bar = (4.0 * 48_000.0 * 60.0 / 145.0) as usize * 2;
+        let (quiet, brk) = (&out[5 * bar..8 * bar], &out[13 * bar..]);
+        let rms = |x: &[f32]| (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+        let bright = |x: &[f32]| {
+            let d: Vec<f32> = x.windows(3).step_by(2).map(|w| w[2] - w[0]).collect();
+            rms(&d) / rms(x)
+        };
+        assert!(rms(brk) > 2.0 * rms(quiet), "break {} quiet {}", rms(brk), rms(quiet));
+        assert!(bright(brk) > 1.5 * bright(quiet), "break {} quiet {}", bright(brk), bright(quiet));
+    }
+
+    #[test]
+    fn score_chords_become_voicings() {
+        let c_major = gen_api::Chord { root: 0, tones: (1 << 0) | (1 << 4) | (1 << 7) };
+        assert_eq!(score_pitches(&c_major), [0, 4, 7, 0]);
+        let g7 = gen_api::Chord { root: 7, tones: (1 << 7) | (1 << 11) | (1 << 2) | (1 << 5) };
+        assert_eq!(score_pitches(&g7), [7, 11, 2, 5], "root, 3rd, 5th, 7th");
+        let v = voice_pitches(score_pitches(&c_major));
+        let mut pcs: Vec<i32> = v.iter().map(|n| n.rem_euclid(12)).collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        assert_eq!(pcs, vec![0, 4, 7]);
+        assert!(v[0] >= LOW && v[2] < LOW + 12);
+    }
+
+    /// Pitch classes the voices are heading for after `bars` bars, with the
+    /// given score.
+    fn targets(score: &gen_api::Score, bars: usize) -> Vec<i32> {
+        let sr = 48_000.0;
+        let mut g = Atmos::new(&Config { sample_rate: sr, seed: 3 });
+        let params: Vec<f64> = PARAMS.iter().map(|p| p.default).collect();
+        let block = 480;
+        let mut out = vec![0.0f32; block * 2];
+        for b in 0..bars * 4 * 24_000 / block {
+            let ctx = Context {
+                score,
+                sample_rate: sr,
+                transport: Transport { bpm: 120.0, beat: (b * block) as f64 / 24_000.0, beats_per_bar: 4, playing: true },
+                tonality: Tonality { root: 4, scale: Scale::Phrygian },
+                params: &params,
+                input: &[],
+            };
+            g.process(&ctx, &mut out);
+        }
+        let mut pcs: Vec<i32> = g.voices.iter().map(|v| (12.0 * (v.lf_target.exp2() / 440.0).log2()).round() as i32 + 69).map(|n| n.rem_euclid(12)).collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        pcs
+    }
+
+    #[test]
+    fn follows_the_score_chord_then_its_own() {
+        // Bar 2 (index 1) has F major in E phrygian; bar 3 has nothing.
+        let mut score = gen_api::Score::EMPTY;
+        score.bars[1].chord = Some(gen_api::Chord { root: 5, tones: (1 << 5) | (1 << 9) | (1 << 0) });
+        assert_eq!(targets(&score, 2), vec![0, 5, 9], "F A C in bar 2");
+        let own = targets(&gen_api::Score::EMPTY, 3);
+        assert_eq!(targets(&score, 3), own, "bar 3: back to its own progression");
     }
 
     #[test]

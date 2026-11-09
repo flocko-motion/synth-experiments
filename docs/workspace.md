@@ -68,6 +68,10 @@ curl -s -N $A/api/events                                 # live state + log (SSE
   generator, then collects the chunks, so generators render in parallel.
   Then it mixes them (mono goes to every channel), adds the click, soft-clips
   (`tanh`) and pushes the block into the ring.
+- **DSP load** (`dsp_load`, `dsp_peak` in the state, shown in the web
+  UI's top bar): the time a block takes to render, every generator and
+  effect in parallel and then the mix, over the time it plays. Near 100%
+  the ring drains and audio drops out; a bigger `ahead` only buys time.
 - **Audio callback** only copies from the ring. It never waits on a
   generator. `underruns` in `ws status` counts callbacks the ring couldn't
   fill.
@@ -107,7 +111,7 @@ for example after rebuilding it.
 The first start in `ws add` is the exception: if the command doesn't
 exist or fails the handshake, `add` reports the error and adds nothing.
 
-`ws status` shows a generator's state (`ok`, `late`, `nan`, `muted`, `entering`,
+`ws status` shows a generator's state (`ok`, `late`, `nan`, `muted`, `entering`, `exiting`,
 `starting`, `retry 1.2s`), its `LATE` and `RESTARTS` counts and its last
 error. Its stderr, including panic messages, goes to the daemon's log,
 prefixed with `[name]`. Ctrl-C, SIGTERM or a closed terminal shut the

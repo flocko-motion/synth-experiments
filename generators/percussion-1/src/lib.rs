@@ -5,9 +5,20 @@
 //! - per epoch (16 bars): which layers play and in what style
 //! - per cycle (4 bars): the actual pattern, with a fill at its end
 //! - the last bar of an epoch often carries a snare roll into the next one
+//!
+//! The workspace score, per 16th: `quiet` drops closed hats, percs and
+//! ride (and clap and snare when strong) and turns down, by its intensity;
+//! `break` keeps only the open hat and shaker (thinned by intensity);
+//! `rise` builds a snare roll, 8ths from the region's middle and 16ths
+//! getting louder in its last bar; `peak` fills in closed hats and adds the
+//! ride. Feel: half keeps hats and shaker on the 8ths, the open hat on
+//! beats 1 and 3 and the clap on 3; double puts closed hats on every 32nd,
+//! doubles shaker and percs and adds snare ghosts on the off-beat 16ths;
+//! quad does the same with a 64th hat shimmer; triplet moves the closed
+//! hats to a triplet grid. Percs follow the score's chord root.
 
 use dsp::{decay_coef, midi_hz, pan_gains, Svf};
-use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, StepClock};
+use gen_api::{Config, Context, Entry, Feel, Generator, Info, Mark, Param, Rng, StepClock};
 use std::f64::consts::PI;
 
 const SLOTS: usize = 64; // 16ths in a cycle (4 bars)
@@ -243,6 +254,31 @@ pub struct Percussion {
     clap: Clap,
     snare: Snare,
     perc: Perc,
+    /// Seeds the per-16th draws that thin layers out.
+    thin_seed: u64,
+    /// Hits due between 16ths (double, quad and triplet feel). Fixed size,
+    /// so `process` never allocates; a full queue drops new hits.
+    pending: [Pending; MAX_PENDING],
+    pending_len: usize,
+}
+
+const MAX_PENDING: usize = 32;
+
+#[derive(Clone, Copy, Default)]
+enum Hit {
+    #[default]
+    Chat,
+    Shaker,
+    /// The last perc again, same pitch and pan.
+    Perc,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    /// Samples to go.
+    t: f64,
+    hit: Hit,
+    vel: f64,
 }
 
 const PAN_OHAT: f64 = -0.1;
@@ -357,14 +393,150 @@ impl Percussion {
         Cycle { index, steps }
     }
 
+    /// Applies the score's dynamics and feel at `slot` (an absolute 16th)
+    /// to its step. `six` is a 16th in samples.
+    fn shape(&mut self, st: &mut Step, slot: u64, ctx: &Context, six: f64) {
+        let bar = ctx.score.bar(slot / 16);
+        let k = bar.intensity as f64;
+        let p = ctx.score.progress(slot as f64 / 4.0, 4);
+        let draw = Rng::new(self.thin_seed ^ slot.wrapping_mul(0x9E37_79B9_7F4A_7C15)).f();
+        let s16 = slot % 16;
+        let mut gain = 1.0;
+        match bar.mark {
+            Mark::Quiet => {
+                if draw < k {
+                    (st.chat, st.perc, st.ride) = (0.0, 0.0, 0.0);
+                }
+                if k > 0.5 {
+                    (st.clap, st.snare) = (0.0, 0.0);
+                }
+                gain = 1.0 - 0.4 * k;
+            }
+            Mark::Break => {
+                (st.clap, st.snare, st.perc) = (0.0, 0.0, 0.0);
+                if draw < k {
+                    (st.chat, st.ride) = (0.0, 0.0);
+                }
+                gain = 1.0 - 0.4 * k;
+            }
+            Mark::Rise => {
+                let last_bar = slot / 16 == bar.mark_start + bar.mark_bars as u64 - 1;
+                if last_bar {
+                    st.snare = st.snare.max((0.35 + 0.6 * s16 as f64 / 15.0) * k);
+                } else if p >= 0.5 && slot % 2 == 0 {
+                    st.snare = st.snare.max((0.2 + 0.4 * p) * k);
+                }
+                st.chat *= 1.0 + 0.3 * p * k;
+            }
+            Mark::Peak => {
+                if st.chat == 0.0 && s16 % 4 != 2 {
+                    st.chat = 0.4 * k;
+                }
+                if st.ride == 0.0 && s16 % 4 == 2 {
+                    st.ride = 0.45 * k;
+                }
+                gain = 1.0 + 0.1 * k;
+            }
+            Mark::Normal => {}
+        }
+        match bar.feel {
+            Feel::Half => {
+                if slot % 2 == 1 {
+                    (st.chat, st.shaker) = (0.0, 0.0);
+                }
+                if (slot / 4) % 2 == 1 {
+                    st.ohat = 0.0;
+                }
+                let clap_layer = self.epoch.as_ref().is_some_and(|e| e.clap);
+                st.clap = if s16 == 8 && clap_layer && bar.mark != Mark::Break { 0.9 } else { 0.0 };
+            }
+            Feel::Double | Feel::Quad => {
+                // Closed hats on every 32nd (64th in quad), unless quiet or
+                // break thinned the hats out here; not on the open hat's
+                // own onset, which a closed hat would choke.
+                let n = if bar.feel == Feel::Double { 2 } else { 4 };
+                let thinned = matches!(bar.mark, Mark::Quiet | Mark::Break) && draw < k;
+                if !thinned {
+                    let hat = if st.chat > 0.0 { st.chat } else { 0.4 };
+                    if st.ohat == 0.0 {
+                        st.chat = hat;
+                    }
+                    for j in 1..n {
+                        let accent = if j * 2 == n { 0.75 } else { 0.5 };
+                        self.queue(six * j as f64 / n as f64, Hit::Chat, hat * accent * gain);
+                    }
+                }
+                if st.shaker > 0.0 {
+                    self.queue(six / 2.0, Hit::Shaker, st.shaker * 0.7 * gain);
+                }
+                if st.perc > 0.0 {
+                    self.queue(six / 2.0, Hit::Perc, st.perc * 0.75 * gain);
+                }
+                // Light snare ghosts on the 16ths between beats.
+                if st.snare == 0.0 && s16 % 4 != 0 && bar.mark != Mark::Break && !(bar.mark == Mark::Quiet && k > 0.5) {
+                    st.snare = 0.12 + 0.1 * draw;
+                }
+            }
+            Feel::Triplet => {
+                if s16 % 4 == 0 && !(bar.mark == Mark::Break && draw < k) {
+                    let vel = [0.6, 0.4, 0.5, 0.6, 0.4, 0.5];
+                    for (j, v) in vel.iter().enumerate() {
+                        self.queue(4.0 * six * j as f64 / 6.0, Hit::Chat, v * gain);
+                    }
+                }
+                st.chat = 0.0;
+            }
+            _ => {}
+        }
+        for v in [&mut st.ohat, &mut st.chat, &mut st.shaker, &mut st.clap, &mut st.ride, &mut st.snare, &mut st.perc] {
+            *v = (*v * gain).min(1.0);
+        }
+    }
+
+    fn queue(&mut self, t: f64, hit: Hit, vel: f64) {
+        if self.pending_len < MAX_PENDING {
+            self.pending[self.pending_len] = Pending { t, hit, vel: vel.min(1.0) };
+            self.pending_len += 1;
+        }
+    }
+
+    /// Counts the queue down by one sample and plays what's due.
+    fn play_pending(&mut self) {
+        let sr = self.sr;
+        let mut i = 0;
+        while i < self.pending_len {
+            let p = &mut self.pending[i];
+            p.t -= 1.0;
+            if p.t > 0.0 {
+                i += 1;
+                continue;
+            }
+            let Pending { hit, vel, .. } = *p;
+            self.pending_len -= 1;
+            self.pending[i] = self.pending[self.pending_len];
+            match hit {
+                Hit::Chat => {
+                    self.ohat.choke(sr);
+                    self.chat.trigger(vel, 1.0, sr);
+                }
+                Hit::Shaker => {
+                    self.shaker.t = 0;
+                    self.shaker.vel = vel;
+                }
+                Hit::Perc => self.perc = Perc { vel, hz: self.perc.hz, pan: self.perc.pan, ..Perc::default() },
+            }
+        }
+    }
+
     fn trigger(&mut self, slot: u64, ctx: &Context) {
         let index = slot / SLOTS as u64;
         if self.cycle.as_ref().map(|c| c.index) != Some(index) {
             self.cycle = Some(self.compose_cycle(index));
         }
-        let st = self.cycle.as_ref().unwrap().steps[(slot % SLOTS as u64) as usize];
+        let mut st = self.cycle.as_ref().unwrap().steps[(slot % SLOTS as u64) as usize];
         let sr = self.sr;
         let six = 60.0 / ctx.transport.bpm / 4.0;
+        self.shape(&mut st, slot, ctx, six * sr);
 
         if st.ohat > 0.0 {
             self.ohat.trigger(st.ohat, 1.0, sr);
@@ -393,7 +565,8 @@ impl Percussion {
         if st.perc > 0.0 {
             // C4..B4 for the root, then up the scale.
             let t = &ctx.tonality;
-            let hz = midi_hz(60.0 + t.root as f64 + t.degree(st.perc_degree as i32) as f64);
+            let (root, semis) = t.chord_degree(ctx.score.bar(slot / 16).chord, st.perc_degree as i32);
+            let hz = midi_hz(60.0 + root as f64 + semis as f64);
             self.perc = Perc { vel: st.perc, hz, pan: st.perc_pan, ..Perc::default() };
         }
     }
@@ -420,6 +593,9 @@ impl Generator for Percussion {
             clap: Clap { t: 0, vel: 0.0, bp: Svf::new(rng.range(1000.0, 1500.0), 0.4, sr) },
             snare: Snare { t: 0, vel: 0.0, decay: 0.08, phase: 0.0, hp: Svf::new(1800.0, 0.1, sr) },
             perc: Perc::default(),
+            thin_seed: config.seed ^ 0x9E2C,
+            pending: [Pending::default(); MAX_PENDING],
+            pending_len: 0,
             rng,
         }
     }
@@ -458,6 +634,9 @@ impl Generator for Percussion {
             while let Some(slot) = steps.due(i) {
                 self.trigger(slot, ctx);
             }
+            if self.pending_len > 0 {
+                self.play_pending();
+            }
             let n = &mut self.noise;
             let mono = [self.ohat.tick(sr, n), self.chat.tick(sr, n), self.ride.tick(sr, n), self.shaker.tick(sr, n)];
             let center = self.clap.tick(sr, n) + self.snare.tick(sr, n);
@@ -478,3 +657,82 @@ impl Generator for Percussion {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gen_api::{Scale, Score, ScoreBar, Tonality, Transport};
+
+    const SR: f64 = 48_000.0;
+    const BEAT: usize = 24_000; // 120 bpm
+
+    /// A score whose bars 0..16 all carry `mark` (at intensity 1) and `feel`.
+    fn score(mark: Mark, feel: Feel) -> Score {
+        let mut s = Score::EMPTY;
+        for (i, b) in s.bars.iter_mut().enumerate().take(16) {
+            *b = ScoreBar { mark, intensity: 1.0, mark_start: 0, mark_bars: 16, feel, ..ScoreBar::NONE };
+            if mark == Mark::Normal {
+                b.mark_start = i as u64;
+                b.mark_bars = 1;
+            }
+        }
+        s
+    }
+
+    /// Renders `bars` bars; returns the audio and how many events came out.
+    fn render(bars: usize, score: &Score) -> (Vec<f32>, usize) {
+        let mut g = Percussion::new(&Config { sample_rate: SR, seed: 7 });
+        let ch = g.info().channels as usize;
+        let params: Vec<f64> = g.params().iter().map(|p| p.default).collect();
+        let block = 480;
+        let mut out = vec![0.0f32; bars * 4 * BEAT * ch];
+        let mut events = Vec::new();
+        for (b, chunk) in out.chunks_mut(block * ch).enumerate() {
+            let ctx = Context {
+                score,
+                sample_rate: SR,
+                transport: Transport { bpm: 120.0, beat: (b * block) as f64 / BEAT as f64, beats_per_bar: 4, playing: true },
+                tonality: Tonality { root: 4, scale: Scale::Phrygian },
+                params: &params,
+                input: &[],
+            };
+            g.process(&ctx, chunk);
+            g.take_events(&mut events);
+        }
+        (out, events.len())
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn deterministic_and_in_range_under_every_mark_and_feel() {
+        for mark in Mark::ALL {
+            for feel in Feel::ALL {
+                let s = score(mark, feel);
+                let (a, _) = render(4, &s);
+                assert_eq!(a, render(4, &s).0, "{mark:?} {feel:?}");
+                assert!(a.iter().all(|x| x.is_finite() && x.abs() <= 1.0), "{mark:?} {feel:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn double_and_quad_are_clearly_busier() {
+        let normal = rms(&render(8, &Score::EMPTY).0);
+        let double = render(8, &score(Mark::Normal, Feel::Double)).0;
+        let quad = render(8, &score(Mark::Normal, Feel::Quad)).0;
+        assert!(rms(&double) > normal * 1.15, "double: {} vs {normal}", rms(&double));
+        assert!(rms(&quad) > normal * 1.15, "quad: {} vs {normal}", rms(&quad));
+        assert_ne!(quad, double, "quad shimmers in 64ths");
+    }
+
+    #[test]
+    fn break_thins_out_and_feel_changes_the_hats() {
+        let (normal, _) = render(8, &Score::EMPTY);
+        assert!(rms(&render(8, &score(Mark::Break, Feel::Normal)).0) < rms(&normal) * 0.8);
+        for feel in [Feel::Half, Feel::Double, Feel::Quad, Feel::Triplet] {
+            assert_ne!(render(8, &score(Mark::Normal, feel)).0, normal, "{feel:?}");
+        }
+    }
+}

@@ -69,6 +69,7 @@ The host calls `process` once per block. `out.len()` is
 | `tonality.scale` | `Phrygian`, `Minor`, `HarmonicMinor`, `Dorian` or `Major`. `Tonality::degree(n)` maps a scale degree to semitones above the root. |
 | `params` | Every parameter's current value, in `params()` order; `ctx.param(i)`. Empty if the plugin has none. |
 | `input` | Effects only: this block's input audio, interleaved. Empty for generators. |
+| `score` | The workspace sequencer's score around now (marks, chords, keys, feel per bar), see [sequencer.md](sequencer.md#what-plugins-see). `Score::EMPTY` without one. |
 
 `transport.beat` is the click: it tells the generator both *where* it is
 (pattern position) and, together with `bpm`, *when* the next subdivision
@@ -171,21 +172,28 @@ the only other flag accepted is `--seed`; tempo and key come from the host.
 All values are little-endian. The generator's stderr is free for logging,
 and the host prefixes it with the generator's name.
 
-Protocol version 4:
+Protocol version 5 (negotiated; v4 plugins and hosts still work):
 
 ```text
-host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 reserved
-gen  -> host  hello     16 bytes   "WSG4" | u16 channels | u16 inputs | u16 params
+host -> gen   hello     16 bytes   "WSH4" | u32 sample_rate | u32 max_frames | u32 version
+gen  -> host  hello     16 bytes   "WSG5" or "WSG4" | u16 channels | u16 inputs | u16 params
                                    | u16 reserved | u32 json_len
                         + json_len bytes: the plugin description (as `--info --json`)
 then, repeated:
 host -> gen   request   32 bytes   header, see below
                         + params × f64       snapshot of every parameter
+                        + 528 bytes of score (v5, only when flagged, see below)
                         + frames × inputs × f32, interleaved   (effects only)
 gen  -> host  chunk     12 bytes   "WSC4" | u32 frames | u32 events
                          + events × 12 bytes   u32 frame | u16 kind | u16 reserved | f32 value
                          + frames × channels × f32, interleaved
 ```
+
+Negotiation: the host puts the highest version it speaks in the hello's
+last field (v4 hosts send 0). A generator answers `WSG5` if both speak 5,
+else `WSG4`. Only a v5 generator gets the score: on the first request and
+whenever its revision changes, flagged by bit 1 of request byte 4. Its
+layout is documented on `gen_api::pipe::encode_score`.
 
 The description travels in the handshake so the host always has the
 metadata of the exact process it talks to, also for plugins that aren't in
@@ -205,7 +213,7 @@ Request layout:
 | Offset | Type | Field |
 |---|---|---|
 | 0 | u32 | `frames` (≤ `max_frames`) |
-| 4 | u8 | `playing` (0/1) |
+| 4 | u8 | flags: bit 0 `playing`, bit 1 a score follows the params (v5) |
 | 5 | u8 | root pitch class, 0 = C |
 | 6 | u8 | scale, index into `Scale::ALL` |
 | 7 | u8 | `beats_per_bar` |

@@ -6,7 +6,7 @@
 
 use crate::catalog::Catalog;
 use crate::daemon::{Mixer, BLOCK};
-use crate::gen::{Entry, ParamDesc, Proc, Slot, Spec, MAX_FADE_BARS};
+use crate::gen::{Entry, Exit, Exiting, ParamDesc, Proc, Slot, Spec, MAX_FADE_BARS};
 use gen_api::{Scale, Tonality};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -93,9 +93,18 @@ pub struct State {
     /// The same in beats at the current tempo.
     pub latency_beats: f64,
     pub underruns: u64,
+    /// DSP load: how long rendering a block takes (every generator and
+    /// effect, in parallel, then the mix) over how long it plays,
+    /// smoothed. Near 1 the buffer drains and audio drops out.
+    pub dsp_load: f64,
+    /// Its recent peak, falling back over a couple of seconds.
+    pub dsp_peak: f64,
     pub sample_rate: u32,
     pub generators: Vec<Generator>,
     pub effects: Vec<Effect>,
+    /// The score: every lane's banks, which one plays (as heard) and which
+    /// is cued.
+    pub sequencer: crate::sequencer::View,
 }
 
 #[derive(Serialize)]
@@ -146,6 +155,9 @@ pub struct Generator {
     /// How it comes into the mix when added: asked for when adding, else as
     /// the generator declares it; null while not running.
     pub entry: Option<Entry>,
+    /// On its way out after a scheduled removal: the exit mode and the beat
+    /// it's gone at; null otherwise.
+    pub exiting: Option<Exiting>,
     /// Insert effects, by name, in signal order.
     pub inserts: Vec<String>,
     /// Post-fader send amounts (linear 0..1) to send effects, by name.
@@ -183,6 +195,9 @@ pub struct Effect {
     pub duck_sensitivity: Option<f64>,
     /// What the plugin itself declares.
     pub declared_duck_sensitivity: Option<f64>,
+    /// Send effects on their way out after a scheduled removal; null
+    /// otherwise.
+    pub exiting: Option<Exiting>,
 }
 
 fn params_of(g: &Slot) -> Vec<Param> {
@@ -215,6 +230,7 @@ impl Effect {
             last_error: last_error_of(f),
             duck_sensitivity: f.duck_sensitivity(),
             declared_duck_sensitivity: f.declared_duck_sensitivity(),
+            exiting: f.exiting,
         }
     }
 }
@@ -255,6 +271,7 @@ impl Generator {
             duck_source: g.duck.source,
             duck_level: g.duck.level,
             entry: g.entry(),
+            exiting: g.exiting,
             inserts: g.inserts.clone(),
             sends: g.sends.clone(),
         }
@@ -465,6 +482,58 @@ fn fresh_rng() -> gen_api::Rng {
 /// Longest slide accepted, in bars.
 pub const MAX_GLIDE_BARS: f64 = 64.0;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BankCopy {
+    pub from: String,
+    pub to: String,
+    /// Default: every lane.
+    pub lanes: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BankRepeat {
+    /// 2, 4 or 8.
+    pub times: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BankCue {
+    pub bank: String,
+}
+
+fn seq_lane(s: &str) -> Result<crate::sequencer::Lane> {
+    crate::sequencer::Lane::parse(s).ok_or_else(|| ApiError::NotFound(format!("no lane {s}; lanes are dynamics, harmony, tempo")))
+}
+
+fn seq_bank(s: &str) -> Result<usize> {
+    crate::sequencer::parse_bank(s).ok_or_else(|| ApiError::NotFound(format!("no bank {s}; banks are A-D")))
+}
+
+/// `ws seq`: one block per lane, one line per layer of the playing bank.
+fn seq_text(v: &crate::sequencer::View) -> String {
+    let mut s = String::new();
+    for l in &v.lanes {
+        let cued = l.cued.map(|c| format!(", {c} cued")).unwrap_or_default();
+        let filled: Vec<&str> = l.banks.iter().filter(|(_, b)| !b.is_empty()).map(|(n, _)| *n).collect();
+        s += &format!("{:<9} playing {}{cued}   banks with content: {}\n", l.lane.name(), l.playing, if filled.is_empty() { "none".into() } else { filled.join(" ") });
+        for layer in &l.layers {
+            let regions = l.banks[l.playing].get(layer).map(Vec::as_slice).unwrap_or(&[]);
+            let mut cells = vec!["·".to_string(); v.bars as usize];
+            for r in regions {
+                cells[r.start as usize - 1] = r.value.clone();
+                for c in cells.iter_mut().skip(r.start as usize).take(r.bars as usize - 1) {
+                    *c = "-".into();
+                }
+            }
+            s += &format!("  {:<7} {}\n", layer.name(), cells.join(" "));
+        }
+    }
+    s
+}
+
 fn check_glide(bars: Option<f64>) -> Result<Option<f64>> {
     match bars {
         Some(b) if !(b > 0.0 && b <= MAX_GLIDE_BARS) => Err(bad(format!("glide_bars is 0 < bars <= {MAX_GLIDE_BARS}"))),
@@ -473,7 +542,7 @@ fn check_glide(bars: Option<f64>) -> Result<Option<f64>> {
 }
 
 /// Removes effect slots and every reference to them.
-fn drop_effects(m: &mut Mixer, names: &[String]) {
+pub fn drop_effects(m: &mut Mixer, names: &[String]) {
     m.fx.retain(|f| !names.contains(&f.name));
     for g in &mut m.gens {
         g.inserts.retain(|n| !names.contains(n));
@@ -492,6 +561,8 @@ pub struct Ctl {
     pub http_url: Option<String>,
     pub catalog: Arc<Catalog>,
     pub favorites: Arc<crate::favorites::Favorites>,
+    /// Where sequencer banks are kept.
+    pub sequencer_path: std::path::PathBuf,
 }
 
 impl Ctl {
@@ -738,10 +809,16 @@ impl Ctl {
         })?
     }
 
-    pub fn remove_effect(&self, name: String) -> Result<()> {
+    /// Removes an effect now, or schedules a send effect's exit (inserts
+    /// always go at once). Removing again replaces a pending exit.
+    pub fn remove_effect(&self, name: String, exit: Exit) -> Result<()> {
         self.on_mixer(move |m| {
-            find_fx(m, &name)?;
-            drop_effects(m, &[name]);
+            let exiting = m.start_exit(exit);
+            let f = find_fx(m, &name)?;
+            match exiting {
+                Some(e) if f.owner.is_none() => f.exiting = Some(e),
+                _ => drop_effects(m, &[name]),
+            }
             Ok(())
         })?
     }
@@ -828,10 +905,17 @@ impl Ctl {
         })?
     }
 
-    /// Removes a generator and its insert effects.
-    pub fn remove(&self, name: String) -> Result<()> {
+    /// Removes a generator and its insert effects, now or as `exit`
+    /// schedules. Removing again replaces a pending exit.
+    pub fn remove(&self, name: String, exit: Exit) -> Result<()> {
         self.on_mixer(move |m| {
-            let inserts = find(m, &name)?.inserts.clone();
+            let exiting = m.start_exit(exit);
+            let g = find(m, &name)?;
+            if let Some(e) = exiting {
+                g.exiting = Some(e);
+                return Ok(());
+            }
+            let inserts = g.inserts.clone();
             drop_effects(m, &inserts);
             m.gens.retain(|g| g.name != name);
             Ok(())
@@ -883,6 +967,58 @@ impl Ctl {
         self.favorites.set(name, favorite).map_err(|e| ApiError::Internal(format!("saving favorites: {e}")))
     }
 
+    // ------------------------------------------------------- sequencer
+
+    pub fn sequencer(&self) -> Result<crate::sequencer::View> {
+        self.on_mixer(|m| m.sequencer.view(m.audible_beat()))
+    }
+
+    /// Runs an edit of the bank contents and saves them afterwards.
+    fn edit_sequencer(&self, f: impl FnOnce(&mut crate::sequencer::Sequencer) + Send + 'static) -> Result<crate::sequencer::View> {
+        let (view, snapshot) = self.on_mixer(|m| {
+            f(&mut m.sequencer);
+            (m.sequencer.view(m.audible_beat()), m.sequencer.snapshot())
+        })?;
+        snapshot.save(&self.sequencer_path).map_err(ApiError::Internal)?;
+        Ok(view)
+    }
+
+    /// Replaces a bank's contents; an empty bank clears it.
+    pub fn set_bank(&self, lane: &str, bank: &str, content: crate::sequencer::Bank) -> Result<crate::sequencer::View> {
+        let (lane, bank) = (seq_lane(lane)?, seq_bank(bank)?);
+        let content = crate::sequencer::check_bank(lane, content).map_err(ApiError::Unprocessable)?;
+        self.edit_sequencer(move |s| s.set_bank(lane, bank, content))
+    }
+
+    pub fn copy_banks(&self, c: BankCopy) -> Result<crate::sequencer::View> {
+        let (from, to) = (seq_bank(&c.from)?, seq_bank(&c.to)?);
+        if from == to {
+            return Err(bad("a bank can't be copied onto itself"));
+        }
+        let lanes = match c.lanes {
+            None => crate::sequencer::Lane::ALL.to_vec(),
+            Some(names) if names.is_empty() => return Err(bad("lanes is empty; leave it out to copy every lane")),
+            Some(names) => names.iter().map(|n| seq_lane(n)).collect::<Result<_>>()?,
+        };
+        self.edit_sequencer(move |s| s.copy(from, to, &lanes))
+    }
+
+    pub fn repeat_bank(&self, lane: &str, bank: &str, r: BankRepeat) -> Result<crate::sequencer::View> {
+        let (lane, bank) = (seq_lane(lane)?, seq_bank(bank)?);
+        if ![2, 4, 8].contains(&r.times) {
+            return Err(bad("times is 2, 4 or 8"));
+        }
+        self.edit_sequencer(move |s| s.repeat(lane, bank, r.times))
+    }
+
+    pub fn cue(&self, lane: &str, c: BankCue) -> Result<crate::sequencer::View> {
+        let (lane, bank) = (seq_lane(lane)?, seq_bank(&c.bank)?);
+        self.on_mixer(move |m| {
+            m.sequencer.cue(lane, bank);
+            m.sequencer.view(m.audible_beat())
+        })
+    }
+
     pub fn quit(&self) -> Result<()> {
         self.on_mixer(|m| m.quit = true)
     }
@@ -917,7 +1053,7 @@ impl Ctl {
             }
             "rm" => {
                 let name = arg(0, "NAME")?;
-                if self.is_effect(&name)? { self.remove_effect(name.clone())? } else { self.remove(name.clone())? }
+                if self.is_effect(&name)? { self.remove_effect(name.clone(), Exit::Now)? } else { self.remove(name.clone(), Exit::Now)? }
                 Ok(format!("removed {name}\n"))
             }
             "restart" => {
@@ -1078,6 +1214,33 @@ impl Ctl {
                     Some(b) => format!("{name} {id} -> {value} over {b} bars\n"),
                     None => format!("{name} {id} = {value}\n"),
                 })
+            }
+            "seq" => self.sequencer().map(|v| seq_text(&v)),
+            "cue" => {
+                let [lane, bank] = rest else { return Err(bad("usage: ws cue LANE BANK")) };
+                let v = self.cue(lane, BankCue { bank: bank.clone() })?;
+                let l = v.lanes.iter().find(|l| l.lane.name() == lane.to_lowercase()).expect("lane was checked");
+                Ok(match l.cued {
+                    Some(c) => format!("{} plays {c} from the next epoch\n", l.lane.name()),
+                    None => format!("{} keeps playing {}\n", l.lane.name(), l.playing),
+                })
+            }
+            "copy" => {
+                let [from, to, lanes @ ..] = rest else { return Err(bad("usage: ws copy FROM TO [LANE..]")) };
+                let lanes = (!lanes.is_empty()).then(|| lanes.to_vec());
+                self.copy_banks(BankCopy { from: from.clone(), to: to.clone(), lanes })?;
+                Ok(format!("copied {} onto {}\n", from.to_uppercase(), to.to_uppercase()))
+            }
+            "repeat" => {
+                let [lane, bank, times] = rest else { return Err(bad("usage: ws repeat LANE BANK 2|4|8")) };
+                let times = times.trim_end_matches(['x', '×']).parse().map_err(|_| bad("repeat: times is 2, 4 or 8"))?;
+                self.repeat_bank(lane, bank, BankRepeat { times })?;
+                Ok(format!("repeated the first {} bars of {lane} {} {times}×\n", 16 / times, bank.to_uppercase()))
+            }
+            "clear" => {
+                let [lane, bank] = rest else { return Err(bad("usage: ws clear LANE BANK")) };
+                self.set_bank(lane, bank, Default::default())?;
+                Ok(format!("cleared {lane} {}\n", bank.to_uppercase()))
             }
             "quit" => self.quit().map(|_| "workspace stopping\n".into()),
             other => Err(bad(format!("unknown command {other}; see ws help"))),

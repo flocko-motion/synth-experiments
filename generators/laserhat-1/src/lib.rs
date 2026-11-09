@@ -12,11 +12,17 @@
 //! `rolls` up, the last beat of a cycle can ratchet at double speed with
 //! the pitch climbing into the next cycle.
 //!
-//! It counts its own subdivisions from the host position (the shared
-//! StepClock only fires on 16ths) and resyncs silently after a seek.
+//! The workspace score: much sparser and roll-free in a `quiet`, thinner in
+//! a `break`, filling up through a `rise` (which always ends in a roll),
+//! fuller with more rolls in a `peak`. The feel sets the rate: half-time
+//! halves it, double-time doubles it, triplet switches to triplets.
+//!
+//! It counts its subdivisions with `dsp::SubClock` (the shared StepClock
+//! only fires on 16ths), which resyncs after a seek and keeps exact
+//! boundaries such as a bar-line entry.
 
-use dsp::{pan_gains, soft_limit, OnePole};
-use gen_api::{Config, Context, Entry, Generator, Info, Param, Rng, BARS_PER_CYCLE};
+use dsp::{pan_gains, soft_limit, OnePole, SubClock};
+use gen_api::{Config, Context, Entry, Feel, Generator, Info, Mark, Param, Rng, BARS_PER_CYCLE};
 use std::f64::consts::PI;
 
 const RATE: usize = 0;
@@ -53,6 +59,34 @@ const VOICES: usize = 6;
 /// Modulator : carrier ratio; irrational, so the spectrum is metallic.
 const MOD_RATIO: f64 = 1.414;
 
+/// Hits per beat under the score's feel: half-time halves the rate,
+/// double and quad multiply it, triplet switches to the triplet rate.
+fn feel_div(div: u64, feel: Feel) -> u64 {
+    match feel {
+        Feel::Normal => div,
+        Feel::Half => (div / 2).max(2),
+        Feel::Double => div * 2,
+        Feel::Quad => div * 4,
+        Feel::Triplet if div % 3 == 0 => div,
+        Feel::Triplet => div / 2 * 3,
+    }
+}
+
+/// `density` under the score at `beat`: sparse in a quiet, thinner in a
+/// break, filling up through a rise, fuller in a peak (by intensity).
+fn score_density(ctx: &Context, beat: f64) -> f64 {
+    let d = ctx.param(DENSITY);
+    let sb = ctx.score.at(beat, ctx.transport.beats_per_bar);
+    let i = sb.intensity as f64;
+    match sb.mark {
+        Mark::Quiet => d * (1.0 - 0.8 * i),
+        Mark::Break => d * 0.5,
+        Mark::Rise => d + (1.0 - d) * i * ctx.score.progress(beat, ctx.transport.beats_per_bar),
+        Mark::Peak => d + (1.0 - d) * 0.6 * i,
+        Mark::Normal => d,
+    }
+}
+
 // ---------------------------------------------------------------- pattern
 
 #[derive(Clone, Copy, Default)]
@@ -87,7 +121,8 @@ pub struct Laserhat {
     noise: Rng,
     cycle: Option<Cycle>,
     /// Last subdivision fired (in units of the current rate) and that rate.
-    last: Option<(i64, u64)>,
+    /// Counts subdivisions at twice the rate (rolls use the odd ones).
+    clock: SubClock,
     voices: [Voice; VOICES],
     next_voice: usize,
     side: f64, // alternates the pan
@@ -135,8 +170,8 @@ impl Laserhat {
         let in_bar = n % bar_slots;
         let pos = in_bar % div; // position within the beat
         let last_bar = bar % BARS_PER_CYCLE as u64 == BARS_PER_CYCLE as u64 - 1;
-        let roll = last_bar && in_bar / div == bpb - 1 && c.roll_draw < ctx.param(ROLLS);
         let slot = c.bars[last_bar as usize][(in_bar as usize * MAX_BAR_SLOTS / bar_slots as usize).min(MAX_BAR_SLOTS - 1)];
+        let roll = self.rolling(n, div, ctx);
 
         if roll {
             // Every slot fires, climbing in pitch towards the next cycle.
@@ -147,7 +182,7 @@ impl Laserhat {
         // On the beat: thin it out, the kick lives there.
         let on_beat = pos == 0;
         let off_eighth = pos * 2 == div;
-        let density = ctx.param(DENSITY) * if on_beat { 0.4 } else { 1.0 };
+        let density = score_density(ctx, n as f64 / div as f64) * if on_beat { 0.4 } else { 1.0 };
         if off_eighth || slot.draw < density {
             let vel = if off_eighth { 1.0 } else if on_beat { 0.45 * slot.vel } else { 0.75 * slot.vel };
             self.hit(vel, 0.0);
@@ -163,7 +198,7 @@ impl Generator for Laserhat {
             rng: Rng::new(config.seed ^ 0x1A5E),
             noise: Rng::new(config.seed ^ 0x7177),
             cycle: None,
-            last: None,
+            clock: SubClock::new(),
             voices: [Voice { t: 1.0, ..Voice::default() }; VOICES],
             next_voice: 0,
             side: 1.0,
@@ -199,29 +234,23 @@ impl Generator for Laserhat {
         let dt = 1.0 / sr;
         let tr = &ctx.transport;
         let spb = tr.samples_per_beat(sr);
-        let div = RATE_DIVS[ctx.param(RATE) as usize];
-        // Rolls run at double speed, so count at twice the rate and let
-        // `slot` see every other subdivision unless rolling.
-        let fine = div * 2;
+        let base_div = RATE_DIVS[ctx.param(RATE) as usize];
 
         for (i, frame) in out.chunks_exact_mut(2).enumerate() {
-            let n = ((tr.beat + i as f64 / spb).max(0.0) * fine as f64 + 1e-9).floor() as i64;
-            match self.last {
-                Some((last, d)) if d == fine && n == last + 1 => {
-                    self.last = Some((n, fine));
-                    if tr.playing {
-                        let roll_pos = n as u64 % 2 == 1;
-                        if !roll_pos {
-                            self.slot(n as u64 / 2, div, ctx);
-                        } else if self.rolling(n as u64 / 2, div, ctx) {
-                            let u = ((n as u64 / 2) % div) as f64 / div as f64;
-                            self.hit(0.6 + 0.3 * u, 0.5 * u + 0.05);
-                        }
-                    }
+            // The score's feel can change the rate on any bar line.
+            let beat = (tr.beat + i as f64 / spb).max(0.0);
+            let div = feel_div(base_div, ctx.score.at(beat, tr.beats_per_bar).feel);
+            // Rolls run at double speed, so count at twice the rate and let
+            // `slot` see every other subdivision unless rolling.
+            let fine = div * 2;
+            if let Some(n) = self.clock.tick(beat, fine, spb, tr.playing) {
+                let roll_pos = n % 2 == 1;
+                if !roll_pos {
+                    self.slot(n / 2, div, ctx);
+                } else if self.rolling(n / 2, div, ctx) {
+                    let u = ((n / 2) % div) as f64 / div as f64;
+                    self.hit(0.6 + 0.3 * u, 0.5 * u + 0.05);
                 }
-                Some((last, d)) if d == fine && n == last => {}
-                // First block, seek, loop or rate change: resync silently.
-                _ => self.last = Some((n, fine)),
             }
 
             for (k, v) in self.params.iter_mut().enumerate() {
@@ -267,7 +296,18 @@ impl Laserhat {
         let last_bar = bar % BARS_PER_CYCLE as u64 == BARS_PER_CYCLE as u64 - 1;
         let last_beat = (n % bar_slots) / div == bpb - 1;
         let cycle = bar / BARS_PER_CYCLE as u64;
-        last_bar && last_beat && self.cycle.as_ref().is_some_and(|c| c.index == cycle && c.roll_draw < ctx.param(ROLLS))
+        // The score: a rise always ends in a roll; no rolls in a quiet or a
+        // break; more in a peak.
+        let sb = ctx.score.at(n as f64 / div as f64, ctx.transport.beats_per_bar);
+        if sb.mark == Mark::Rise && last_beat && bar == sb.mark_start + sb.mark_bars as u64 - 1 {
+            return true;
+        }
+        let rolls = match sb.mark {
+            Mark::Quiet | Mark::Break => return false,
+            Mark::Peak => (ctx.param(ROLLS) + 0.5 * sb.intensity as f64).min(1.0),
+            _ => ctx.param(ROLLS),
+        };
+        last_bar && last_beat && self.cycle.as_ref().is_some_and(|c| c.index == cycle && c.roll_draw < rolls)
     }
 }
 
@@ -281,12 +321,17 @@ mod tests {
 
     /// Render; also returns how many hits fired.
     fn render(bars: usize, params: &[f64], playing: bool) -> (Vec<f32>, usize) {
+        render_with(bars, params, playing, &gen_api::Score::EMPTY)
+    }
+
+    fn render_with(bars: usize, params: &[f64], playing: bool, score: &gen_api::Score) -> (Vec<f32>, usize) {
         let mut g = Laserhat::new(&Config { sample_rate: SR, seed: 8 });
         let block = 480;
         let mut out = vec![0.0f32; bars * 4 * BEAT * 2];
         let mut hits = 0;
         for (b, chunk) in out.chunks_mut(block * 2).enumerate() {
             let ctx = Context {
+                score,
                 sample_rate: SR,
                 transport: Transport { bpm: 120.0, beat: (b * block) as f64 / BEAT as f64, beats_per_bar: 4, playing },
                 tonality: Tonality { root: 9, scale: Scale::Phrygian },
@@ -338,6 +383,40 @@ mod tests {
         let (_, rolled) = render(8, &p, true);
         // Two cycles; each roll fills its beat at 1/64: 16 hits instead of 1.
         assert_eq!(rolled, plain + 2 * 15);
+    }
+
+    /// Hits in 2 bars where every bar carries `bar`, density 0.5, no rolls.
+    fn hits_with(bar: gen_api::ScoreBar) -> usize {
+        let mut score = gen_api::Score::EMPTY;
+        score.bars.iter_mut().for_each(|b| *b = bar);
+        let mut p = defaults();
+        p[DENSITY] = 0.5;
+        p[ROLLS] = 0.0;
+        render_with(2, &p, true, &score).1
+    }
+
+    #[test]
+    fn follows_the_score() {
+        use gen_api::ScoreBar;
+        let normal = hits_with(ScoreBar::NONE);
+        let quiet = hits_with(ScoreBar { mark: Mark::Quiet, intensity: 1.0, ..ScoreBar::NONE });
+        let half = hits_with(ScoreBar { feel: Feel::Half, ..ScoreBar::NONE });
+        let double = hits_with(ScoreBar { feel: Feel::Double, ..ScoreBar::NONE });
+        // Deep quiet: the off-8ths (8) and a fifth of the density.
+        assert!(quiet >= 8 && quiet <= normal / 3, "quiet {quiet} normal {normal}");
+        assert!(half < normal * 2 / 3, "half {half} normal {normal}");
+        assert!(double >= normal * 3 / 2, "double {double} normal {normal}");
+        // A 2-bar rise over bars 1-2 ends in a roll on bar 2's last beat.
+        let mut rise = gen_api::Score::EMPTY;
+        for b in 0..2 {
+            rise.bars[b] = ScoreBar { mark: Mark::Rise, intensity: 0.0, mark_start: 0, mark_bars: 2, ..ScoreBar::NONE };
+        }
+        let mut p = defaults();
+        p[DENSITY] = 0.0;
+        p[ROLLS] = 0.0;
+        // Density 0: 8 off-8ths; the roll fills the last beat with 16 hits
+        // instead of its one off-8th.
+        assert_eq!(render_with(2, &p, true, &rise).1, 8 + 15);
     }
 
     #[test]

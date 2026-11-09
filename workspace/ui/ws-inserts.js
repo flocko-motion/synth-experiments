@@ -118,7 +118,7 @@ class WsInserts extends LitElement {
       </div>
       ${open ? html`
         <div class="detail" style="--c:${colorOf(fx)}">
-          <ws-params .params=${this.paramsOf(fx)} @change=${(e) => this.setParams(fx, e.detail, e.glideBars)}
+          <ws-params .standard=${false} .params=${this.paramsOf(fx)} @change=${(e) => this.setParams(fx, e.detail, e.glideBars)}
             @randomize=${() => this.run(fx.name, () => api.randomizeEffect(fx.name))}></ws-params>
           <div class="order">
             <button title="Earlier in the chain" ?disabled=${i === 0}
